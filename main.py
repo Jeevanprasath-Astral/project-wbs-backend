@@ -76,3 +76,26 @@ def seed_database():
         return {"status": "success", "message": "Database seeded successfully!"}
     except Exception as e:
         return {"status": "already seeded or error", "message": str(e)}
+
+@app.get("/api/reset-users")
+def reset_users():
+    try:
+        from app.db.database import SessionLocal
+        from app.models.models import User
+        from app.core.security import hash_password
+        db = SessionLocal()
+        db.query(User).delete()
+        db.commit()
+        users = [
+            User(name="Admin User", email="admin@wbs.com", password_hash=hash_password("admin123"), role="Admin"),
+            User(name="Priya Krishnan", email="fc@wbs.com", password_hash=hash_password("fc123"), role="Functional Consultant"),
+            User(name="Arun Dev", email="tech@wbs.com", password_hash=hash_password("tech123"), role="Technical Team"),
+            User(name="Client Reviewer", email="client@wbs.com", password_hash=hash_password("client123"), role="Client"),
+        ]
+        for u in users:
+            db.add(u)
+        db.commit()
+        db.close()
+        return {"status": "success", "message": "Users reset successfully! Login: admin@wbs.com / admin123"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
