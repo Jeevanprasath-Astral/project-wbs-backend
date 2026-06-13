@@ -1,16 +1,20 @@
-from datetime import datetime, timedelta
+﻿from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import hashlib
+import hmac
 from app.core.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+SECRET = settings.SECRET_KEY.encode()
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return hmac.new(SECRET, password.encode(), hashlib.sha256).hexdigest()
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        return hmac.compare_digest(hash_password(plain), hashed)
+    except Exception:
+        return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
