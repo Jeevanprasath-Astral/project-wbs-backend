@@ -99,3 +99,26 @@ def reset_users():
         return {"status": "success", "message": "Users reset successfully! Login: admin@wbs.com / admin123"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/fix-passwords")
+def fix_passwords():
+    try:
+        from app.db.database import SessionLocal
+        from app.models.models import User
+        from app.core.security import hash_password
+        db = SessionLocal()
+        updates = [
+            ("admin@wbs.com",  "admin123"),
+            ("fc@wbs.com",     "fc123"),
+            ("tech@wbs.com",   "tech123"),
+            ("client@wbs.com", "client123"),
+        ]
+        for email, password in updates:
+            user = db.query(User).filter_by(email=email).first()
+            if user:
+                user.password_hash = hash_password(password)
+        db.commit()
+        db.close()
+        return {"status": "success", "message": "Passwords updated! Login: admin@wbs.com / admin123"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
