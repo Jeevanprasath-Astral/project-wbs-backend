@@ -67,3 +67,12 @@ def health():
 @app.get("/api/ping")
 def ping():
     return {"status": "ok", "app": settings.APP_NAME}
+
+@app.get("/api/seed-database")
+def seed_database():
+    try:
+        from seed import seed
+        seed()
+        return {"status": "success", "message": "Database seeded successfully!"}
+    except Exception as e:
+        return {"status": "already seeded or error", "message": str(e)}
