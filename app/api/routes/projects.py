@@ -5,6 +5,7 @@ from app.db.database import get_db
 from app.models.models import Project, ProjectMilestone, Milestone, User, ProjectMember
 from app.schemas.schemas import ProjectCreate, ProjectOut, ProjectUpdate
 from app.core.deps import get_current_user
+from app.core.permissions import is_team_manager, can_create_project
 from app.services.audit_service import log_action
 from app.core.security import hash_password
 from pydantic import BaseModel
@@ -43,6 +44,8 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
 
 @router.post("", response_model=ProjectOut)
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if not can_create_project(current_user):
+        raise HTTPException(403, "Only Admin and Project Manager can create projects")
     project = Project(**payload.model_dump(), created_by=current_user.id, status="Not Started", progress=0.0)
     db.add(project)
     db.flush()
@@ -105,6 +108,8 @@ def get_all_users(project_id: int, db: Session = Depends(get_db), current_user: 
 @router.post("/{project_id}/team/add-existing")
 def add_existing_member(project_id: int, payload: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Add an existing user to the project."""
+    if not is_team_manager(current_user):
+        raise HTTPException(403, "Only Admin or HR can add team members")
     user_id = payload.get("user_id")
     user = db.query(User).filter_by(id=user_id).first()
     if not user:
@@ -122,6 +127,8 @@ def add_existing_member(project_id: int, payload: dict, db: Session = Depends(ge
 @router.post("/{project_id}/team/add-new")
 def add_new_member(project_id: int, payload: AddMemberRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Create a new user and add them to the project."""
+    if not is_team_manager(current_user):
+        raise HTTPException(403, "Only Admin or HR can add team members")
     if db.query(User).filter_by(email=payload.email).first():
         raise HTTPException(400, "Email already registered")
     user = User(
@@ -138,9 +145,27 @@ def add_new_member(project_id: int, payload: AddMemberRequest, db: Session = Dep
     db.commit()
     return {"status": "ok", "message": f"{user.name} created and added to project"}
 
+@router.delete("/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Delete a project and all its related data (Admin only)."""
+    if current_user.role != "Admin":
+        raise HTTPException(403, "Only Admin can delete projects")
+    p = db.query(Project).filter_by(id=project_id).first()
+    if not p:
+        raise HTTPException(404, "Project not found")
+    log_action(db, actor=current_user.name, action="delete",
+               description=f"Project '{p.name}' deleted",
+               project_id=project_id, entity_type="project",
+               entity_id=project_id, user_id=current_user.id)
+    db.delete(p)
+    db.commit()
+    return {"status": "ok", "message": f"Project '{p.name}' deleted"}
+
 @router.delete("/{project_id}/team/{member_id}")
 def remove_member(project_id: int, member_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Remove a member from the project."""
+    if not is_team_manager(current_user):
+        raise HTTPException(403, "Only Admin or HR can remove team members")
     member = db.query(ProjectMember).filter_by(id=member_id, project_id=project_id).first()
     if not member:
         raise HTTPException(404, "Member not found")

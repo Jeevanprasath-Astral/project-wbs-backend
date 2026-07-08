@@ -4,7 +4,8 @@ from sqlalchemy.orm import Session
 from io import BytesIO
 from app.db.database import get_db
 from app.models.models import (Project, ProjectMilestone, Milestone, Task,
-                                Subtask, Question, Response, SubtaskStatus, User)
+                                Subtask, Question, Response, SubtaskStatus, User,
+                                CustomMilestone)
 from app.core.deps import get_current_user
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -13,11 +14,28 @@ router = APIRouter(tags=["Export"])
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 def _load_project_data(db, project_id):
-    """Load all milestone data in bulk to avoid N+1 queries."""
+    """Load all milestone data in bulk to avoid N+1 queries.
+
+    "All Milestones" must only ever mean the milestones actually selected
+    for THIS project via Milestone Configuration (CustomMilestone), not the
+    full standard 10-milestone catalog. Different projects can select
+    different subsets, so this filter is computed fresh per project.
+    """
     from sqlalchemy.orm import joinedload
     project = db.query(Project).filter_by(id=project_id).first()
-    pms = db.query(ProjectMilestone).filter_by(
-        project_id=project_id).order_by(ProjectMilestone.num).all()
+    selected_nums = {
+        cm.num for cm in db.query(CustomMilestone).filter_by(
+            project_id=project_id, is_active=True
+        ).all()
+    }
+    pm_query = db.query(ProjectMilestone).filter_by(project_id=project_id)
+    if selected_nums:
+        pm_query = pm_query.filter(ProjectMilestone.num.in_(selected_nums))
+    else:
+        # No milestones selected yet for this project — export nothing
+        # rather than silently falling back to all 10 standard milestones.
+        pm_query = pm_query.filter(ProjectMilestone.num.in_([-1]))
+    pms = pm_query.order_by(ProjectMilestone.num).all()
     milestones = {
         ms.num: ms for ms in db.query(Milestone).options(
             joinedload(Milestone.tasks)
@@ -286,7 +304,7 @@ def export_pdf(project_id: int, milestone: int = None, db: Session = Depends(get
         ["Owner:", project.owner if project else "—"],
         ["Exported by:", current_user.name],
         ["Export date:", date.today().strftime("%d %B %Y")],
-        ["Total milestones:", "10"],
+        ["Total milestones:", str(len(pms))],
     ]
     cover_table = Table(cover_data, colWidths=[5*cm, 12*cm])
     cover_table.setStyle(TableStyle([

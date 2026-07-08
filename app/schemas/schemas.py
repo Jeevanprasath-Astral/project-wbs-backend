@@ -17,6 +17,7 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
     role: str = "Functional Consultant"
+    cost_rate: Optional[float] = 0.0
 
 class UserOut(BaseModel):
     id: int
@@ -24,6 +25,7 @@ class UserOut(BaseModel):
     email: str
     role: str
     is_active: bool
+    cost_rate: Optional[float] = 0.0
     model_config = {"from_attributes": True}
 
 # ── Projects ──────────────────────────────────────────────────────────────────
@@ -34,11 +36,13 @@ class ProjectCreate(BaseModel):
     owner: Optional[str] = None
     location: Optional[str] = None
     project_type: str = "Implementation"
+    project_category: Optional[str] = "Billable"
     functional_consultant: Optional[str] = None
     technical_lead: Optional[str] = None
     description: Optional[str] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
+    billing_amount: Optional[float] = 0.0
 
 class ProjectOut(BaseModel):
     id: int
@@ -48,6 +52,7 @@ class ProjectOut(BaseModel):
     owner: Optional[str]
     location: Optional[str]
     project_type: Optional[str]
+    project_category: Optional[str] = "Billable"
     functional_consultant: Optional[str]
     technical_lead: Optional[str]
     description: Optional[str]
@@ -55,6 +60,8 @@ class ProjectOut(BaseModel):
     end_date: Optional[datetime]
     status: str
     progress: float
+    budget: Optional[float] = 0.0
+    billing_amount: Optional[float] = 0.0
     created_at: Optional[datetime]
     model_config = {"from_attributes": True}
 
@@ -63,6 +70,8 @@ class ProjectUpdate(BaseModel):
     client: Optional[str] = None
     status: Optional[str] = None
     progress: Optional[float] = None
+    billing_amount: Optional[float] = None
+    project_category: Optional[str] = None
 
 # ── Questions & Responses ─────────────────────────────────────────────────────
 class QuestionOut(BaseModel):
@@ -141,6 +150,11 @@ class NotificationOut(BaseModel):
     email_sent: bool
     read: bool
     created_at: Optional[datetime]
+    # Requirement 7(b): the Notifications tab groups by assignee and shows a
+    # count rather than full message text by default — user_id/user_name
+    # are needed to group server-side-resolved notifications by person.
+    user_id: Optional[int] = None
+    user_name: Optional[str] = None
     model_config = {"from_attributes": True}
 
 # ── Audit ─────────────────────────────────────────────────────────────────────
@@ -148,11 +162,17 @@ class AuditOut(BaseModel):
     id: int
     actor: Optional[str]
     entity_type: Optional[str]
+    entity_id: Optional[int] = None
     action: Optional[str]
     description: Optional[str]
     old_value: Optional[str]
     new_value: Optional[str]
     created_at: Optional[datetime]
+    # Requirement 4: Audit Trail must show Created By / Modified By separately.
+    # created_by = actor of the earliest "create"-type log row for this
+    # entity_type+entity_id; modified_by = this row's own actor.
+    created_by: Optional[str] = None
+    modified_by: Optional[str] = None
     model_config = {"from_attributes": True}
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────

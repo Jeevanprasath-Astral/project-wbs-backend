@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     MAIL_ENABLED: bool = False
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # Cloudinary — file storage for attachments and cost documents
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
+
     class Config:
         env_file = ".env"
 

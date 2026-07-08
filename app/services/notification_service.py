@@ -1,10 +1,11 @@
 from sqlalchemy.orm import Session
+from typing import Optional
 from app.models.models import Notification
 from app.services.email_service import send_email
 
 def create_notification(
     db: Session,
-    project_id: int,
+    project_id: Optional[int],
     type: str,
     message: str,
     user_id: int = None,

@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.models import TaskAssignment, User, ProjectMember, Notification, Project, CustomTask, WorkHours
 from app.core.deps import get_current_user
-from app.core.permissions import is_elevated
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
 from app.services.email_service import email_task_assigned
@@ -34,7 +33,6 @@ class AssignmentCreate(BaseModel):
     planned_start: Optional[datetime] = None
     planned_end: Optional[datetime] = None
     remarks: Optional[str] = None
-    category: Optional[str] = None
 
 class AssignmentUpdate(BaseModel):
     status: Optional[str] = None
@@ -53,7 +51,6 @@ class AssignmentUpdate(BaseModel):
     # instead. See _assignment_actual_hours below.
     actual_start: Optional[datetime] = None
     actual_end: Optional[datetime] = None
-    category: Optional[str] = None
 
 def _assignment_actual_hours(a: TaskAssignment, db: Session) -> float:
     """Actual Hours logged against this assignment so far.
@@ -88,18 +85,6 @@ def _build_assignment(a: TaskAssignment, db: Session):
     assignee = db.query(User).filter_by(id=a.assigned_to).first()
     assigner = db.query(User).filter_by(id=a.assigned_by).first()
     task = db.query(CustomTask).filter_by(id=a.custom_task_id).first() if a.custom_task_id else None
-    # Whether a genuine Working Hours entry (anything other than our own
-    # auto-synced "Assignment"-level row) already exists for this assignment.
-    # When true, actual_hours below is driven entirely by that real entry --
-    # the actual_start/actual_end fields on this row become a stale,
-    # disconnected pair (e.g. could show 15:00-16:00 while actual_hours shows
-    # 4h from a separately-logged Working Hours session). The frontend uses
-    # this flag to hide the now-meaningless manual editor instead of showing
-    # numbers that don't reconcile with each other.
-    hours_via_working_hours = any(
-        w.level != "Assignment"
-        for w in db.query(WorkHours).filter_by(assignment_id=a.id).all()
-    )
     return {
         "id":            a.id,
         "title":         a.title,
@@ -121,12 +106,10 @@ def _build_assignment(a: TaskAssignment, db: Session):
         "actual_start":  a.actual_start,
         "actual_end":    a.actual_end,
         "actual_hours":  _assignment_actual_hours(a, db),
-        "hours_via_working_hours": hours_via_working_hours,
         "completed_at":  a.completed_at,
         "created_at":    a.created_at,
         "remarks":       a.remarks,
         "project_id":    a.project_id,
-        "category":      a.category,
     }
 
 @router.get("")
@@ -138,8 +121,8 @@ def list_assignments(
     current_user: User = Depends(get_current_user)
 ):
     q = db.query(TaskAssignment).filter_by(project_id=project_id)
-    # Admin/FC Lead/TC Lead see everything; everyone else only their own.
-    if not is_elevated(current_user):
+    # Non-admins only see their own assignments
+    if current_user.role != "Admin":
         q = q.filter_by(assigned_to=current_user.id)
     if team:
         q = q.filter_by(team=team)
@@ -166,9 +149,8 @@ def create_assignment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    _assign_roles = {"Associate", "Functional Consultant", "Technical Team"}
-    if not is_elevated(current_user) and current_user.role not in _assign_roles:
-        raise HTTPException(403, "Only Admin, Project Manager, FC Lead, TC Lead, or Associate can assign tasks")
+    if current_user.role not in ("Admin", "Functional Consultant"):
+        raise HTTPException(403, "Only Admin or Project Manager can assign tasks")
 
     assignee = db.query(User).filter_by(id=payload.assigned_to).first()
     if not assignee:
@@ -189,7 +171,6 @@ def create_assignment(
         planned_start=payload.planned_start,
         planned_end=payload.planned_end,
         remarks=payload.remarks,
-        category=payload.category,
     )
     db.add(a)
     db.flush()
@@ -303,8 +284,8 @@ def delete_assignment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not is_elevated(current_user):
-        raise HTTPException(403, "Only Admin, FC Lead or TC Lead can delete assignments")
+    if current_user.role != "Admin":
+        raise HTTPException(403, "Only Admin can delete assignments")
     a = db.query(TaskAssignment).filter_by(id=assignment_id, project_id=project_id).first()
     if not a:
         raise HTTPException(404, "Assignment not found")

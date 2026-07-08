@@ -135,7 +135,21 @@ def _build_milestone_detail(db: Session, project_id: int, ms_num: int, current_u
 
 @router.get("/milestones", response_model=List[dict])
 def list_milestones(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    pms = db.query(ProjectMilestone).filter_by(project_id=project_id).order_by(ProjectMilestone.num).all()
+    # Only return milestones the user has actually selected/confirmed for this
+    # project (CustomMilestone). If none are selected yet, return nothing —
+    # never fall back to the full standard 10-milestone catalog.
+    from app.models.models import CustomMilestone
+    selected_nums = {
+        cm.num for cm in db.query(CustomMilestone).filter_by(
+            project_id=project_id, is_active=True
+        ).all()
+    }
+    if not selected_nums:
+        return []
+    pms = db.query(ProjectMilestone).filter(
+        ProjectMilestone.project_id == project_id,
+        ProjectMilestone.num.in_(selected_nums),
+    ).order_by(ProjectMilestone.num).all()
     return [{"id": pm.id, "num": pm.num, "name": pm.name, "status": pm.status,
              "progress": pm.progress, "assignee": pm.assignee,
              "planned_start": pm.planned_start, "planned_end": pm.planned_end,
