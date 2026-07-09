@@ -37,10 +37,9 @@ def _init_project_milestones(db: Session, project: Project):
 
 @router.get("", response_model=List[ProjectOut])
 def list_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if current_user.role == "Admin":
-        return db.query(Project).order_by(Project.created_at.desc()).all()
-    member_project_ids = [m.project_id for m in db.query(ProjectMember).filter_by(user_id=current_user.id).all()]
-    return db.query(Project).filter(Project.id.in_(member_project_ids)).all()
+    # All authenticated users see all projects.
+    # Role-based permissions within each project are enforced at the action level.
+    return db.query(Project).order_by(Project.created_at.desc()).all()
 
 @router.post("", response_model=ProjectOut)
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

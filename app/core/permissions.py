@@ -26,8 +26,9 @@ swap conditions with a minimal diff.
 
 ELEVATED_ROLES         = {"Admin", "Project Manager", "FC Lead", "TC Lead"}
 PROJECT_CREATOR_ROLES  = {"Admin", "Project Manager"}
-TEAM_MANAGER_ROLES     = {"Admin", "HR"}
+TEAM_MANAGER_ROLES     = {"Admin", "HR", "Project Manager"}
 TIMESHEET_MANAGER_ROLES = {"Admin", "HR"}
+FINANCIAL_SETTINGS_ROLES = {"Admin", "HR"}
 
 # All role strings the app knows about — used by the Team page's role
 # dropdown and any place that needs to enumerate valid roles.
@@ -68,6 +69,10 @@ def is_timesheet_manager(user) -> bool:
 
 
 def is_admin(user) -> bool:
-    """Strict Admin-only check. Use for Financial Settings and actions that
-    should never be accessible by any other role."""
+    """Strict Admin-only check."""
     return getattr(user, "role", None) == "Admin"
+
+
+def can_access_financial_settings(user) -> bool:
+    """Financial Settings access — Admin and HR."""
+    return getattr(user, "role", None) in FINANCIAL_SETTINGS_ROLES
