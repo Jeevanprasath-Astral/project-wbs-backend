@@ -165,4 +165,19 @@ def delete_project(project_id: int, db: Session = Depends(get_db), current_user:
     db.commit()
     return {"status": "ok", "message": f"Project '{p.name}' deleted"}
 
-@router.de
+
+@router.delete("/{project_id}/team/{member_id}")
+def remove_member(project_id: int, member_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Remove a member from the project."""
+    if not is_team_manager(current_user):
+        raise HTTPException(403, "Only Admin or HR can remove team members")
+    member = db.query(ProjectMember).filter_by(id=member_id, project_id=project_id).first()
+    if not member:
+        raise HTTPException(404, "Member not found")
+    user = db.query(User).filter_by(id=member.user_id).first()
+    db.delete(member)
+    log_action(db, actor=current_user.name, action="remove_member",
+               description=f"Removed {user.name if user else 'user'} from project",
+               project_id=project_id, user_id=current_user.id)
+    db.commit()
+    return {"status": "ok"}
