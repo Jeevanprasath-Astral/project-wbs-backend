@@ -84,22 +84,39 @@ def _assignment_actual_hours(a: TaskAssignment, db: Session) -> float:
         return round(max((a.actual_end - a.actual_start).total_seconds() / 3600.0, 0.0), 2)
     return 0.0
 
-def _build_assignment(a: TaskAssignment, db: Session):
-    assignee = db.query(User).filter_by(id=a.assigned_to).first()
-    assigner = db.query(User).filter_by(id=a.assigned_by).first()
-    task = db.query(CustomTask).filter_by(id=a.custom_task_id).first() if a.custom_task_id else None
-    # Whether a genuine Working Hours entry (anything other than our own
-    # auto-synced "Assignment"-level row) already exists for this assignment.
-    # When true, actual_hours below is driven entirely by that real entry --
-    # the actual_start/actual_end fields on this row become a stale,
-    # disconnected pair (e.g. could show 15:00-16:00 while actual_hours shows
-    # 4h from a separately-logged Working Hours session). The frontend uses
-    # this flag to hide the now-meaningless manual editor instead of showing
-    # numbers that don't reconcile with each other.
-    hours_via_working_hours = any(
-        w.level != "Assignment"
-        for w in db.query(WorkHours).filter_by(assignment_id=a.id).all()
+def _build_assignment(a: TaskAssignment, db: Session,
+                      user_map=None, task_map=None, wh_map=None):
+    """
+    Build the assignment dict.
+    Pass pre-fetched user_map/task_map/wh_map for bulk list endpoints
+    to avoid N+1 queries.  Single-record endpoints can leave them as None
+    and the function falls back to individual DB lookups.
+    """
+    if user_map is not None:
+        assignee = user_map.get(a.assigned_to)
+        assigner = user_map.get(a.assigned_by)
+    else:
+        assignee = db.query(User).filter_by(id=a.assigned_to).first()
+        assigner = db.query(User).filter_by(id=a.assigned_by).first()
+
+    if task_map is not None:
+        task = task_map.get(a.custom_task_id) if a.custom_task_id else None
+    else:
+        task = db.query(CustomTask).filter_by(id=a.custom_task_id).first() if a.custom_task_id else None
+
+    if wh_map is not None:
+        wh_rows = wh_map.get(a.id, [])
+    else:
+        wh_rows = db.query(WorkHours).filter_by(assignment_id=a.id).all()
+
+    hours_via_working_hours = any(w.level != "Assignment" for w in wh_rows)
+    # Re-use the existing helper but pass pre-loaded rows to avoid another query
+    actual_hours = round(sum(max((h or 0.0) - (b or 0.0), 0.0) for h, b in
+                             [(w.hours_spent, w.buffer_hours) for w in wh_rows]), 2) if wh_rows else (
+        round(max((a.actual_end - a.actual_start).total_seconds() / 3600.0, 0.0), 2)
+        if (not a.milestone_num and not a.custom_task_id and a.actual_start and a.actual_end) else 0.0
     )
+
     return {
         "id":            a.id,
         "title":         a.title,
@@ -120,7 +137,7 @@ def _build_assignment(a: TaskAssignment, db: Session):
         "planned_end":   a.planned_end,
         "actual_start":  a.actual_start,
         "actual_end":    a.actual_end,
-        "actual_hours":  _assignment_actual_hours(a, db),
+        "actual_hours":  actual_hours,
         "hours_via_working_hours": hours_via_working_hours,
         "completed_at":  a.completed_at,
         "created_at":    a.created_at,
@@ -128,6 +145,26 @@ def _build_assignment(a: TaskAssignment, db: Session):
         "project_id":    a.project_id,
         "category":      a.category,
     }
+
+
+def _bulk_prefetch(assignments, db):
+    """
+    Pre-fetch users, tasks, and work-hours for a list of assignments
+    in 3 queries instead of 3*N queries.
+    """
+    user_ids = {a.assigned_to for a in assignments} | {a.assigned_by for a in assignments if a.assigned_by}
+    task_ids = {a.custom_task_id for a in assignments if a.custom_task_id}
+    a_ids    = [a.id for a in assignments]
+
+    user_map = {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+    task_map = {t.id: t for t in db.query(CustomTask).filter(CustomTask.id.in_(task_ids)).all()} if task_ids else {}
+
+    from collections import defaultdict
+    wh_map: dict = defaultdict(list)
+    for w in db.query(WorkHours).filter(WorkHours.assignment_id.in_(a_ids)).all():
+        wh_map[w.assignment_id].append(w)
+
+    return user_map, task_map, wh_map
 
 @router.get("")
 def list_assignments(
@@ -146,7 +183,10 @@ def list_assignments(
     if status:
         q = q.filter_by(status=status)
     assignments = q.order_by(TaskAssignment.created_at.desc()).all()
-    return [_build_assignment(a, db) for a in assignments]
+    if not assignments:
+        return []
+    user_map, task_map, wh_map = _bulk_prefetch(assignments, db)
+    return [_build_assignment(a, db, user_map, task_map, wh_map) for a in assignments]
 
 @router.get("/my")
 def my_assignments(
@@ -157,7 +197,10 @@ def my_assignments(
     assignments = db.query(TaskAssignment).filter_by(
         project_id=project_id, assigned_to=current_user.id
     ).order_by(TaskAssignment.created_at.desc()).all()
-    return [_build_assignment(a, db) for a in assignments]
+    if not assignments:
+        return []
+    user_map, task_map, wh_map = _bulk_prefetch(assignments, db)
+    return [_build_assignment(a, db, user_map, task_map, wh_map) for a in assignments]
 
 @router.post("")
 def create_assignment(
