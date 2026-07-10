@@ -1425,3 +1425,23 @@ def hours_summary(
         "by_milestone": by_milestone,
         "by_person": by_person,
     }
+
+
+# ── Single milestone GET (for targeted frontend refresh without full reload) ──
+# Placed last so all static paths (/templates, /hours-summary, etc.)
+# are matched before this wildcard capture.
+@router.get("/{milestone_id}")
+def get_one_milestone(
+    project_id: int, milestone_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Return one fully-nested milestone (tasks → subtasks → activities).
+    Used by the frontend updateOneMilestone() to refresh a single card
+    after a save without triggering a full page reload."""
+    ms = db.query(CustomMilestone).options(
+        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.activities)
+    ).filter_by(id=milestone_id, project_id=project_id).first()
+    if not ms:
+        raise HTTPException(404, "Milestone not found")
+    return _build(ms, db)
