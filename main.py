@@ -190,6 +190,43 @@ def _run_lightweight_migrations():
             uploaded_by INTEGER REFERENCES users(id),
             created_at TIMESTAMPTZ DEFAULT now()
         )""",
+        # Employee filter bug fix — Task #157 seeded 5 role-based demo accounts
+        # using the role name as the user's display name (e.g. name="Project Manager").
+        # The Global Dashboard / Workload employee filter then showed role names
+        # instead of real names. Rename those placeholder accounts to proper
+        # human names. Guard: only match rows where name = role exactly, so
+        # real accounts whose names happen to match are not affected.
+        "UPDATE users SET name = 'Arjun Ramachandran'   WHERE name = 'Project Manager'   AND role = 'Project Manager'",
+        "UPDATE users SET name = 'Priya Krishnamurthy'  WHERE name = 'FC Lead'            AND role = 'FC Lead'",
+        "UPDATE users SET name = 'Karthik Subramanian'  WHERE name = 'Technical Lead'     AND role = 'Technical Lead'",
+        "UPDATE users SET name = 'Meena Sundaram'       WHERE name = 'HR Manager'         AND role = 'HR Manager'",
+        "UPDATE users SET name = 'Suresh Natarajan'     WHERE name = 'Client Reviewer'    AND role = 'Client Reviewer'",
+        # ── Performance: indexes on high-traffic FK columns ───────────────────
+        # work_hours is the most-queried table (every page that shows actual
+        # hours hits it). Without these indexes every filter is a full-table
+        # sequential scan; with them PostgreSQL uses a B-tree index seek instead.
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_project_id         ON work_hours(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_user_id            ON work_hours(user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_custom_milestone_id ON work_hours(custom_milestone_id)",
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_custom_task_id     ON work_hours(custom_task_id)",
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_custom_subtask_id  ON work_hours(custom_subtask_id)",
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_activity_id        ON work_hours(activity_id)",
+        # task_assignments: filtered by project_id and custom_task_id on every
+        # Milestone Config list load (was part of the N+1 pattern now fixed).
+        "CREATE INDEX IF NOT EXISTS ix_task_assignments_project_id   ON task_assignments(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_task_assignments_custom_task_id ON task_assignments(custom_task_id)",
+        "CREATE INDEX IF NOT EXISTS ix_task_assignments_assigned_to  ON task_assignments(assigned_to)",
+        # Milestone hierarchy — filtered by project_id on every page open.
+        "CREATE INDEX IF NOT EXISTS ix_custom_milestones_project_id  ON custom_milestones(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_custom_tasks_milestone_id     ON custom_tasks(milestone_id)",
+        "CREATE INDEX IF NOT EXISTS ix_custom_tasks_project_id       ON custom_tasks(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_custom_subtasks_task_id       ON custom_subtasks(task_id)",
+        "CREATE INDEX IF NOT EXISTS ix_custom_subtasks_project_id    ON custom_subtasks(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_activities_subtask_id         ON activities(subtask_id)",
+        "CREATE INDEX IF NOT EXISTS ix_activities_project_id         ON activities(project_id)",
+        # Notifications: the bell-icon unread count hits this on every page load.
+        "CREATE INDEX IF NOT EXISTS ix_notifications_user_id         ON notifications(user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_notifications_is_read         ON notifications(is_read)",
     ]
     try:
         with engine.begin() as conn:

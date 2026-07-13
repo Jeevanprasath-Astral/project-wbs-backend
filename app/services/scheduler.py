@@ -8,6 +8,8 @@ from app.services.notification_service import create_notification
 from app.services.email_service import email_overdue, email_due_reminder
 from datetime import datetime, timedelta
 import logging
+import os
+import urllib.request
 
 logger = logging.getLogger(__name__)
 scheduler = BackgroundScheduler()
@@ -169,10 +171,28 @@ def check_overdue_and_reminders():
     finally:
         db.close()
 
+def _keepalive_ping():
+    """Ping /api/ping every 10 min so Render free tier never idles long enough
+    to spin the server down (Render sleeps after 15 min of inactivity; 10-min
+    interval gives a safe buffer).  Runs inside the server process, invisible
+    to users.  Render injects RENDER_EXTERNAL_URL automatically.  On localhost
+    that variable is absent so the ping is skipped silently."""
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base_url:
+        return  # not on Render -- skip
+    try:
+        url = base_url + "/api/ping"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            logger.info("Keepalive ping -> %s  status=%s", url, resp.status)
+    except Exception as e:
+        logger.warning("Keepalive ping failed: %s", e)
+
+
 def start_scheduler():
     scheduler.add_job(check_overdue_and_reminders, "interval", hours=6, id="overdue_check")
+    scheduler.add_job(_keepalive_ping, "interval", minutes=10, id="keepalive_ping")
     scheduler.start()
-    logger.info("Scheduler started — checking every 6 hours.")
+    logger.info("Scheduler started -- overdue check every 6 h, keepalive ping every 10 min.")
 
 def stop_scheduler():
     scheduler.shutdown()

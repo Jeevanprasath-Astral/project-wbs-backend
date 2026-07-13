@@ -154,6 +154,189 @@ def _milestone_hours(db: Session, ms: CustomMilestone):
     return estimated, actual
 
 
+# ── Pre-fetch context for list endpoint (eliminates N+1 queries) ─────────────
+def _make_list_ctx(db: Session, project_id: int) -> dict:
+    """Pre-fetch all WorkHours and TaskAssignments for a project in 3 queries
+    total, then build in-memory lookup dicts that replace the per-entity DB
+    calls (_wh_sum / _linked_assignee_id) inside _build and friends.
+
+    Without this, listing N milestones with T tasks each and S subtasks each
+    triggered O(N*T*S) separate DB round-trips — 150-670+ queries for a
+    typical project. With this, the list endpoint costs exactly 3 queries
+    regardless of how many milestones/tasks/subtasks exist.
+    """
+    from collections import defaultdict
+
+    # Query 1: all work-hour rows for this project
+    all_wh = db.query(WorkHours).filter(WorkHours.project_id == project_id).all()
+
+    # wh[(entity_type_char, entity_id)][user_id_or_None] = cumulative hours
+    # None key = any-user total (used when no specific user is identified)
+    wh: dict = defaultdict(lambda: defaultdict(float))
+    for row in all_wh:
+        h = max((row.hours_spent or 0.0) - (row.buffer_hours or 0.0), 0.0)
+        uid = row.user_id
+        for key in [
+            ('ms', row.custom_milestone_id),
+            ('t',  row.custom_task_id),
+            ('s',  row.custom_subtask_id),
+            ('a',  row.activity_id),
+        ]:
+            if key[1] is not None:
+                wh[key][uid]  += h
+                wh[key][None] += h  # None = sum over all users
+
+    # Query 2: all task assignments for this project (ordered newest-first so
+    # first-seen wins when building the "most recent" map)
+    all_ta = db.query(TaskAssignment).filter(
+        TaskAssignment.project_id == project_id
+    ).order_by(TaskAssignment.created_at.desc()).all()
+
+    ta_by_task: dict  = {}   # custom_task_id  -> assigned_to user_id
+    ta_by_msnum: dict = {}   # milestone_num   -> assigned_to user_id (task_id=None)
+    for ta in all_ta:
+        if ta.custom_task_id is not None:
+            ta_by_task.setdefault(ta.custom_task_id, ta.assigned_to)
+        elif ta.milestone_num is not None:
+            ta_by_msnum.setdefault(ta.milestone_num, ta.assigned_to)
+
+    # Query 3: name→id map for assignee resolution
+    all_users = db.query(User.id, User.name).all()
+    user_name_to_id: dict = {
+        u.name.strip().lower(): u.id for u in all_users if u.name
+    }
+
+    return {
+        "wh": wh,
+        "ta_by_task": ta_by_task,
+        "ta_by_msnum": ta_by_msnum,
+        "user_name_to_id": user_name_to_id,
+    }
+
+
+def _ctx_wh_sum(ctx: dict, entity_key: tuple, user_id=None) -> float:
+    return round(ctx["wh"][entity_key].get(user_id, 0.0), 2)
+
+
+def _ctx_wh_for_assignee(ctx: dict, assignee, entity_key: tuple) -> float:
+    uid = None
+    if assignee:
+        uid = ctx["user_name_to_id"].get(assignee.strip().lower())
+    return _ctx_wh_sum(ctx, entity_key, user_id=uid)
+
+
+def _activity_hours_ctx(ctx: dict, a: "Activity"):
+    estimated = a.estimated_hours or 0.0
+    actual    = _ctx_wh_for_assignee(ctx, a.assignee, ("a", a.id))
+    return estimated, actual
+
+
+def _subtask_hours_ctx(ctx: dict, s: "CustomSubtask"):
+    estimated = s.estimated_hours or 0.0
+    actual    = _ctx_wh_for_assignee(ctx, s.assignee, ("s", s.id))
+    for a in s.activities:
+        a_est, a_act = _activity_hours_ctx(ctx, a)
+        estimated += a_est
+        actual    += a_act
+    return estimated, actual
+
+
+def _task_hours_ctx(ctx: dict, t: "CustomTask"):
+    estimated = 0.0
+    linked_uid = ctx["ta_by_task"].get(t.id)
+    if linked_uid is not None:
+        actual = _ctx_wh_sum(ctx, ("t", t.id), user_id=linked_uid)
+    else:
+        actual = _ctx_wh_for_assignee(ctx, t.assignee, ("t", t.id))
+    for s in t.subtasks:
+        s_est, s_act = _subtask_hours_ctx(ctx, s)
+        estimated += s_est
+        actual    += s_act
+    return estimated, actual
+
+
+def _milestone_hours_ctx(ctx: dict, ms: "CustomMilestone"):
+    estimated = 0.0
+    linked_uid = ctx["ta_by_msnum"].get(ms.num)
+    if linked_uid is not None:
+        actual = _ctx_wh_sum(ctx, ("ms", ms.id), user_id=linked_uid)
+    else:
+        actual = _ctx_wh_for_assignee(ctx, ms.assignee, ("ms", ms.id))
+    for t in ms.tasks:
+        t_est, t_act = _task_hours_ctx(ctx, t)
+        estimated += t_est
+        actual    += t_act
+    return estimated, actual
+
+
+def _build_activity_ctx(a: "Activity", ctx: dict):
+    est, act = _activity_hours_ctx(ctx, a)
+    return {
+        "id": a.id, "name": a.name, "status": a.status, "assignee": a.assignee,
+        "planned_start": a.planned_start, "planned_end": a.planned_end,
+        "actual_start": a.actual_start, "actual_end": a.actual_end,
+        "start_time": a.start_time, "end_time": a.end_time,
+        "estimated_hours": a.estimated_hours or 0.0,
+        "own_estimated_hours": a.estimated_hours or 0.0,
+        "actual_hours": act,
+        "total_days": _total_days(a.planned_start, a.planned_end) or _total_days(a.actual_start, a.actual_end),
+    }
+
+
+def _build_subtask_ctx(s: "CustomSubtask", ctx: dict):
+    est, act = _subtask_hours_ctx(ctx, s)
+    return {
+        "id": s.id, "num": s.num, "name": s.name,
+        "input_type": s.input_type, "response": s.response, "status": s.status,
+        "assignee": s.assignee,
+        "planned_start": s.planned_start, "planned_end": s.planned_end,
+        "actual_start": s.actual_start, "actual_end": s.actual_end,
+        "start_time": s.start_time, "end_time": s.end_time,
+        "estimated_hours": est, "own_estimated_hours": s.estimated_hours or 0.0,
+        "actual_hours": act,
+        "total_days": _total_days(s.planned_start, s.planned_end) or _total_days(s.actual_start, s.actual_end),
+        "activities": [_build_activity_ctx(a, ctx) for a in sorted(s.activities, key=lambda x: x.id)],
+        "questions": [_build_question(q) for q in sorted(s.questions, key=lambda x: (x.num or 0, x.id))],
+        "reports": [_build_report(r) for r in sorted(s.reports, key=lambda x: x.id)],
+    }
+
+
+def _build_task_ctx(t: "CustomTask", ctx: dict):
+    est, act = _task_hours_ctx(ctx, t)
+    return {
+        "id": t.id, "num": t.num, "name": t.name,
+        "responsibility": t.responsibility,
+        "status": t.status, "assignee": t.assignee,
+        "planned_start": t.planned_start, "planned_end": t.planned_end,
+        "actual_start": t.actual_start, "actual_end": t.actual_end,
+        "start_time": t.start_time, "end_time": t.end_time,
+        "estimated_hours": est, "actual_hours": act,
+        "total_days": _total_days(t.planned_start, t.planned_end) or _total_days(t.actual_start, t.actual_end),
+        "subtasks": [_build_subtask_ctx(s, ctx) for s in sorted(t.subtasks, key=lambda x: x.num or 0)],
+    }
+
+
+def _build_ctx(ms: "CustomMilestone", ctx: dict):
+    est, act = _milestone_hours_ctx(ctx, ms)
+    return {
+        "id": ms.id, "num": ms.num, "name": ms.name,
+        "description": ms.description, "responsible": ms.responsible,
+        "is_active": ms.is_active,
+        "status": ms.status, "assignee": ms.assignee,
+        "planned_start": ms.planned_start, "planned_end": ms.planned_end,
+        "actual_start": ms.actual_start, "actual_end": ms.actual_end,
+        "start_time": ms.start_time, "end_time": ms.end_time,
+        "schedule_variance_reason": ms.schedule_variance_reason,
+        "iteration": ms.iteration or 1,
+        "revision_reason": ms.revision_reason,
+        "revision_description": ms.revision_description,
+        "estimated_hours": est, "actual_hours": act,
+        "total_days": _total_days(ms.planned_start, ms.planned_end) or _total_days(ms.actual_start, ms.actual_end),
+        "reports": [_build_milestone_report(r) for r in sorted(ms.reports, key=lambda x: x.id)],
+        "tasks": [_build_task_ctx(t, ctx) for t in sorted(ms.tasks, key=lambda x: x.num or 0)],
+    }
+
+
 def _notify_task_assignment(db: Session, project_id: int, task: CustomTask, milestone_name: str):
     """Requirement: once a Task is assigned, auto-generate an email AND a
     Notifications-tab entry for the assignee."""
@@ -588,11 +771,23 @@ def list_custom_milestones(
     current_user: User = Depends(get_current_user)
 ):
     milestones = db.query(CustomMilestone).options(
-        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.activities)
+        joinedload(CustomMilestone.tasks)
+            .joinedload(CustomTask.subtasks)
+            .joinedload(CustomSubtask.activities),
+        joinedload(CustomMilestone.tasks)
+            .joinedload(CustomTask.subtasks)
+            .joinedload(CustomSubtask.questions),
+        joinedload(CustomMilestone.tasks)
+            .joinedload(CustomTask.subtasks)
+            .joinedload(CustomSubtask.reports),
+        joinedload(CustomMilestone.reports),
     ).filter_by(project_id=project_id).order_by(
         CustomMilestone.num, CustomMilestone.iteration
     ).all()
-    return [_build(ms, db) for ms in milestones]
+    # Pre-fetch WorkHours + TaskAssignments in 3 queries, then build entirely
+    # from in-memory lookups — eliminates the O(N×T×S) per-entity DB calls.
+    ctx = _make_list_ctx(db, project_id)
+    return [_build_ctx(ms, ctx) for ms in milestones]
 
 
 # ── Add from standard template (selective Task/Subtask picking) ──────────────
