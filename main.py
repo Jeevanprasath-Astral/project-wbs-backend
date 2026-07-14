@@ -247,41 +247,49 @@ def _run_lightweight_migrations():
 _run_lightweight_migrations()
 
 def _update_user_accounts():
-    """Set real names, office emails and hashed temp passwords for the 5
-    role-based accounts.  Each account is updated in its own DB transaction
-    so a single constraint error on one row cannot roll back all the others.
-    Uses a LIMIT-1 subquery so duplicate-role rows don't cause unique-email
-    conflicts.  Idempotent: re-running on an already-updated DB is a no-op."""
+    """Set real names, office emails and hashed passwords for the 5 role-based
+    accounts.  Matches by OLD email OR new email so the function is idempotent
+    across multiple deploys.  Each account runs in its own transaction so one
+    failure cannot roll back the others."""
     from app.core.security import hash_password
     from sqlalchemy import text as _sql
+    # (old_email, new_name, new_email, password)
+    # old_email = what the seed put in; new_email = real office address.
+    # If already migrated, old_email won't exist but new_email will — still a no-op update.
     accounts = [
-        ("Admin",          "Jeevan Prasath. J", "jeevanprasath.j@astralbusinessconsulting.in",  "Admin@2026"),
-        ("Project Manager","Gayathri. P",        "gayathri.p@astralbusinessconsulting.com",       "PManager@2026"),
-        ("HR Manager",     "Manikandan. S",      "manikandan.s@astralbusinessconsulting.com",     "HRUser@2026"),
-        ("FC Lead",        "Manikandan. M",      "manikandan.m@astralbusinessconsulting.in",      "FCLead@2026"),
-        ("Technical Lead", "Sanjeev. V",         "sanjeev.v@astralbusinessconsulting.in",         "TCLead@2026"),
+        ("admin@wbs.com",
+         "Jeevan Prasath. J", "jeevanprasath.j@astralbusinessconsulting.in", "Admin@2026"),
+        ("pm@wbs.com",
+         "Gayathri. P",       "gayathri.p@astralbusinessconsulting.com",      "PManager@2026"),
+        ("hr@wbs.com",
+         "Manikandan. S",     "manikandan.s@astralbusinessconsulting.com",     "HRUser@2026"),
+        ("fc@wbs.com",
+         "Manikandan. M",     "manikandan.m@astralbusinessconsulting.in",      "FCLead@2026"),
+        ("tclead@wbs.com",
+         "Sanjeev. V",        "sanjeev.v@astralbusinessconsulting.in",         "TCLead@2026"),
     ]
-    for role, name, email, temp_pwd in accounts:
+    for old_email, name, new_email, temp_pwd in accounts:
         try:
             with engine.begin() as _conn:
                 res = _conn.execute(_sql(
                     """UPDATE users
-                          SET name         = :name,
-                              email        = :email,
+                          SET name          = :name,
+                              email         = :new_email,
                               password_hash = :ph
                         WHERE id = (
                             SELECT id FROM users
-                            WHERE  role = :role
+                            WHERE  email IN (:old_email, :new_email)
                             ORDER  BY id
                             LIMIT  1
                         )"""
-                ), {"name": name, "email": email, "ph": hash_password(temp_pwd), "role": role})
+                ), {"name": name, "new_email": new_email,
+                    "ph": hash_password(temp_pwd), "old_email": old_email})
                 if res.rowcount:
-                    logging.info(f"_update_user_accounts OK  role={role!r} → {email}")
+                    logging.info(f"_update_user_accounts OK  {old_email!r} → {new_email}")
                 else:
-                    logging.warning(f"_update_user_accounts SKIP role={role!r} — no user found")
+                    logging.warning(f"_update_user_accounts SKIP {old_email!r} — not found")
         except Exception as _ex:
-            logging.error(f"_update_user_accounts FAIL role={role!r}: {_ex}")
+            logging.error(f"_update_user_accounts FAIL {old_email!r}: {_ex}")
 
 _update_user_accounts()
 
@@ -403,6 +411,56 @@ def debug_accounts():
     users = db.query(User.id, User.role, User.name, User.email).order_by(User.id).all()
     db.close()
     return [{"id": u.id, "role": u.role, "name": u.name, "email": u.email} for u in users]
+
+@app.get("/api/setup-accounts")
+def setup_accounts():
+    """TEMPORARY one-time endpoint — sets correct name/email/password for all
+    5 role-based accounts using the server's own hash function (same SECRET_KEY
+    as the login endpoint). Call once after deploy, then ignore — safe to call
+    multiple times (idempotent).  Remove in the next cleanup deploy."""
+    from app.db.database import SessionLocal
+    from app.models.models import User
+    from app.core.security import hash_password, verify_password
+    # (current_email_in_db, target_name, target_email, password)
+    # Uses current email to locate the row — avoids role-name mismatches.
+    accounts = [
+        ("jeevanprasath.j@astralbusinessconsulting.in", "Jeevan Prasath. J",
+         "jeevanprasath.j@astralbusinessconsulting.in",  "Admin@2026"),
+        ("gayathri.p@astralbusinessconsulting.com",       "Gayathri. P",
+         "gayathri.p@astralbusinessconsulting.com",        "PManager@2026"),
+        ("manikandan.m@astralbusinessconsulting.in",       "Manikandan. M",
+         "manikandan.m@astralbusinessconsulting.in",        "FCLead@2026"),
+        # HR Manager — old email hr@wbs.com; role in DB is "HR"
+        ("hr@wbs.com",                                    "Manikandan. S",
+         "manikandan.s@astralbusinessconsulting.com",      "HRUser@2026"),
+        # Technical Lead — old email tclead@wbs.com; role in DB is "TC Lead"
+        ("tclead@wbs.com",                                "Sanjeev. V",
+         "sanjeev.v@astralbusinessconsulting.in",          "TCLead@2026"),
+    ]
+    db = SessionLocal()
+    results = []
+    try:
+        for old_email, name, new_email, pwd in accounts:
+            u = db.query(User).filter(User.email == old_email).first()
+            if not u:
+                results.append({"email": new_email, "status": "NOT FOUND (check old email)"})
+                continue
+            u.name         = name
+            u.email        = new_email
+            u.password_hash = hash_password(pwd)
+            db.flush()
+            # Immediate verify inside the same process — proves hash is correct
+            ok = verify_password(pwd, u.password_hash)
+            results.append({"email": new_email,
+                             "status": "updated",
+                             "verify": "PASS" if ok else "FAIL — hash mismatch!"})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        return {"status": "error", "message": str(exc)}
+    finally:
+        db.close()
+    return {"status": "success", "results": results}
 
 @app.get("/api/fix-passwords")
 def fix_passwords():
