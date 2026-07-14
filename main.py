@@ -19,7 +19,13 @@ import logging
 import os
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(name)s — %(levelname)s — %(message)s")
-Base.metadata.create_all(bind=engine)
+# Create tables individually so a pre-existing table (e.g. from a previous
+# partial deploy) doesn't crash the whole startup sequence.
+for _table in Base.metadata.sorted_tables:
+    try:
+        _table.create(bind=engine, checkfirst=True)
+    except Exception as _e:
+        logging.warning(f"Table '{_table.name}' creation skipped: {_e}")
 
 def _run_lightweight_migrations():
     """Add columns that create_all() can't add to already-existing tables."""
