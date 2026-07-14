@@ -1,27 +1,34 @@
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import urllib.request as _urllib
+import json as _json
 from app.core.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
 
 def send_email(to: str, subject: str, body: str) -> bool:
-    if not settings.MAIL_ENABLED or not settings.MAIL_USERNAME:
+    if not settings.MAIL_ENABLED:
         logger.info(f"[EMAIL DISABLED] To: {to} | Subject: {subject}")
         return False
+    if not settings.RESEND_API_KEY:
+        logger.error("RESEND_API_KEY is not set — email not sent")
+        return False
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = settings.MAIL_FROM
-        msg["To"]      = to
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT, timeout=15) as server:
-            if settings.MAIL_STARTTLS:
-                server.starttls()
-            server.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
-            server.send_message(msg)
-        logger.info(f"Email sent to {to}: {subject}")
+        payload = _json.dumps({
+            "from": settings.MAIL_FROM,
+            "to": [to],
+            "subject": subject,
+            "html": body
+        }).encode("utf-8")
+        req = _urllib.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            }
+        )
+        with _urllib.urlopen(req, timeout=15) as resp:
+            logger.info(f"Email sent to {to}: {subject} (HTTP {resp.status})")
         return True
     except Exception as e:
         logger.error(f"Email failed to {to}: {e}")
