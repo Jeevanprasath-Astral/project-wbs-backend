@@ -1,4 +1,5 @@
 import urllib.request as _urllib
+import urllib.error as _urllib_error
 import json as _json
 from app.core.config import settings
 import logging
@@ -30,7 +31,7 @@ def send_email(to: str, subject: str, body: str) -> bool:
         with _urllib.urlopen(req, timeout=15) as resp:
             logger.info(f"Email sent to {to}: {subject} (HTTP {resp.status})")
         return True
-    except _urllib.error.HTTPError as http_err:
+    except _urllib_error.HTTPError as http_err:
         err_body = http_err.read().decode("utf-8", errors="replace")
         logger.error(f"Email failed to {to}: HTTP {http_err.code} — {err_body}")
         return False
