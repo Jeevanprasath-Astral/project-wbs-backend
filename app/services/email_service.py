@@ -9,21 +9,21 @@ def send_email(to: str, subject: str, body: str) -> bool:
     if not settings.MAIL_ENABLED:
         logger.info(f"[EMAIL DISABLED] To: {to} | Subject: {subject}")
         return False
-    if not settings.RESEND_API_KEY:
-        logger.error("RESEND_API_KEY is not set — email not sent")
+    if not settings.BREVO_API_KEY:
+        logger.error("BREVO_API_KEY is not set — email not sent")
         return False
     try:
         payload = _json.dumps({
-            "from": settings.MAIL_FROM,
-            "to": [to],
+            "sender": {"name": "Axon WBS", "email": settings.MAIL_FROM},
+            "to": [{"email": to}],
             "subject": subject,
-            "html": body
+            "htmlContent": body
         }).encode("utf-8")
         req = _urllib.Request(
-            "https://api.resend.com/emails",
+            "https://api.brevo.com/v3/smtp/email",
             data=payload,
             headers={
-                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+                "api-key": settings.BREVO_API_KEY,
                 "Content-Type": "application/json"
             }
         )

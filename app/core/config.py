@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     MAIL_SSL_TLS: bool = False
     MAIL_ENABLED: bool = True
     RESEND_API_KEY: str = ""          # Set RESEND_API_KEY env var on Render
+    BREVO_API_KEY: str = ""           # Set BREVO_API_KEY env var on Render
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # Cloudinary — file storage for attachments and cost documents
