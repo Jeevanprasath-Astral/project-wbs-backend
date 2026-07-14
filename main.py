@@ -247,14 +247,13 @@ def _run_lightweight_migrations():
 _run_lightweight_migrations()
 
 def _update_user_accounts():
-    """One-time migration: set real names, office emails and hashed temp
-    passwords for the 5 role-based accounts. Idempotent -- subsequent runs
-    are no-ops because we guard on the role AND on the email still being the
-    old placeholder value. Once a user changes their own password the
-    password_hash guard no longer matches, so we only touch untouched rows."""
-    from app.db.database import SessionLocal
-    from app.models.models import User
+    """Set real names, office emails and hashed temp passwords for the 5
+    role-based accounts.  Each account is updated in its own DB transaction
+    so a single constraint error on one row cannot roll back all the others.
+    Uses a LIMIT-1 subquery so duplicate-role rows don't cause unique-email
+    conflicts.  Idempotent: re-running on an already-updated DB is a no-op."""
     from app.core.security import hash_password
+    from sqlalchemy import text as _sql
     accounts = [
         ("Admin",          "Jeevan Prasath. J", "jeevanprasath.j@astralbusinessconsulting.in",  "Admin@2026"),
         ("Project Manager","Gayathri. P",        "gayathri.p@astralbusinessconsulting.com",       "PManager@2026"),
@@ -262,21 +261,27 @@ def _update_user_accounts():
         ("FC Lead",        "Manikandan. M",      "manikandan.m@astralbusinessconsulting.in",      "FCLead@2026"),
         ("Technical Lead", "Sanjeev. V",         "sanjeev.v@astralbusinessconsulting.in",         "TCLead@2026"),
     ]
-    db = SessionLocal()
-    try:
-        for role, name, email, temp_pwd in accounts:
-            user = db.query(User).filter(User.role == role).first()
-            if user:
-                user.name         = name
-                user.email        = email
-                user.password_hash = hash_password(temp_pwd)
-        db.commit()
-        logging.info("User account migration completed.")
-    except Exception as e:
-        db.rollback()
-        logging.warning(f"User account migration failed: {e}")
-    finally:
-        db.close()
+    for role, name, email, temp_pwd in accounts:
+        try:
+            with engine.begin() as _conn:
+                res = _conn.execute(_sql(
+                    """UPDATE users
+                          SET name         = :name,
+                              email        = :email,
+                              password_hash = :ph
+                        WHERE id = (
+                            SELECT id FROM users
+                            WHERE  role = :role
+                            ORDER  BY id
+                            LIMIT  1
+                        )"""
+                ), {"name": name, "email": email, "ph": hash_password(temp_pwd), "role": role})
+                if res.rowcount:
+                    logging.info(f"_update_user_accounts OK  role={role!r} → {email}")
+                else:
+                    logging.warning(f"_update_user_accounts SKIP role={role!r} — no user found")
+        except Exception as _ex:
+            logging.error(f"_update_user_accounts FAIL role={role!r}: {_ex}")
 
 _update_user_accounts()
 
@@ -387,6 +392,17 @@ def seed_database():
         return {"status": "success", "message": "Database seeded!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/debug-accounts")
+def debug_accounts():
+    """TEMPORARY — shows current role/name/email for all users (no passwords).
+    Remove this endpoint after confirming account migration is correct."""
+    from app.db.database import SessionLocal
+    from app.models.models import User
+    db = SessionLocal()
+    users = db.query(User.id, User.role, User.name, User.email).order_by(User.id).all()
+    db.close()
+    return [{"id": u.id, "role": u.role, "name": u.name, "email": u.email} for u in users]
 
 @app.get("/api/fix-passwords")
 def fix_passwords():

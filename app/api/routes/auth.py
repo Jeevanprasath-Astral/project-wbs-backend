@@ -42,19 +42,32 @@ def me(current_user: User = Depends(get_current_user)):
 
 @router.post("/forgot-password")
 def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
-    # Always return the same message — never reveal if email exists
-    user = db.query(User).filter(User.email == payload.email).first()
-    if user:
-        # Delete any existing tokens for this email
-        db.query(PasswordResetToken).filter(PasswordResetToken.email == payload.email).delete()
-        # Generate a secure random token (expires in 15 minutes)
-        token = secrets.token_urlsafe(32)
-        expires_at = datetime.utcnow() + timedelta(minutes=15)
-        db.add(PasswordResetToken(email=payload.email, token=token, expires_at=expires_at))
-        db.commit()
-        # Build reset link using FRONTEND_URL from config
-        reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
-        send_password_reset_email(to=user.email, name=user.name, reset_link=reset_link)
+    import logging as _log
+    # Always return the same generic message — never reveal whether the email exists
+    try:
+        user = db.query(User).filter(User.email == payload.email).first()
+        if user:
+            # Delete any existing tokens for this email
+            db.query(PasswordResetToken).filter(
+                PasswordResetToken.email == payload.email
+            ).delete()
+            # Generate a secure random token (expires in 15 minutes)
+            token = secrets.token_urlsafe(32)
+            expires_at = datetime.utcnow() + timedelta(minutes=15)
+            db.add(PasswordResetToken(email=payload.email, token=token, expires_at=expires_at))
+            db.commit()
+            # Build reset link using FRONTEND_URL from config
+            reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+            send_password_reset_email(to=user.email, name=user.name, reset_link=reset_link)
+            _log.info(f"Password reset email dispatched to {user.email}")
+        else:
+            _log.info(f"Forgot-password: email not found in DB: {payload.email}")
+    except Exception as _exc:
+        _log.error(f"forgot_password error: {_exc}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
     return {"message": "If this email is registered, a password reset link has been sent."}
 
 @router.post("/reset-password")

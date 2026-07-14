@@ -16,7 +16,7 @@ def send_email(to: str, subject: str, body: str) -> bool:
         msg["From"]    = settings.MAIL_FROM
         msg["To"]      = to
         msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT) as server:
+        with smtplib.SMTP(settings.MAIL_SERVER, settings.MAIL_PORT, timeout=15) as server:
             if settings.MAIL_STARTTLS:
                 server.starttls()
             server.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
