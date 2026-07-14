@@ -62,6 +62,45 @@ def email_milestone_complete(to: str, milestone: str, project: str, completed_da
     """
     return send_email(to, subject, body)
 
+def send_password_reset_email(to: str, name: str, reset_link: str):
+    subject = "Reset your Axon WBS password"
+    body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;background:#f8fafc;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;">
+      <div style="background:linear-gradient(135deg,#091525,#0f2448);padding:32px 36px;text-align:center;">
+        <h1 style="color:#fff;font-size:22px;margin:0;letter-spacing:0.04em;">AXON</h1>
+        <p style="color:#4a6080;font-size:11px;margin:4px 0 0;letter-spacing:0.08em;">REQUIREMENT &amp; TRACKING SYSTEM</p>
+      </div>
+      <div style="padding:36px;">
+        <p style="font-size:15px;color:#0f172a;margin:0 0 12px;">Hi <strong>{name}</strong>,</p>
+        <p style="font-size:14px;color:#334155;margin:0 0 24px;line-height:1.6;">
+          We received a request to reset your password for <strong>Axon WBS</strong>.
+          Click the button below to set a new password.
+        </p>
+        <div style="text-align:center;margin:28px 0;">
+          <a href="{reset_link}"
+             style="display:inline-block;background:linear-gradient(135deg,#1d6ec6,#0d3e7a);
+                    color:#fff;font-size:15px;font-weight:700;padding:14px 32px;
+                    border-radius:10px;text-decoration:none;letter-spacing:0.01em;">
+            Reset My Password
+          </a>
+        </div>
+        <p style="font-size:12px;color:#64748b;margin:0 0 8px;">Or copy this link into your browser:</p>
+        <p style="font-size:11px;color:#1d6ec6;word-break:break-all;background:#f1f5f9;
+                  padding:10px 12px;border-radius:6px;margin:0 0 24px;">{reset_link}</p>
+        <div style="background:#fef9ec;border:1px solid #fde68a;border-radius:8px;padding:12px 14px;margin-bottom:24px;">
+          <p style="font-size:12px;color:#92400e;margin:0;">
+            <strong>This link expires in 15 minutes.</strong>
+            If you did not request a password reset, please ignore this email.
+            Your password will remain unchanged.
+          </p>
+        </div>
+        <p style="font-size:13px;color:#94a3b8;margin:0;">Regards,<br><strong style="color:#64748b;">Axon WBS Team</strong><br>
+        <span style="font-size:11px;">by Connectome</span></p>
+      </div>
+    </div>
+    """
+    return send_email(to, subject, body)
+
 def email_due_reminder(to: str, name: str, item: str, project: str, days_left: int, due_date: str):
     subject = f"[REMINDER] {item} due in {days_left} day(s) — {project}"
     body = f"""

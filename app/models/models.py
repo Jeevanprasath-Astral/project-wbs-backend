@@ -40,6 +40,15 @@ class Team(Base):
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
     members     = relationship("User", back_populates="team")
 
+# ── Password Reset Tokens ────────────────────────────────────────────────────
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    id         = Column(Integer, primary_key=True, index=True)
+    email      = Column(String(200), nullable=False, index=True)
+    token      = Column(String(100), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 # ── Users ────────────────────────────────────────────────────────────────────
 class User(Base):
     __tablename__ = "users"

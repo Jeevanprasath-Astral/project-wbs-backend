@@ -11,14 +11,14 @@ class Settings(BaseSettings):
     APP_PORT: int = 8000
     DEBUG: bool = True
     FRONTEND_URL: str = "http://localhost:5173"
-    MAIL_USERNAME: str = ""
-    MAIL_PASSWORD: str = ""
-    MAIL_FROM: str = ""
+    MAIL_USERNAME: str = "contact@connectome.co.in"
+    MAIL_PASSWORD: str = ""          # Set MAIL_PASSWORD env var on Render
+    MAIL_FROM: str = "contact@connectome.co.in"
     MAIL_PORT: int = 587
-    MAIL_SERVER: str = "smtp.gmail.com"
+    MAIL_SERVER: str = "smtp.office365.com"
     MAIL_STARTTLS: bool = True
     MAIL_SSL_TLS: bool = False
-    MAIL_ENABLED: bool = False
+    MAIL_ENABLED: bool = True
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # Cloudinary — file storage for attachments and cost documents

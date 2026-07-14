@@ -240,6 +240,40 @@ def _run_lightweight_migrations():
 
 _run_lightweight_migrations()
 
+def _update_user_accounts():
+    """One-time migration: set real names, office emails and hashed temp
+    passwords for the 5 role-based accounts. Idempotent -- subsequent runs
+    are no-ops because we guard on the role AND on the email still being the
+    old placeholder value. Once a user changes their own password the
+    password_hash guard no longer matches, so we only touch untouched rows."""
+    from app.db.database import SessionLocal
+    from app.models.models import User
+    from app.core.security import hash_password
+    accounts = [
+        ("Admin",          "Jeevan Prasath. J", "jeevanprasath.j@astralbusinessconsulting.in",  "Admin@2026"),
+        ("Project Manager","Gayathri. P",        "gayathri.p@astralbusinessconsulting.com",       "PManager@2026"),
+        ("HR Manager",     "Manikandan. S",      "manikandan.s@astralbusinessconsulting.com",     "HRUser@2026"),
+        ("FC Lead",        "Manikandan. M",      "manikandan.m@astralbusinessconsulting.in",      "FCLead@2026"),
+        ("Technical Lead", "Sanjeev. V",         "sanjeev.v@astralbusinessconsulting.in",         "TCLead@2026"),
+    ]
+    db = SessionLocal()
+    try:
+        for role, name, email, temp_pwd in accounts:
+            user = db.query(User).filter(User.role == role).first()
+            if user:
+                user.name         = name
+                user.email        = email
+                user.password_hash = hash_password(temp_pwd)
+        db.commit()
+        logging.info("User account migration completed.")
+    except Exception as e:
+        db.rollback()
+        logging.warning(f"User account migration failed: {e}")
+    finally:
+        db.close()
+
+_update_user_accounts()
+
 app = FastAPI(title=settings.APP_NAME, description="Project WBS API", version="2.0.0")
 
 app.add_middleware(CORSMiddleware,
