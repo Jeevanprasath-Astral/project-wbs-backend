@@ -286,6 +286,33 @@ def update_assignment(
         a.completed_at = datetime.utcnow()
         create_notification(db, project_id, "completed",
                             f"Task '{a.title}' marked completed by {current_user.name}")
+        # Email the person who created/assigned this task
+        _assigner = db.query(User).filter_by(id=a.assigned_by).first()
+        if _assigner and _assigner.email:
+            _project = db.query(Project).filter_by(id=project_id).first()
+            _project_name = _project.name if _project else "—"
+            _assignee = db.query(User).filter_by(id=a.assigned_to).first()
+            _completed_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+            _email_subject = f"[{_project_name}] Task Completed — {a.title}"
+            _email_body = f"""
+            <p>Hi {_assigner.name},</p>
+            <p>The following task has been marked as <strong style="color:green">Completed</strong>:</p>
+            <p><strong>Project:</strong> {_project_name}</p>
+            <p><strong>Task:</strong> {a.title}</p>
+            <p><strong>Assigned To:</strong> {_assignee.name if _assignee else '—'}</p>
+            <p><strong>Completed By:</strong> {current_user.name}</p>
+            <p><strong>Completed At:</strong> {_completed_str} UTC</p>
+            <p>Regards,<br>Project WBS System</p>
+            """
+            create_notification(
+                db, project_id, "completed",
+                f"Task '{a.title}' completed — notified {_assigner.name}",
+                user_id=_assigner.id,
+                email_to=_assigner.email,
+                send_now=True,
+                email_subject=_email_subject,
+                email_body=_email_body,
+            )
 
     # Bug fix: manually entering Actual start/end on a General task's card
     # (the only way to log time for a General task that has no Milestone/

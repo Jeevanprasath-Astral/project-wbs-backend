@@ -95,9 +95,29 @@ def check_overdue_and_reminders():
 
         for ms in upcoming:
             days_left = (ms.planned_end - now).days
+            user = _resolve_user_by_name(db, ms.assignee)
+            project = db.query(Project).filter_by(id=ms.project_id).first()
+            project_name = project.name if project else "—"
+            due_str = ms.planned_end.strftime("%Y-%m-%d") if ms.planned_end else "—"
+            email_subject = f"[{project_name}] Reminder — Milestone due in {days_left} day(s)"
+            email_body = f"""
+            <p>Hi {user.name if user else (ms.assignee or 'Team')},</p>
+            <p>This is a reminder that the following milestone is due soon:</p>
+            <p><strong>Project:</strong> {project_name}</p>
+            <p><strong>Milestone:</strong> {ms.name or f'M{ms.num:02d}'}</p>
+            <p><strong>Due Date:</strong> {due_str}</p>
+            <p><strong>Days Remaining:</strong> {days_left}</p>
+            <p>Please ensure timely completion.</p>
+            <p>Regards,<br>Project WBS System</p>
+            """
             create_notification(
                 db, ms.project_id, "reminder",
                 f"Milestone {ms.num:02d} '{ms.name}' is due in {days_left} day(s).",
+                user_id=user.id if user else None,
+                email_to=user.email if user else None,
+                send_now=bool(user and user.email),
+                email_subject=email_subject,
+                email_body=email_body,
             )
 
         # ── NEW path: CustomMilestone / CustomTask / CustomSubtask / Activity ─
@@ -158,9 +178,29 @@ def check_overdue_and_reminders():
         ).all()
         for ct in upcoming_tasks:
             days_left = (ct.planned_end - now).days
+            user = _resolve_user_by_name(db, ct.assignee)
+            project = db.query(Project).filter_by(id=ct.project_id).first()
+            project_name = project.name if project else "—"
+            due_str = ct.planned_end.strftime("%Y-%m-%d") if ct.planned_end else "—"
+            email_subject = f"[{project_name}] Reminder — Task due in {days_left} day(s)"
+            email_body = f"""
+            <p>Hi {user.name if user else (ct.assignee or 'Team')},</p>
+            <p>This is a reminder that the following task is due soon:</p>
+            <p><strong>Project:</strong> {project_name}</p>
+            <p><strong>Task:</strong> {ct.name}</p>
+            <p><strong>Due Date:</strong> {due_str}</p>
+            <p><strong>Days Remaining:</strong> {days_left}</p>
+            <p>Please ensure timely completion.</p>
+            <p>Regards,<br>Project WBS System</p>
+            """
             create_notification(
                 db, ct.project_id, "reminder",
                 f"Task '{ct.name}' is due in {days_left} day(s).",
+                user_id=user.id if user else None,
+                email_to=user.email if user else None,
+                send_now=bool(user and user.email),
+                email_subject=email_subject,
+                email_body=email_body,
             )
 
         db.commit()

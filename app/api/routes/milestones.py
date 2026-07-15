@@ -5,7 +5,7 @@ from typing import List
 from datetime import datetime
 from app.db.database import get_db
 from app.models.models import (ProjectMilestone, Milestone, Task, Subtask,
-                                Question, Response, SubtaskStatus, User)
+                                Question, Response, SubtaskStatus, User, Project)
 from app.schemas.schemas import MilestoneUpdate
 from app.core.deps import get_current_user
 from app.services.audit_service import log_action
@@ -190,6 +190,32 @@ def signoff_milestone(project_id: int, num: int, db: Session = Depends(get_db), 
     pm.status = "Completed"
     create_notification(db, project_id, "completed",
                         f"Milestone {num:02d} '{pm.name}' signed off by {current_user.name}.")
+    # Email all Admin users about the milestone sign-off
+    _project = db.query(Project).filter_by(id=project_id).first()
+    _project_name = _project.name if _project else "—"
+    _signed_off_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    _ms_label = pm.name or f"M{num:02d}"
+    _email_subject = f"[{_project_name}] Milestone Completed — {_ms_label}"
+    _email_body = f"""
+    <p>Hi,</p>
+    <p>The following milestone has been <strong style="color:green">signed off and completed</strong>:</p>
+    <p><strong>Project:</strong> {_project_name}</p>
+    <p><strong>Milestone:</strong> {_ms_label}</p>
+    <p><strong>Signed Off By:</strong> {current_user.name}</p>
+    <p><strong>Date:</strong> {_signed_off_str} UTC</p>
+    <p>Regards,<br>Project WBS System</p>
+    """
+    for _admin in db.query(User).filter(User.role == "Admin", User.is_active == True).all():
+        if _admin.email:
+            create_notification(
+                db, project_id, "completed",
+                f"Milestone {num:02d} '{_ms_label}' signed off — notified {_admin.name}",
+                user_id=_admin.id,
+                email_to=_admin.email,
+                send_now=True,
+                email_subject=_email_subject,
+                email_body=_email_body,
+            )
     log_action(db, actor=current_user.name, action="signoff",
                description=f"Milestone {num} signed off",
                project_id=project_id, entity_type="milestone",
