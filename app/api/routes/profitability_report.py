@@ -3,7 +3,7 @@
 Columns per project row:
   Project | Billing (Revenue) | Total Hours | Billable Hours | Utilization %
   | Manpower Cost | Direct Expenses | Indirect / Overhead | Total Cost
-  | Net Profit / Loss | Net Margin % | Billing Recovery %
+  | Net Profit / Loss | Net Margin % | Labor Yield %
 
 Formulas:
   Manpower Cost      = SUM(work_hours.hours_spent × user.cost_rate) per project
@@ -12,7 +12,7 @@ Formulas:
   Total Cost         = Manpower Cost + Direct Expenses + Indirect / Overhead
   Net Profit / Loss  = Billing Amount − Total Cost
   Net Margin %       = Net Profit / Billing Amount × 100   (blank if Billing = 0)
-  Billing Recovery % = Billing Amount / Total Cost × 100   (blank if Total Cost = 0)
+  Labor Yield %      = (Billing − Direct Expenses) / Manpower Cost × 100  (blank if Manpower Cost = 0)
   Utilization %      = Billable Hours / Total Hours × 100  (blank if Total Hours = 0)
 """
 from fastapi import APIRouter, Depends, HTTPException
@@ -165,7 +165,7 @@ def _project_metrics(db: Session, project: Project):
     )
     net_profit   = billing - total_cost
     margin_pct   = _pct(net_profit, billing)
-    recovery_pct = _pct(billing, total_cost)
+    recovery_pct = _pct(billing - direct_expenses, manpower_cost)
     util_pct     = _pct(billable_hours, total_hours)
 
     return {
@@ -204,7 +204,7 @@ def profitability_report_export(
         "Project", "Billing (Revenue ₹)", "Total Hours", "Billable Hours",
         "Utilization %", "Manpower Cost (₹)", "Direct Expenses (₹)",
         "Indirect / Overhead (₹)", "Total Cost (₹)", "Net Profit / Loss (₹)",
-        "Net Margin %", "Billing Recovery %",
+        "Net Margin %", "Labor Yield %",
     ]
 
     rows = []

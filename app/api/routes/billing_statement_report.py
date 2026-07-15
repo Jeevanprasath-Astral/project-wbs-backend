@@ -265,6 +265,56 @@ def billing_statement_export(
     for i, w in enumerate([28, 18, 12, 20, 16, 18, 30, 25, 25], 1):
         ws2.column_dimensions[chr(ord("A") + i - 1)].width = w
 
+    # ── Sheet 3: Month-wise Summary ───────────────────────────────────────────
+    ws3 = wb.create_sheet("Month-wise Summary")
+
+    HEADERS_M = ["Month", "Total Billed (₹)", "# Entries", "Projects"]
+    hrow3 = _write_title(ws3, "Billing Statement — Month-wise Summary", subtitle, len(HEADERS_M))
+    _write_header(ws3, HEADERS_M, hrow3)
+
+    # Group all billing entries by YYYY-MM
+    from collections import defaultdict
+    month_data = defaultdict(lambda: {"total": 0.0, "count": 0, "projects": set()})
+    for e in entries:
+        if e.date:
+            key = e.date.strftime("%Y-%m")
+            month_data[key]["total"]   += float(e.amount or 0)
+            month_data[key]["count"]   += 1
+            p = proj_map.get(e.project_id)
+            if p:
+                month_data[key]["projects"].add(p.name)
+
+    row_num3 = hrow3 + 1
+    grand_m_total = 0.0
+    grand_m_count = 0
+
+    for i, month_key in enumerate(sorted(month_data.keys())):
+        md = month_data[month_key]
+        grand_m_total += md["total"]
+        grand_m_count += md["count"]
+        bg = EVEN_FILL if i % 2 == 0 else ODD_FILL
+        _write_row(ws3, row_num3, [
+            month_key,
+            _fmt(md["total"]),
+            md["count"],
+            ", ".join(sorted(md["projects"])) or "—",
+        ], bg, right_cols=[2, 3])
+        row_num3 += 1
+
+    if month_data:
+        _write_row(ws3, row_num3, [
+            "TOTAL", _fmt(grand_m_total), grand_m_count, "",
+        ], TOT_FILL, right_cols=[2, 3], bold=True)
+        row_num3 += 1
+
+    if not month_data:
+        ws3.merge_cells(f"A{row_num3}:D{row_num3}")
+        ws3.cell(row_num3, 1, "No billing entries found for the selected filters")
+        ws3.cell(row_num3, 1).font = Font(italic=True, size=9, color="999999")
+
+    for i, w in enumerate([18, 20, 12, 50], 1):
+        ws3.column_dimensions[chr(ord("A") + i - 1)].width = w
+
     # ── Stream ────────────────────────────────────────────────────────────────
     output = BytesIO()
     wb.save(output)

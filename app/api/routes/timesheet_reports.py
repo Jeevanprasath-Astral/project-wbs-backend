@@ -73,7 +73,8 @@ REPORT_FIELDS = {
     "individual_time": [("start_date", "Start Date"), ("end_date", "End Date"), ("project", "Project"),
                          ("billable", "Billable / Non-Billable"), ("hours", "Number of Hours")],
     "leave": [("employee", "Employee Name"), ("leave_reason", "Leave Reason"),
-              ("start_date", "Start Date"), ("end_date", "End Date")],
+              ("leave_start_date", "Leave Start Date"), ("leave_end_date", "Leave End Date"),
+              ("leave_days", "Leave Days")],
     "overtime": [("employee", "Employee Name"), ("start_date", "Start Date"), ("end_date", "End Date"),
                  ("hours_worked", "Hours Worked"), ("overtime_hours", "Overtime Hours")],
     "holiday": [("start_date", "Start Date"), ("end_date", "End Date"), ("holiday_name", "Holiday Name")],
@@ -219,8 +220,14 @@ def leave_report(start_date: Optional[str] = None, end_date: Optional[str] = Non
     rows = []
     for l in leaves:
         u = db.query(User).filter_by(id=l.user_id).first()
-        values = {"employee": u.name if u else "—", "leave_reason": l.reason,
-                  "start_date": str(l.date_from), "end_date": str(l.date_to)}
+        days = (l.date_to - l.date_from).days + 1 if l.date_from and l.date_to else 0
+        values = {
+            "employee": u.name if u else "—",
+            "leave_reason": l.reason,
+            "leave_start_date": str(l.date_from) if l.date_from else "—",
+            "leave_end_date": str(l.date_to) if l.date_to else "—",
+            "leave_days": days,
+        }
         rows.append([values[k] for k in keys])
 
     return _build_xlsx("Leave Report", headers, rows,

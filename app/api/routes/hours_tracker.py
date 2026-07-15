@@ -334,7 +334,7 @@ def hours_tracker_export(
     ws2 = wb.create_sheet("Project-wise")
     PROJ_HEADERS = [
         "Project Name", "Client",
-        "Billable (h)", "Non-Billable (h)", "No Work (h)", "Training (h)", "R&D (h)",
+        "Billable (h)", "No Work (h)", "Training (h)", "R&D (h)",
         "Total Work (h)",
     ]
     hrow2 = _write_title(ws2, "Hours Tracker — Project-wise", subtitle, len(PROJ_HEADERS))
@@ -345,7 +345,7 @@ def hours_tracker_export(
         bg = EVEN_FILL if i % 2 == 0 else ODD_FILL
         _write_row(ws2, row_num2, [
             d['project_name'], d['client'],
-            d['billable'], d['non_billable'], d['no_work'], d['training'], d['rnd'],
+            d['billable'], d['no_work'], d['training'], d['rnd'],
             d['total_work'],
         ], bg)
         row_num2 += 1
@@ -354,7 +354,7 @@ def hours_tracker_export(
         proj_total_work = round(sum(d['total_work'] for d in data['project']), 2)
         _write_row(ws2, row_num2, [
             "TOTAL", "",
-            t['billable'], t['non_billable'], t['no_work'], t['training'], t['rnd'],
+            t['billable'], t['no_work'], t['training'], t['rnd'],
             proj_total_work,
         ], TOT_FILL)
         ws2.cell(row_num2, 1).font = Font(bold=True, size=9, name="Calibri")
@@ -363,7 +363,7 @@ def hours_tracker_export(
         ws2.cell(row_num2, 1, "No project-level work hours found")
         ws2.cell(row_num2, 1).font = Font(italic=True, size=9, color="999999")
 
-    col_widths2 = [28, 20, 13, 15, 12, 12, 10, 14]
+    col_widths2 = [28, 20, 13, 12, 12, 10, 14]
     for i, w in enumerate(col_widths2, 1):
         ws2.column_dimensions[chr(ord("A") + i - 1)].width = w
 
