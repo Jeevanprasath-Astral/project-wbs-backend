@@ -258,7 +258,7 @@ def _update_user_accounts():
     # If already migrated, old_email won't exist but new_email will — still a no-op update.
     accounts = [
         ("admin@wbs.com",
-         "Jeevan Prasath. J", "jeevanprasath.j@astralbusinessconsulting.in", "Admin@2026"),
+         "Jeevan Prasath. J", "jeevanprasath.j@astralbusinessconsulting.in", "DEC@jp2801"),
         ("pm@wbs.com",
          "Gayathri. P",       "gayathri.p@astralbusinessconsulting.com",      "PManager@2026"),
         ("hr@wbs.com",
@@ -271,23 +271,39 @@ def _update_user_accounts():
     for old_email, name, new_email, temp_pwd in accounts:
         try:
             with engine.begin() as _conn:
-                res = _conn.execute(_sql(
-                    """UPDATE users
-                          SET name          = :name,
-                              email         = :new_email,
-                              password_hash = :ph
-                        WHERE id = (
-                            SELECT id FROM users
-                            WHERE  email IN (:old_email, :new_email)
-                            ORDER  BY id
-                            LIMIT  1
-                        )"""
-                ), {"name": name, "new_email": new_email,
-                    "ph": hash_password(temp_pwd), "old_email": old_email})
-                if res.rowcount:
-                    logging.info(f"_update_user_accounts OK  {old_email!r} → {new_email}")
+                # Only update name+email. Password is only set if the row is
+                # being migrated from its OLD placeholder email — once the real
+                # email is already in place the password is left untouched so
+                # that a user-changed password survives redeploys.
+                already_migrated = _conn.execute(_sql(
+                    "SELECT id FROM users WHERE email = :new_email"
+                ), {"new_email": new_email}).fetchone()
+
+                if already_migrated:
+                    # Row already has the real email — only sync name, leave password alone.
+                    res = _conn.execute(_sql(
+                        "UPDATE users SET name = :name WHERE email = :new_email"
+                    ), {"name": name, "new_email": new_email})
+                    logging.info(f"_update_user_accounts NAME-ONLY {new_email}")
                 else:
-                    logging.warning(f"_update_user_accounts SKIP {old_email!r} — not found")
+                    # Still on old placeholder email — full migration with initial password.
+                    res = _conn.execute(_sql(
+                        """UPDATE users
+                              SET name          = :name,
+                                  email         = :new_email,
+                                  password_hash = :ph
+                            WHERE id = (
+                                SELECT id FROM users
+                                WHERE  email = :old_email
+                                ORDER  BY id
+                                LIMIT  1
+                            )"""
+                    ), {"name": name, "new_email": new_email,
+                        "ph": hash_password(temp_pwd), "old_email": old_email})
+                    if res.rowcount:
+                        logging.info(f"_update_user_accounts MIGRATED {old_email!r} → {new_email}")
+                    else:
+                        logging.warning(f"_update_user_accounts SKIP {old_email!r} — not found")
         except Exception as _ex:
             logging.error(f"_update_user_accounts FAIL {old_email!r}: {_ex}")
 
@@ -425,7 +441,7 @@ def setup_accounts():
     # Uses current email to locate the row — avoids role-name mismatches.
     accounts = [
         ("jeevanprasath.j@astralbusinessconsulting.in", "Jeevan Prasath. J",
-         "jeevanprasath.j@astralbusinessconsulting.in",  "Admin@2026"),
+         "jeevanprasath.j@astralbusinessconsulting.in",  "DEC@jp2801"),
         ("gayathri.p@astralbusinessconsulting.com",       "Gayathri. P",
          "gayathri.p@astralbusinessconsulting.com",        "PManager@2026"),
         ("manikandan.m@astralbusinessconsulting.in",       "Manikandan. M",
