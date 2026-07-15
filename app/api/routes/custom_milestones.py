@@ -13,6 +13,11 @@ from sqlalchemy.exc import IntegrityError
 from app.core.deps import get_current_user
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
+from app.services.email_service import send_mailbox_email
+import io as _io
+import base64 as _b64
+import openpyxl as _xl
+from openpyxl.styles import Font as _Font, PatternFill as _Fill, Alignment as _Align
 
 router = APIRouter(prefix="/projects/{project_id}/custom-milestones", tags=["Custom Milestones"])
 
@@ -1620,6 +1625,227 @@ def hours_summary(
         "by_milestone": by_milestone,
         "by_person": by_person,
     }
+
+
+# ── Mailbox helpers ──────────────────────────────────────────────────────────
+
+def _dfmt(dt) -> str:
+    if not dt: return ""
+    try: return str(dt)[:10]
+    except: return ""
+
+def _xl_header(ws, headers, color="4F46E5"):
+    fill = _Fill(start_color=color, end_color=color, fill_type="solid")
+    font = _Font(bold=True, color="FFFFFF")
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.fill = fill; c.font = font
+        c.alignment = _Align(horizontal="center")
+    ws.freeze_panes = "A2"
+
+def _generate_milestone_excel(db: Session, ms: CustomMilestone) -> bytes:
+    wb = _xl.Workbook()
+    # Sheet 1 — Summary
+    ws1 = wb.active; ws1.title = "Milestone"
+    _xl_header(ws1, ["Field", "Value"])
+    for r, (f, v) in enumerate([
+        ("Milestone #", f"M{ms.num:02d}"), ("Name", ms.name or ""),
+        ("Status", ms.status or ""), ("Assignee", ms.assignee or ""),
+        ("Planned Start", _dfmt(ms.planned_start)), ("Planned End", _dfmt(ms.planned_end)),
+        ("Actual Start", _dfmt(ms.actual_start)), ("Actual End", _dfmt(ms.actual_end)),
+        ("Description", ms.description or ""), ("Responsible", ms.responsible or ""),
+    ], 2):
+        ws1.cell(row=r, column=1, value=f).font = _Font(bold=True)
+        ws1.cell(row=r, column=2, value=v)
+    ws1.column_dimensions["A"].width = 20; ws1.column_dimensions["B"].width = 45
+    # Sheet 2 — Tasks
+    ws2 = wb.create_sheet("Tasks")
+    _xl_header(ws2, ["Task #", "Name", "Status", "Assignee", "Planned Start", "Planned End", "Responsibility"])
+    tasks = db.query(CustomTask).filter_by(milestone_id=ms.id).order_by(CustomTask.num).all()
+    for r, t in enumerate(tasks, 2):
+        for c, v in enumerate([f"T{t.num:02d}" if t.num else "", t.name or "", t.status or "",
+                                t.assignee or "", _dfmt(t.planned_start), _dfmt(t.planned_end), t.responsibility or ""], 1):
+            ws2.cell(row=r, column=c, value=v)
+    for i, w in enumerate([10,30,15,20,15,15,20], 1):
+        ws2.column_dimensions[ws2.cell(1,i).column_letter].width = w
+    # Sheet 3 — Subtasks
+    ws3 = wb.create_sheet("Subtasks")
+    _xl_header(ws3, ["Task", "Subtask #", "Name", "Status", "Assignee", "Input Type", "Est. Hours"], "7C3AED")
+    r3 = 2
+    for t in tasks:
+        for s in db.query(CustomSubtask).filter_by(task_id=t.id).order_by(CustomSubtask.num).all():
+            for c, v in enumerate([t.name or "", f"S{s.num:02d}" if s.num else "", s.name or "",
+                                    s.status or "", s.assignee or "", s.input_type or "", s.estimated_hours or 0], 1):
+                ws3.cell(row=r3, column=c, value=v)
+            r3 += 1
+    for i, w in enumerate([25,12,30,15,20,15,12], 1):
+        ws3.column_dimensions[ws3.cell(1,i).column_letter].width = w
+    # Sheet 4 — Activities
+    ws4 = wb.create_sheet("Activities")
+    _xl_header(ws4, ["Task", "Subtask", "Activity", "Status", "Assignee", "Planned Start", "Planned End", "Est. Hours"], "0D3E7A")
+    r4 = 2
+    for t in tasks:
+        for s in db.query(CustomSubtask).filter_by(task_id=t.id).order_by(CustomSubtask.num).all():
+            for a in db.query(Activity).filter_by(subtask_id=s.id).all():
+                for c, v in enumerate([t.name or "", s.name or "", a.name or "", a.status or "",
+                                        a.assignee or "", _dfmt(a.planned_start), _dfmt(a.planned_end), a.estimated_hours or 0], 1):
+                    ws4.cell(row=r4, column=c, value=v)
+                r4 += 1
+    for i, w in enumerate([25,25,30,15,20,15,15,12], 1):
+        ws4.column_dimensions[ws4.cell(1,i).column_letter].width = w
+    buf = _io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+def _generate_task_excel(db: Session, task: CustomTask, ms: CustomMilestone) -> bytes:
+    wb = _xl.Workbook()
+    # Sheet 1 — Summary
+    ws1 = wb.active; ws1.title = "Task"
+    _xl_header(ws1, ["Field", "Value"])
+    ms_label = f"M{ms.num:02d} — {ms.name}" if ms else ""
+    for r, (f, v) in enumerate([
+        ("Milestone", ms_label), ("Task #", f"T{task.num:02d}" if task.num else ""),
+        ("Name", task.name or ""), ("Status", task.status or ""),
+        ("Assignee", task.assignee or ""), ("Planned Start", _dfmt(task.planned_start)),
+        ("Planned End", _dfmt(task.planned_end)), ("Responsibility", task.responsibility or ""),
+    ], 2):
+        ws1.cell(row=r, column=1, value=f).font = _Font(bold=True)
+        ws1.cell(row=r, column=2, value=v)
+    ws1.column_dimensions["A"].width = 20; ws1.column_dimensions["B"].width = 45
+    # Sheet 2 — Subtasks
+    ws2 = wb.create_sheet("Subtasks")
+    _xl_header(ws2, ["Subtask #", "Name", "Status", "Assignee", "Input Type", "Est. Hours"], "7C3AED")
+    subs = db.query(CustomSubtask).filter_by(task_id=task.id).order_by(CustomSubtask.num).all()
+    for r, s in enumerate(subs, 2):
+        for c, v in enumerate([f"S{s.num:02d}" if s.num else "", s.name or "", s.status or "",
+                                s.assignee or "", s.input_type or "", s.estimated_hours or 0], 1):
+            ws2.cell(row=r, column=c, value=v)
+    for i, w in enumerate([12,30,15,20,15,12], 1):
+        ws2.column_dimensions[ws2.cell(1,i).column_letter].width = w
+    # Sheet 3 — Activities
+    ws3 = wb.create_sheet("Activities")
+    _xl_header(ws3, ["Subtask", "Activity", "Status", "Assignee", "Planned Start", "Planned End", "Est. Hours"], "0D3E7A")
+    r3 = 2
+    for s in subs:
+        for a in db.query(Activity).filter_by(subtask_id=s.id).all():
+            for c, v in enumerate([s.name or "", a.name or "", a.status or "",
+                                    a.assignee or "", _dfmt(a.planned_start), _dfmt(a.planned_end), a.estimated_hours or 0], 1):
+                ws3.cell(row=r3, column=c, value=v)
+            r3 += 1
+    for i, w in enumerate([25,30,15,20,15,15,12], 1):
+        ws3.column_dimensions[ws3.cell(1,i).column_letter].width = w
+    buf = _io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+class MailboxPayload(BaseModel):
+    to: List[str]
+    note: str = ""
+
+
+@router.post("/{milestone_id}/mailbox")
+def send_milestone_mailbox(
+    project_id: int, milestone_id: int, payload: MailboxPayload,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
+    if not ms: raise HTTPException(404, "Milestone not found")
+    if not payload.to: raise HTTPException(400, "At least one recipient required")
+    project = db.query(Project).filter_by(id=project_id).first()
+    project_name = project.name if project else "—"
+    excel_b64 = _b64.b64encode(_generate_milestone_excel(db, ms)).decode("utf-8")
+    file_name = f"Milestone_M{ms.num:02d}_{(ms.name or 'details').replace(' ','_')}.xlsx"
+    note_html = f"<p><strong>Note from {current_user.name}:</strong> {payload.note}</p><hr/>" if payload.note else ""
+    tasks = db.query(CustomTask).filter_by(milestone_id=ms.id).order_by(CustomTask.num).all()
+    task_rows = "".join(
+        f"<tr><td style='padding:4px 8px;border:1px solid #e2e8f0'>T{t.num:02d}</td>"
+        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{t.name or ''}</td>"
+        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{t.assignee or '—'}</td>"
+        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{t.status or ''}</td></tr>"
+        for t in tasks
+    ) or "<tr><td colspan='4' style='padding:8px;text-align:center;color:#94a3b8;font-size:12px'>No tasks</td></tr>"
+    body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+      <div style="background:linear-gradient(135deg,#091525,#0f2448);padding:24px 28px;border-radius:12px 12px 0 0;text-align:center;">
+        <h1 style="color:#fff;font-size:20px;margin:0;">AXON WBS</h1>
+        <p style="color:#4a6080;font-size:11px;margin:4px 0 0;letter-spacing:.08em;">MILESTONE DETAILS</p>
+      </div>
+      <div style="padding:24px;background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px;">
+        {note_html}
+        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9;width:35%">Project</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{project_name}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Milestone</td><td style="padding:5px 8px;border:1px solid #e2e8f0">M{ms.num:02d} — {ms.name or ''}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Status</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{ms.status or ''}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Assignee</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{ms.assignee or '—'}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned Start</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.planned_start)}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned End</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.planned_end)}</td></tr>
+        </table>
+        <p style="font-size:13px;color:#334155;margin-bottom:8px;font-weight:bold">Tasks ({len(tasks)})</p>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+          <tr style="background:#4F46E5"><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Task #</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Name</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Assignee</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Status</th></tr>
+          {task_rows}
+        </table>
+        <p style="font-size:12px;color:#64748b;">&#128206; Full details including Subtasks &amp; Activities are in the attached Excel file.</p>
+        <p style="font-size:12px;color:#64748b;margin-top:16px;">Sent by <strong>{current_user.name}</strong> via Axon WBS</p>
+      </div>
+    </div>"""
+    subject = f"[{project_name}] Milestone M{ms.num:02d} — {ms.name or 'Details'}"
+    if not send_mailbox_email(payload.to, subject, body, excel_b64, file_name):
+        raise HTTPException(500, "Failed to send email — check server logs")
+    return {"status": "sent", "recipients": len(payload.to)}
+
+
+@router.post("/{milestone_id}/tasks/{task_id}/mailbox")
+def send_task_mailbox(
+    project_id: int, milestone_id: int, task_id: int, payload: MailboxPayload,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
+    if not ms: raise HTTPException(404, "Milestone not found")
+    task = db.query(CustomTask).filter_by(id=task_id, milestone_id=milestone_id).first()
+    if not task: raise HTTPException(404, "Task not found")
+    if not payload.to: raise HTTPException(400, "At least one recipient required")
+    project = db.query(Project).filter_by(id=project_id).first()
+    project_name = project.name if project else "—"
+    excel_b64 = _b64.b64encode(_generate_task_excel(db, task, ms)).decode("utf-8")
+    file_name = f"Task_T{task.num:02d}_{(task.name or 'details').replace(' ','_')}.xlsx"
+    note_html = f"<p><strong>Note from {current_user.name}:</strong> {payload.note}</p><hr/>" if payload.note else ""
+    subs = db.query(CustomSubtask).filter_by(task_id=task.id).order_by(CustomSubtask.num).all()
+    sub_rows = "".join(
+        f"<tr><td style='padding:4px 8px;border:1px solid #e2e8f0'>S{s.num:02d}</td>"
+        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{s.name or ''}</td>"
+        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{s.assignee or '—'}</td>"
+        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{s.status or ''}</td></tr>"
+        for s in subs
+    ) or "<tr><td colspan='4' style='padding:8px;text-align:center;color:#94a3b8;font-size:12px'>No subtasks</td></tr>"
+    body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+      <div style="background:linear-gradient(135deg,#091525,#0f2448);padding:24px 28px;border-radius:12px 12px 0 0;text-align:center;">
+        <h1 style="color:#fff;font-size:20px;margin:0;">AXON WBS</h1>
+        <p style="color:#4a6080;font-size:11px;margin:4px 0 0;letter-spacing:.08em;">TASK DETAILS</p>
+      </div>
+      <div style="padding:24px;background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px;">
+        {note_html}
+        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9;width:35%">Project</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{project_name}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Milestone</td><td style="padding:5px 8px;border:1px solid #e2e8f0">M{ms.num:02d} — {ms.name or ''}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Task</td><td style="padding:5px 8px;border:1px solid #e2e8f0">T{task.num:02d} — {task.name or ''}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Status</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{task.status or ''}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Assignee</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{task.assignee or '—'}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned Start</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(task.planned_start)}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned End</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(task.planned_end)}</td></tr>
+        </table>
+        <p style="font-size:13px;color:#334155;margin-bottom:8px;font-weight:bold">Subtasks ({len(subs)})</p>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+          <tr style="background:#7C3AED"><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Subtask #</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Name</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Assignee</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Status</th></tr>
+          {sub_rows}
+        </table>
+        <p style="font-size:12px;color:#64748b;">&#128206; Full details including Activities are in the attached Excel file.</p>
+        <p style="font-size:12px;color:#64748b;margin-top:16px;">Sent by <strong>{current_user.name}</strong> via Axon WBS</p>
+      </div>
+    </div>"""
+    subject = f"[{project_name}] Task T{task.num:02d} — {task.name or 'Details'}"
+    if not send_mailbox_email(payload.to, subject, body, excel_b64, file_name):
+        raise HTTPException(500, "Failed to send email — check server logs")
+    return {"status": "sent", "recipients": len(payload.to)}
 
 
 # ── Single milestone GET (for targeted frontend refresh without full reload) ──
