@@ -342,8 +342,8 @@ def remove_user_permanently(
     # 7. Delete permissions
     db.query(Permission).filter_by(user_id=user_id).delete(synchronize_session=False)
 
-    # 8. Delete password reset tokens
-    db.query(PasswordResetToken).filter_by(user_id=user_id).delete(synchronize_session=False)
+    # 8. Delete password reset tokens (keyed by email, not user_id)
+    db.query(PasswordResetToken).filter_by(email=user_email).delete(synchronize_session=False)
 
     # 9. Delete the user record
     db.delete(u)

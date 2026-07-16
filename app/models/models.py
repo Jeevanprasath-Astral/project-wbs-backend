@@ -259,6 +259,7 @@ class TaskAssignment(Base):
     created_at   = Column(DateTime(timezone=True), server_default=func.now())
     updated_at   = Column(DateTime(timezone=True), onupdate=func.now())
     remarks      = Column(Text)
+    category     = Column(String(100))   # Assignment category (Business Dev, R&D, etc.)
     assignee     = relationship("User", foreign_keys=[assigned_to], backref="assignments_received")
     assigner     = relationship("User", foreign_keys=[assigned_by], backref="assignments_given")
 
