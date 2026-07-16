@@ -3,11 +3,15 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 from pydantic import BaseModel
 from app.db.database import get_db
-from app.models.models import User, ProjectMember, Project, TaskAssignment, Team, CustomRole, AssignmentCategory
+from app.models.models import (User, ProjectMember, Project, TaskAssignment, Team,
+                               CustomRole, AssignmentCategory, WorkHours, AuditLog,
+                               Notification, LeaveRequest, Permission, PasswordResetToken)
 from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager
 from app.core.security import hash_password
 from app.services.audit_service import log_action
+from app.services.email_service import send_welcome_email
+from app.core.config import settings
 
 router = APIRouter(prefix="/global/team", tags=["Global Team"])
 
@@ -183,6 +187,17 @@ def create_user(
     db.add(u); db.commit(); db.refresh(u)
     log_action(db, actor=current_user.name, action="create_user",
                description=f"Created user {u.name} ({u.role})", user_id=current_user.id)
+    # Send welcome email with credentials
+    try:
+        send_welcome_email(
+            to=u.email,
+            name=u.name,
+            temp_password=payload.password,
+            app_url=settings.FRONTEND_URL
+        )
+    except Exception as _e:
+        import logging as _log
+        _log.error(f"Welcome email failed for {u.email}: {_e}")
     return _build_user(u, db)
 
 @router.patch("/{user_id}")
@@ -224,6 +239,125 @@ def deactivate_user(
                description=f"Deactivated user {u.name}", user_id=current_user.id)
     db.commit()
     return {"status": "deactivated"}
+
+@router.get("/{user_id}/impact")
+def user_removal_impact(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return a summary of what will be removed when permanently deleting this user.
+    Called by the confirmation dialog before the actual DELETE so the admin can
+    see exactly what will be affected."""
+    if not is_team_manager(current_user):
+        raise HTTPException(403, "Only Admin or HR can view member impact")
+    u = db.query(User).filter_by(id=user_id).first()
+    if not u:
+        raise HTTPException(404, "User not found")
+    if u.id == current_user.id:
+        raise HTTPException(400, "Cannot remove yourself")
+
+    # Projects this user belongs to
+    memberships = db.query(ProjectMember).filter_by(user_id=user_id).all()
+    project_ids = [m.project_id for m in memberships]
+    project_names = [
+        p.name
+        for p in db.query(Project).filter(Project.id.in_(project_ids)).all()
+    ] if project_ids else []
+
+    # Task assignments
+    total_assignments = db.query(TaskAssignment).filter(
+        (TaskAssignment.assigned_to == user_id) | (TaskAssignment.assigned_by == user_id)
+    ).count()
+    open_assignments = db.query(TaskAssignment).filter(
+        TaskAssignment.assigned_to == user_id,
+        TaskAssignment.status.notin_(["Completed"]),
+    ).count()
+
+    # Work hours entries
+    wh_count = db.query(WorkHours).filter_by(user_id=user_id).count()
+
+    return {
+        "user": {"id": u.id, "name": u.name, "email": u.email, "role": u.role},
+        "project_count": len(project_names),
+        "project_names": project_names,
+        "total_assignments": total_assignments,
+        "open_assignments": open_assignments,
+        "work_hours_entries": wh_count,
+    }
+
+
+@router.delete("/{user_id}/remove")
+def remove_user_permanently(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Permanently delete a user and clean up all their FK dependencies.
+
+    Dependency handling (in order, to satisfy NOT NULL FKs):
+    1. ProjectMember rows (user_id NOT NULL)             → DELETE
+    2. TaskAssignment rows (assigned_to/by NOT NULL)     → DELETE
+    3. WorkHours rows (user_id NOT NULL)                 → DELETE
+    4. AuditLog rows (user_id NULLABLE)                  → SET NULL (preserve history)
+    5. Notification rows (user_id NULLABLE)              → DELETE
+    6. LeaveRequest rows (user_id NOT NULL)              → DELETE
+    7. Permission rows (user_id NOT NULL)                → DELETE
+    8. PasswordResetToken rows (user_id NOT NULL)        → DELETE
+    9. User record                                       → DELETE
+    """
+    if not is_team_manager(current_user):
+        raise HTTPException(403, "Only Admin or HR can permanently remove members")
+    u = db.query(User).filter_by(id=user_id).first()
+    if not u:
+        raise HTTPException(404, "User not found")
+    if u.id == current_user.id:
+        raise HTTPException(400, "Cannot remove yourself")
+
+    user_name = u.name
+    user_email = u.email
+
+    # 1. Remove from all project memberships
+    db.query(ProjectMember).filter_by(user_id=user_id).delete(synchronize_session=False)
+
+    # 2. Delete all task assignments (both assigned_to and assigned_by — same rows)
+    db.query(TaskAssignment).filter(
+        (TaskAssignment.assigned_to == user_id) | (TaskAssignment.assigned_by == user_id)
+    ).delete(synchronize_session=False)
+
+    # 3. Delete work hour entries
+    db.query(WorkHours).filter_by(user_id=user_id).delete(synchronize_session=False)
+
+    # 4. Null out audit log references (preserve historical log entries)
+    db.query(AuditLog).filter_by(user_id=user_id).update(
+        {AuditLog.user_id: None}, synchronize_session=False
+    )
+
+    # 5. Delete notifications
+    db.query(Notification).filter_by(user_id=user_id).delete(synchronize_session=False)
+
+    # 6. Delete leave requests
+    db.query(LeaveRequest).filter_by(user_id=user_id).delete(synchronize_session=False)
+
+    # 7. Delete permissions
+    db.query(Permission).filter_by(user_id=user_id).delete(synchronize_session=False)
+
+    # 8. Delete password reset tokens
+    db.query(PasswordResetToken).filter_by(user_id=user_id).delete(synchronize_session=False)
+
+    # 9. Delete the user record
+    db.delete(u)
+
+    log_action(
+        db,
+        actor=current_user.name,
+        action="remove_user",
+        description=f"Permanently removed user '{user_name}' ({user_email})",
+        user_id=current_user.id,
+    )
+    db.commit()
+    return {"status": "removed", "message": f"{user_name} has been permanently removed"}
+
 
 @router.get("/{user_id}/projects")
 def user_projects(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

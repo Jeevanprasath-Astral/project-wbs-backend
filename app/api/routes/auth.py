@@ -22,7 +22,10 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     return {"token": token, "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role}}
 
 @router.post("/register", response_model=UserOut)
-def register(payload: UserCreate, db: Session = Depends(get_db)):
+def register(payload: UserCreate, db: Session = Depends(get_db),
+             current_user: User = Depends(get_current_user)):
+    if current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="Only Admin can create accounts via this endpoint")
     if db.query(User).filter(User.email == payload.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
     user = User(

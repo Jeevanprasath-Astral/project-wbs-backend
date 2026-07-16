@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 from typing import Optional, List
@@ -8,11 +9,12 @@ from app.db.database import get_db
 from app.models.models import (TaskAssignment, ProjectMilestone, Project,
                                 User, ProjectMember, SubtaskStatus, Task,
                                 Milestone, CustomTask, CustomSubtask, Activity,
-                                CustomMilestone)
+                                CustomMilestone, AuditLog)
 from app.core.deps import get_current_user
 from app.core.permissions import is_elevated
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
+import io
 
 router = APIRouter(prefix="/global", tags=["Global Modules"])
 
@@ -68,6 +70,7 @@ def _build_global_assignment(a: TaskAssignment, db: Session, project_map=None, u
         "completed_at": a.completed_at,
         "created_at": a.created_at,
         "remarks": a.remarks,
+        "category": a.category,
     }
 
 
@@ -167,6 +170,7 @@ class GlobalAssignmentCreate(BaseModel):
     status: Optional[str] = "Not Started"
     due_date: Optional[datetime] = None
     remarks: Optional[str] = None
+    category: Optional[str] = None
 
 
 @router.post("/assignments")
@@ -177,8 +181,9 @@ def create_global_assignment(
 ):
     """Create a task assignment from the Global Task Assignments hub.
     Supports General Tasks (no project_id) in addition to project-linked tasks."""
-    if not is_elevated(current_user) and current_user.role != "Functional Consultant":
-        raise HTTPException(403, "Only Admin, FC Lead, TC Lead or Functional Consultant can assign tasks")
+    _assign_roles = {"Associate", "Functional Consultant", "Technical Team"}
+    if not is_elevated(current_user) and current_user.role not in _assign_roles:
+        raise HTTPException(403, "Only elevated roles, Associates, Functional Consultants, or Technical Team can assign tasks")
 
     assignee = db.query(User).filter_by(id=payload.assigned_to).first()
     if not assignee:
@@ -203,6 +208,7 @@ def create_global_assignment(
         status=payload.status or "Not Started",
         due_date=payload.due_date,
         remarks=payload.remarks,
+        category=payload.category,
     )
     db.add(a)
     db.flush()
@@ -711,3 +717,194 @@ def global_project_status(
             "overall_progress_pct": round((ms_pct + task_pct) / 2, 1) if (ms_total or task_total) else 0.0,
         })
     return result
+
+
+# ── Global Audit Log ──────────────────────────────────────────────────────────
+@router.get("/audit-log")
+def global_audit_log(
+    project_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    action: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not is_elevated(current_user):
+        raise HTTPException(403, "Only elevated roles can view the audit log")
+
+    q = db.query(AuditLog)
+    if project_id:
+        q = q.filter(AuditLog.project_id == project_id)
+    if user_id:
+        q = q.filter(AuditLog.user_id == user_id)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    if entity_type:
+        q = q.filter(AuditLog.entity_type == entity_type)
+    if date_from:
+        try:
+            q = q.filter(AuditLog.created_at >= datetime.fromisoformat(date_from))
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            q = q.filter(AuditLog.created_at < datetime.fromisoformat(date_to) + timedelta(days=1))
+        except ValueError:
+            pass
+    if search:
+        term = f"%{search}%"
+        q = q.filter(
+            or_(AuditLog.description.ilike(term), AuditLog.actor.ilike(term))
+        )
+
+    total = q.count()
+
+    # Distinct action values for the filter dropdown
+    distinct_actions = [
+        r[0] for r in db.query(AuditLog.action).distinct().all() if r[0]
+    ]
+
+    logs = (
+        q.order_by(AuditLog.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    # Batch-fetch referenced projects
+    project_ids = {l.project_id for l in logs if l.project_id}
+    project_map = (
+        {p.id: p.name for p in db.query(Project).filter(Project.id.in_(project_ids)).all()}
+        if project_ids else {}
+    )
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "distinct_actions": sorted(distinct_actions),
+        "logs": [
+            {
+                "id": l.id,
+                "actor": l.actor,
+                "action": l.action,
+                "entity_type": l.entity_type,
+                "entity_id": l.entity_id,
+                "description": l.description,
+                "old_value": l.old_value,
+                "new_value": l.new_value,
+                "project_id": l.project_id,
+                "project_name": project_map.get(l.project_id, "—") if l.project_id else "—",
+                "user_id": l.user_id,
+                "created_at": l.created_at,
+            }
+            for l in logs
+        ],
+    }
+
+
+@router.get("/audit-log/export")
+def global_audit_log_export(
+    project_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    action: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not is_elevated(current_user):
+        raise HTTPException(403, "Only elevated roles can export the audit log")
+
+    q = db.query(AuditLog)
+    if project_id:
+        q = q.filter(AuditLog.project_id == project_id)
+    if user_id:
+        q = q.filter(AuditLog.user_id == user_id)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    if entity_type:
+        q = q.filter(AuditLog.entity_type == entity_type)
+    if date_from:
+        try:
+            q = q.filter(AuditLog.created_at >= datetime.fromisoformat(date_from))
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            q = q.filter(AuditLog.created_at < datetime.fromisoformat(date_to) + timedelta(days=1))
+        except ValueError:
+            pass
+    if search:
+        term = f"%{search}%"
+        q = q.filter(
+            or_(AuditLog.description.ilike(term), AuditLog.actor.ilike(term))
+        )
+
+    logs = q.order_by(AuditLog.created_at.desc()).all()
+
+    project_ids = {l.project_id for l in logs if l.project_id}
+    project_map = (
+        {p.id: p.name for p in db.query(Project).filter(Project.id.in_(project_ids)).all()}
+        if project_ids else {}
+    )
+
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        raise HTTPException(500, "openpyxl not installed")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Audit Log"
+
+    header_fill = PatternFill("solid", fgColor="4F46E5")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    headers = ["#", "Timestamp (UTC)", "Actor", "Action", "Entity Type", "Entity ID",
+               "Project", "Description", "Old Value", "New Value"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    col_widths = [5, 22, 22, 22, 16, 10, 24, 60, 30, 30]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+    for row_num, l in enumerate(logs, 2):
+        ts = l.created_at.strftime("%Y-%m-%d %H:%M:%S") if l.created_at else ""
+        ws.append([
+            row_num - 1,
+            ts,
+            l.actor or "",
+            l.action or "",
+            l.entity_type or "",
+            l.entity_id,
+            project_map.get(l.project_id, "—") if l.project_id else "—",
+            l.description or "",
+            l.old_value or "",
+            l.new_value or "",
+        ])
+        if row_num % 2 == 0:
+            alt_fill = PatternFill("solid", fgColor="F0F0FF")
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row_num, column=col).fill = alt_fill
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=audit-log.xlsx"},
+    )

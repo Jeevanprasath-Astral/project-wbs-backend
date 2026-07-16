@@ -8,6 +8,8 @@ from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager, can_create_project
 from app.services.audit_service import log_action
 from app.core.security import hash_password
+from app.services.email_service import send_email, send_welcome_email
+import os
 from pydantic import BaseModel
 from typing import Optional
 
@@ -126,6 +128,30 @@ def add_existing_member(project_id: int, payload: dict, db: Session = Depends(ge
                description=f"Added {user.name} to project",
                project_id=project_id, user_id=current_user.id)
     db.commit()
+    # Notify the user they've been added to the project
+    project = db.query(Project).filter_by(id=project_id).first()
+    project_name = project.name if project else f"Project #{project_id}"
+    send_email(
+        to=user.email,
+        subject=f"You've been added to {project_name} — Axon WBS",
+        body=f"""
+        <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
+          <div style="background:linear-gradient(135deg,#091525,#0f2448);padding:24px 32px;text-align:center;border-radius:12px 12px 0 0;">
+            <h1 style="color:#fff;font-size:20px;margin:0;letter-spacing:0.04em;">AXON</h1>
+            <p style="color:#4a6080;font-size:10px;margin:4px 0 0;">REQUIREMENT &amp; TRACKING SYSTEM</p>
+          </div>
+          <div style="background:#f8fafc;padding:28px 32px;border:1px solid #e2e8f0;border-top:0;border-radius:0 0 12px 12px;">
+            <p style="font-size:15px;color:#0f172a;margin:0 0 12px;">Hi <strong>{user.name}</strong>,</p>
+            <p style="font-size:14px;color:#334155;line-height:1.6;margin:0 0 20px;">
+              You have been added to the project <strong>{project_name}</strong> on Axon WBS.
+              Please log in to access your project dashboard and assigned tasks.
+            </p>
+            <p style="font-size:13px;color:#94a3b8;margin:0;">Regards,<br>
+              <strong style="color:#64748b;">Axon WBS Team</strong></p>
+          </div>
+        </div>
+        """,
+    )
     return {"status": "ok", "message": f"{user.name} added to project"}
 
 @router.post("/{project_id}/team/add-new")
@@ -147,6 +173,16 @@ def add_new_member(project_id: int, payload: AddMemberRequest, db: Session = Dep
                description=f"Created and added {user.name} to project",
                project_id=project_id, user_id=current_user.id)
     db.commit()
+    # Send welcome email with credentials + project context
+    project = db.query(Project).filter_by(id=project_id).first()
+    project_name = project.name if project else f"Project #{project_id}"
+    app_url = os.environ.get("FRONTEND_URL", "https://axon-wbs.netlify.app")
+    send_welcome_email(
+        to=user.email,
+        name=user.name,
+        temp_password=payload.password or "wbs123",
+        app_url=app_url,
+    )
     return {"status": "ok", "message": f"{user.name} created and added to project"}
 
 @router.delete("/{project_id}")
