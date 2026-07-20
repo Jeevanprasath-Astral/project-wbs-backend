@@ -258,15 +258,12 @@ def _run_lightweight_migrations():
         # Task Notes — free-text notes field on each Task row.
         "ALTER TABLE custom_tasks ADD COLUMN IF NOT EXISTS notes TEXT",
     ]
-    try:
-        with engine.begin() as conn:
-            for stmt in statements:
-                try:
-                    conn.execute(text(stmt))
-                except Exception as e:
-                    logging.warning(f"Migration step failed ({stmt}): {e}")
-    except Exception as e:
-        logging.warning(f"Lightweight migration pass failed: {e}")
+    for stmt in statements:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as e:
+            logging.warning(f"Migration step failed: {e}")
 
 _run_lightweight_migrations()
 
