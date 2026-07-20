@@ -134,9 +134,9 @@ def _task_hours(db: Session, t: CustomTask):
     # by-employee breakdown. Prefer it; fall back to the assignee name.
     linked_user_id = _linked_assignee_id(db, custom_task_id=t.id)
     if linked_user_id is not None:
-        actual += _wh_sum(db, custom_task_id=t.id, user_id=linked_user_id)
+        actual += _wh_sum(db, custom_task_id=t.id, custom_subtask_id=None, user_id=linked_user_id)
     else:
-        actual += _wh_sum_for_assignee(db, t.assignee, custom_task_id=t.id)
+        actual += _wh_sum_for_assignee(db, t.assignee, custom_task_id=t.id, custom_subtask_id=None)
     for s in t.subtasks:
         s_est, s_act = _subtask_hours(db, s)
         estimated += s_est
@@ -150,9 +150,9 @@ def _milestone_hours(db: Session, ms: CustomMilestone):
     # set, custom_task_id null — a General/whole-milestone assignment).
     linked_user_id = _linked_assignee_id(db, milestone_num=ms.num, custom_task_id=None)
     if linked_user_id is not None:
-        actual += _wh_sum(db, custom_milestone_id=ms.id, user_id=linked_user_id)
+        actual += _wh_sum(db, custom_milestone_id=ms.id, custom_task_id=None, user_id=linked_user_id)
     else:
-        actual += _wh_sum_for_assignee(db, ms.assignee, custom_milestone_id=ms.id)
+        actual += _wh_sum_for_assignee(db, ms.assignee, custom_milestone_id=ms.id, custom_task_id=None)
     for t in ms.tasks:
         t_est, t_act = _task_hours(db, t)
         estimated += t_est
@@ -182,15 +182,23 @@ def _make_list_ctx(db: Session, project_id: int) -> dict:
     for row in all_wh:
         h = max((row.hours_spent or 0.0) - (row.buffer_hours or 0.0), 0.0)
         uid = row.user_id
-        for key in [
-            ('ms', row.custom_milestone_id),
-            ('t',  row.custom_task_id),
-            ('s',  row.custom_subtask_id),
-            ('a',  row.activity_id),
-        ]:
-            if key[1] is not None:
-                wh[key][uid]  += h
-                wh[key][None] += h  # None = sum over all users
+        # Attribute each row to its MOST SPECIFIC level only so that parent
+        # levels don't double-count (e.g. a row with both custom_milestone_id
+        # and custom_task_id must only go into the task bucket — the milestone
+        # total is built by aggregating task totals, not by also querying
+        # custom_milestone_id directly for that same row).
+        if row.activity_id is not None:
+            key = ('a', row.activity_id)
+        elif row.custom_subtask_id is not None:
+            key = ('s', row.custom_subtask_id)
+        elif row.custom_task_id is not None:
+            key = ('t', row.custom_task_id)
+        elif row.custom_milestone_id is not None:
+            key = ('ms', row.custom_milestone_id)
+        else:
+            continue
+        wh[key][uid]  += h
+        wh[key][None] += h  # None = sum over all users
 
     # Query 2: all task assignments for this project (ordered newest-first so
     # first-seen wins when building the "most recent" map)
@@ -264,6 +272,7 @@ def _task_hours_ctx(ctx: dict, t: "CustomTask"):
 def _milestone_hours_ctx(ctx: dict, ms: "CustomMilestone"):
     estimated = 0.0
     linked_uid = ctx["ta_by_msnum"].get(ms.num)
+    # Direct milestone hours (no task assigned) + rollup from tasks
     if linked_uid is not None:
         actual = _ctx_wh_sum(ctx, ("ms", ms.id), user_id=linked_uid)
     else:
