@@ -255,6 +255,8 @@ def _run_lightweight_migrations():
         "UPDATE custom_milestones SET name = 'Deployment for UAT' WHERE num = 7 AND name = 'Deployment'",
         "UPDATE custom_milestones SET name = 'UAT for End User'   WHERE num = 8 AND name = 'UAT'",
         "UPDATE custom_milestones SET name = 'Post Live Support'  WHERE num = 10 AND name = 'Support'",
+        # Task Notes — free-text notes field on each Task row.
+        "ALTER TABLE custom_tasks ADD COLUMN IF NOT EXISTS notes TEXT",
     ]
     try:
         with engine.begin() as conn:
@@ -267,6 +269,147 @@ def _run_lightweight_migrations():
         logging.warning(f"Lightweight migration pass failed: {e}")
 
 _run_lightweight_migrations()
+
+
+def _fix_task_names(db):
+    """
+    Normalize task names across all milestones in every project:
+      - Strip 'None ' prefix artefacts from the Excel migration
+      - Rename to the canonical names from the Milestone/Task master list
+      - Merge form_fields from duplicate tasks into the primary (most-fielded) one
+      - Delete tasks that don't belong in the expected list
+    Idempotent: safe to run on every startup.
+    """
+    from app.models.models import CustomMilestone, CustomTask, TaskFormField
+    from sqlalchemy import text as _t
+
+    MILESTONE_TASK_MAP = {
+        "Development": [
+            "Database Object Creation",
+            "Data Extraction Development",
+            "Business Logic Development",
+            "Report Development",
+            "Dashboard Development",
+            "Validation Implementation",
+            "Internal Developer Testing",
+            "Bug Fixing",
+        ],
+        "Internal Testing": [
+            "Prepare Test Scenarios",
+            "App Testing",
+            "Retest",
+        ],
+        "Deployment for UAT": [
+            "Server Readiness",
+            "Master Data Deployment",
+            "Deploy Solution to UAT Environment",
+            "Load Sample Data",
+            "Share UAT Version",
+            "Execute Smoke Testing",
+            "Verify Deployment",
+        ],
+        "UAT for End User": [
+            "Provide User Training",
+            "Conduct UAT Walkthrough",
+            "End User Testing",
+            "Validate Outputs",
+            "Fix UAT Defects",
+            "Re-deploy Updated Version",
+            "UAT Sign-off",
+        ],
+        "Go Live": [
+            "Deploy Production Version",
+            "Configure Production Environment",
+            "Validate Production Data",
+            "Perform Sanity Testing",
+            "Obtain Go-live Approval",
+            "Release to Users",
+        ],
+        "Post Live Support": [
+            "Monitor Application/Report",
+            "Resolve Production Issues",
+            "Handover Project Documents",
+            "Project Closure",
+        ],
+    }
+
+    def _norm(name):
+        s = (name or "").strip()
+        if s.startswith("None "):
+            s = s[5:]
+        elif s == "None":
+            s = ""
+        return s.strip().lower()
+
+    renamed = merged = deleted = 0
+    try:
+        from app.db.database import SessionLocal
+        db = SessionLocal()
+        try:
+            for ms in db.query(CustomMilestone).all():
+                ms_norm = (ms.name or "").strip().lower()
+                expected = None
+                for key, names in MILESTONE_TASK_MAP.items():
+                    if ms_norm == key.lower():
+                        expected = names
+                        break
+                if expected is None:
+                    continue
+
+                tasks = db.query(CustomTask).filter_by(milestone_id=ms.id).all()
+
+                # Group by normalised name
+                by_norm = {}
+                for t in tasks:
+                    by_norm.setdefault(_norm(t.name), []).append(t)
+
+                expected_norms = {name.lower(): name for name in expected}
+                kept_ids = set()
+
+                for idx, canonical in enumerate(expected, 1):
+                    norm_key = canonical.lower()
+                    matches = sorted(by_norm.get(norm_key, []),
+                                     key=lambda t: len(t.form_fields), reverse=True)
+                    if not matches:
+                        continue
+                    primary = matches[0]
+                    if primary.name != canonical:
+                        primary.name = canonical
+                        renamed += 1
+                    primary.num = idx
+                    kept_ids.add(primary.id)
+
+                    # Merge form_fields from duplicates via raw SQL (avoids cascade-delete race)
+                    for dup in matches[1:]:
+                        db.execute(_t("UPDATE task_form_fields SET task_id = :pid WHERE task_id = :did"),
+                                   {"pid": primary.id, "did": dup.id})
+                        merged += db.execute(_t("SELECT changes()") if False else _t(
+                            "SELECT COUNT(*) FROM task_form_fields WHERE task_id = :pid"),
+                            {"pid": primary.id}).scalar() and 0  # count already moved; just flush
+                        db.flush()
+                        db.expire(dup)
+                        db.delete(dup)
+                        deleted += 1
+
+                # Delete tasks not in expected list
+                for t in tasks:
+                    if t.id not in kept_ids and _norm(t.name) not in expected_norms:
+                        db.delete(t)
+                        deleted += 1
+
+                db.flush()
+
+            db.commit()
+            logging.info(f"_fix_task_names: renamed={renamed}, deleted={deleted}")
+        except Exception as e:
+            db.rollback()
+            logging.warning(f"_fix_task_names failed: {e}")
+        finally:
+            db.close()
+    except Exception as e:
+        logging.warning(f"_fix_task_names could not acquire DB session: {e}")
+
+_fix_task_names(None)
 
 def _update_user_accounts():
     """Set real names, office emails and hashed passwords for the 5 role-based

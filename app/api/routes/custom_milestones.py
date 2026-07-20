@@ -318,6 +318,7 @@ def _build_task_ctx(t: "CustomTask", ctx: dict):
         "start_time": t.start_time, "end_time": t.end_time,
         "estimated_hours": est, "actual_hours": act,
         "total_days": _total_days(t.planned_start, t.planned_end) or _total_days(t.actual_start, t.actual_end),
+        "notes": t.notes,
         "form_fields": [_build_form_field(f) for f in sorted(t.form_fields, key=lambda x: x.num or 0)],
         "subtasks": [_build_subtask_ctx(s, ctx) for s in sorted(t.subtasks, key=lambda x: x.num or 0)],
     }
@@ -499,6 +500,7 @@ class TaskUpdate(BaseModel):
     actual_end: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    notes: Optional[str] = None
 
 class SubtaskCreate(BaseModel):
     name: str
@@ -1294,7 +1296,7 @@ def update_task(
     old_assignee = t.assignee
     _set_fields(t, payload, ["name", "responsibility", "status", "assignee",
                               "planned_start", "planned_end", "actual_start", "actual_end",
-                              "start_time", "end_time"])
+                              "start_time", "end_time", "notes"])
     if t.status == "Completed" and old_status != "Completed" and not t.actual_end:
         t.actual_end = datetime.utcnow()
     db.flush()

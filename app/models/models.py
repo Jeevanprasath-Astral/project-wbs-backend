@@ -352,6 +352,7 @@ class CustomTask(Base):
     start_time    = Column(String(10))   # "HH:MM"
     end_time      = Column(String(10))   # "HH:MM"
     subtasks     = relationship("CustomSubtask", back_populates="task", cascade="all, delete-orphan")
+    notes        = Column(Text)
     form_fields  = relationship("TaskFormField", back_populates="task", cascade="all, delete-orphan", order_by="TaskFormField.num")
     milestone    = relationship("CustomMilestone", back_populates="tasks")
 
