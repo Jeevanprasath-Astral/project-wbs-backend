@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.models import (CustomMilestone, CustomTask, CustomSubtask, Activity,
                                 SubtaskQuestion, SubtaskReport, MilestoneReport,
+                                TaskFormField,
                                 Milestone, Task, Subtask, User, WorkHours, Project,
                                 TaskAssignment)
 from sqlalchemy.exc import IntegrityError
@@ -317,6 +318,7 @@ def _build_task_ctx(t: "CustomTask", ctx: dict):
         "start_time": t.start_time, "end_time": t.end_time,
         "estimated_hours": est, "actual_hours": act,
         "total_days": _total_days(t.planned_start, t.planned_end) or _total_days(t.actual_start, t.actual_end),
+        "form_fields": [_build_form_field(f) for f in sorted(t.form_fields, key=lambda x: x.num or 0)],
         "subtasks": [_build_subtask_ctx(s, ctx) for s in sorted(t.subtasks, key=lambda x: x.num or 0)],
     }
 
@@ -560,6 +562,18 @@ class SubtaskQuestionUpdate(BaseModel):
     input_type: Optional[str] = None
     response: Optional[str] = None
 
+class FormFieldCreate(BaseModel):
+    question_text: str
+    input_type: str = "text"
+    section_name: Optional[str] = None
+    num: Optional[int] = None
+
+class FormFieldUpdate(BaseModel):
+    question_text: Optional[str] = None
+    input_type: Optional[str] = None
+    section_name: Optional[str] = None
+    response: Optional[str] = None
+
 class ReportCreate(BaseModel):
     report_number: str
     report_name: str
@@ -664,6 +678,14 @@ def _build_milestone_report(r: MilestoneReport):
     }
 
 
+def _build_form_field(f: TaskFormField):
+    return {
+        "id": f.id, "num": f.num, "section_name": f.section_name,
+        "question_text": f.question_text, "input_type": f.input_type,
+        "response": f.response,
+    }
+
+
 def _build_task(t: CustomTask, db: Session = None):
     est, act = _task_hours(db, t) if db is not None else (0.0, 0.0)
     return {
@@ -675,6 +697,9 @@ def _build_task(t: CustomTask, db: Session = None):
         "start_time": t.start_time, "end_time": t.end_time,
         "estimated_hours": est, "actual_hours": act,
         "total_days": _total_days(t.planned_start, t.planned_end) or _total_days(t.actual_start, t.actual_end),
+        # New: form_fields replaces the subtask+question hierarchy
+        "form_fields": [_build_form_field(f) for f in sorted(t.form_fields, key=lambda x: x.num or 0)],
+        # Keep subtasks in payload for backward compat during transition
         "subtasks": [_build_subtask(s, db) for s in sorted(t.subtasks, key=lambda x: x.num or 0)],
     }
 
@@ -777,6 +802,8 @@ def list_custom_milestones(
 ):
     milestones = db.query(CustomMilestone).options(
         joinedload(CustomMilestone.tasks)
+            .joinedload(CustomTask.form_fields),
+        joinedload(CustomMilestone.tasks)
             .joinedload(CustomTask.subtasks)
             .joinedload(CustomSubtask.activities),
         joinedload(CustomMilestone.tasks)
@@ -832,34 +859,79 @@ def add_from_template(
     )
     db.add(cm); db.flush()
 
+    # Milestones 5-10 use the new Task-promotion structure: each Subtask
+    # becomes an independent CustomTask with its Questions as FormFields.
+    # Milestones 1-4 keep the original Tasks; Subtasks fold as Form sections.
+    from main import _SUBTASK_TO_NEW_TASK
+
     for i, t in enumerate(sorted(standard.tasks, key=lambda x: x.num or 0)):
         t_num = t.num or (i + 1)
         if selected_task_nums is not None and t_num not in selected_task_nums:
             continue
-        ct = CustomTask(milestone_id=cm.id, project_id=project_id,
-                        num=t_num, name=t.name, responsibility=t.responsibility,
-                        status="Not Started")
-        db.add(ct); db.flush()
 
-        wanted_subs = subtask_nums.get(t_num) if subtask_nums else None
-        for j, s in enumerate(sorted(t.subtasks, key=lambda x: x.num or 0)):
-            s_num = s.num or (j + 1)
-            if wanted_subs is not None and s_num not in wanted_subs:
-                continue
-            cs = CustomSubtask(task_id=ct.id, project_id=project_id,
-                               num=s_num, name=s.name,
-                               input_type=s.input_type or "text", status="Not Started")
-            db.add(cs); db.flush()
-            # Standard subtasks can carry multiple Questions (the original
-            # form questions, e.g. "Understand client business operations"
-            # has 10) — these were never copied over, so every multi-question
-            # subtask added from a template silently lost its extra
-            # questions and fell back to the single flat answer field. Copy
-            # each one into a SubtaskQuestion row so the form matches.
-            for q in sorted(s.questions, key=lambda x: x.num or 0):
-                db.add(SubtaskQuestion(subtask_id=cs.id, project_id=project_id,
-                                        num=q.num, question_text=q.question_text,
-                                        input_type=q.input_type or "text"))
+        need_new_tasks = ms_num in (5, 6, 7, 8, 9, 10)
+
+        if need_new_tasks:
+            # Build promoted tasks from subtasks
+            new_task_map: dict[str, CustomTask] = {}
+            for j, s in enumerate(sorted(t.subtasks, key=lambda x: x.num or 0)):
+                s_num = s.num or (j + 1)
+                wanted_subs = subtask_nums.get(t_num) if subtask_nums else None
+                if wanted_subs is not None and s_num not in wanted_subs:
+                    continue
+                new_name = _SUBTASK_TO_NEW_TASK.get((ms_num, t_num, s_num))
+                if new_name is None:
+                    new_name = s.name  # fallback: use subtask name as task name
+                if new_name not in new_task_map:
+                    nt = CustomTask(milestone_id=cm.id, project_id=project_id,
+                                    num=None, name=new_name,
+                                    responsibility=t.responsibility, status="Not Started")
+                    db.add(nt); db.flush()
+                    new_task_map[new_name] = nt
+                tgt = new_task_map[new_name]
+                questions = sorted(s.questions, key=lambda x: x.num or 0)
+                if not questions:
+                    db.add(TaskFormField(task_id=tgt.id, milestone_id=cm.id,
+                                         project_id=project_id, num=1,
+                                         section_name=None,
+                                         question_text=s.name,
+                                         input_type=s.input_type or "text"))
+                else:
+                    for idx, q in enumerate(questions, 1):
+                        db.add(TaskFormField(task_id=tgt.id, milestone_id=cm.id,
+                                              project_id=project_id, num=idx,
+                                              section_name=None,
+                                              question_text=q.question_text,
+                                              input_type=q.input_type or "text"))
+        else:
+            # M1-M4: create the original Task, fold Subtasks as Form sections
+            ct = CustomTask(milestone_id=cm.id, project_id=project_id,
+                            num=t_num, name=t.name, responsibility=t.responsibility,
+                            status="Not Started")
+            db.add(ct); db.flush()
+
+            wanted_subs = subtask_nums.get(t_num) if subtask_nums else None
+            field_num = 0
+            for j, s in enumerate(sorted(t.subtasks, key=lambda x: x.num or 0)):
+                s_num = s.num or (j + 1)
+                if wanted_subs is not None and s_num not in wanted_subs:
+                    continue
+                questions = sorted(s.questions, key=lambda x: x.num or 0)
+                if not questions:
+                    field_num += 1
+                    db.add(TaskFormField(task_id=ct.id, milestone_id=cm.id,
+                                         project_id=project_id, num=field_num,
+                                         section_name=s.name,
+                                         question_text=s.name,
+                                         input_type=s.input_type or "text"))
+                else:
+                    for q in questions:
+                        field_num += 1
+                        db.add(TaskFormField(task_id=ct.id, milestone_id=cm.id,
+                                              project_id=project_id, num=field_num,
+                                              section_name=s.name,
+                                              question_text=q.question_text,
+                                              input_type=q.input_type or "text"))
 
     log_action(db, actor=current_user.name, action="add_milestone",
                description=f"Added M{ms_num:02d} to project",
@@ -891,31 +963,68 @@ def add_task_from_template(
     if not std_task:
         raise HTTPException(404, f"Standard task {task_num} not found under milestone {cm.num}")
 
-    ct = CustomTask(milestone_id=cm.id, project_id=project_id, num=std_task.num,
-                    name=std_task.name, responsibility=std_task.responsibility,
-                    status="Not Started")
-    db.add(ct); db.flush()
+    from main import _SUBTASK_TO_NEW_TASK
+    ms_num = cm.num
+    t_num  = std_task.num or task_num
+    need_new_tasks = ms_num in (5, 6, 7, 8, 9, 10)
 
-    for j, s in enumerate(sorted(std_task.subtasks, key=lambda x: x.num or 0)):
-        s_num = s.num or (j + 1)
-        if subtask_nums is not None and s_num not in subtask_nums:
-            continue
-        cs = CustomSubtask(task_id=ct.id, project_id=project_id, num=s_num, name=s.name,
-                           input_type=s.input_type or "text", status="Not Started")
-        db.add(cs); db.flush()
-        # See add_from_template — copy multi-question form data too.
-        for q in sorted(s.questions, key=lambda x: x.num or 0):
-            db.add(SubtaskQuestion(subtask_id=cs.id, project_id=project_id,
-                                    num=q.num, question_text=q.question_text,
-                                    input_type=q.input_type or "text"))
+    if need_new_tasks:
+        # M5-M10: Subtasks become new Tasks with FormFields
+        new_task_map: dict[str, CustomTask] = {}
+        for j, s in enumerate(sorted(std_task.subtasks, key=lambda x: x.num or 0)):
+            s_num = s.num or (j + 1)
+            if subtask_nums is not None and s_num not in subtask_nums:
+                continue
+            new_name = _SUBTASK_TO_NEW_TASK.get((ms_num, t_num, s_num)) or s.name
+            if new_name not in new_task_map:
+                nt = CustomTask(milestone_id=cm.id, project_id=project_id, num=None,
+                                name=new_name, responsibility=std_task.responsibility,
+                                status="Not Started")
+                db.add(nt); db.flush()
+                new_task_map[new_name] = nt
+            tgt = new_task_map[new_name]
+            questions = sorted(s.questions, key=lambda x: x.num or 0)
+            if not questions:
+                db.add(TaskFormField(task_id=tgt.id, milestone_id=cm.id,
+                                     project_id=project_id, num=1, section_name=None,
+                                     question_text=s.name, input_type=s.input_type or "text"))
+            else:
+                for idx, q in enumerate(questions, 1):
+                    db.add(TaskFormField(task_id=tgt.id, milestone_id=cm.id,
+                                         project_id=project_id, num=idx, section_name=None,
+                                         question_text=q.question_text,
+                                         input_type=q.input_type or "text"))
+        db.commit()
+        return {"status": "ok", "tasks_created": list(new_task_map.keys())}
 
-    db.commit(); db.refresh(ct)
-    return {"id": ct.id, "num": ct.num, "name": ct.name, "responsibility": ct.responsibility,
-            "status": ct.status,
-            "subtasks": [{"id": s.id, "num": s.num, "name": s.name, "input_type": s.input_type,
-                          "status": s.status,
-                          "questions": [_build_question(q) for q in sorted(s.questions, key=lambda x: (x.num or 0, x.id))]}
-                         for s in ct.subtasks]}
+    else:
+        # M1-M4: create Task, fold Subtasks as Form sections
+        ct = CustomTask(milestone_id=cm.id, project_id=project_id, num=std_task.num,
+                        name=std_task.name, responsibility=std_task.responsibility,
+                        status="Not Started")
+        db.add(ct); db.flush()
+
+        field_num = 0
+        for j, s in enumerate(sorted(std_task.subtasks, key=lambda x: x.num or 0)):
+            s_num = s.num or (j + 1)
+            if subtask_nums is not None and s_num not in subtask_nums:
+                continue
+            questions = sorted(s.questions, key=lambda x: x.num or 0)
+            if not questions:
+                field_num += 1
+                db.add(TaskFormField(task_id=ct.id, milestone_id=cm.id,
+                                     project_id=project_id, num=field_num,
+                                     section_name=s.name, question_text=s.name,
+                                     input_type=s.input_type or "text"))
+            else:
+                for q in questions:
+                    field_num += 1
+                    db.add(TaskFormField(task_id=ct.id, milestone_id=cm.id,
+                                         project_id=project_id, num=field_num,
+                                         section_name=s.name, question_text=q.question_text,
+                                         input_type=q.input_type or "text"))
+        db.commit(); db.refresh(ct)
+        return _build_task(ct, db)
 
 
 # ── Add one standard subtask into an existing custom task ────────────────────
@@ -1215,6 +1324,52 @@ def delete_task(
     t = db.query(CustomTask).filter_by(id=task_id, milestone_id=milestone_id).first()
     if not t: raise HTTPException(404, "Task not found")
     db.delete(t); db.commit()
+    return {"status": "deleted"}
+
+
+# ── Task Form Fields (replaces Subtask+Question hierarchy) ───────────────────
+@router.post("/{milestone_id}/tasks/{task_id}/form-fields")
+def add_form_field(
+    project_id: int, milestone_id: int, task_id: int, payload: FormFieldCreate,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    task = db.query(CustomTask).filter_by(id=task_id, milestone_id=milestone_id).first()
+    if not task: raise HTTPException(404, "Task not found")
+    max_num = max((f.num or 0 for f in task.form_fields), default=0)
+    ff = TaskFormField(
+        task_id=task_id, milestone_id=milestone_id, project_id=project_id,
+        num=payload.num or (max_num + 1),
+        section_name=payload.section_name,
+        question_text=payload.question_text,
+        input_type=payload.input_type or "text",
+    )
+    db.add(ff); db.commit(); db.refresh(ff)
+    return _build_form_field(ff)
+
+
+@router.patch("/{milestone_id}/tasks/{task_id}/form-fields/{field_id}")
+def update_form_field(
+    project_id: int, milestone_id: int, task_id: int, field_id: int,
+    payload: FormFieldUpdate,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    ff = db.query(TaskFormField).filter_by(id=field_id, task_id=task_id).first()
+    if not ff: raise HTTPException(404, "Form field not found")
+    data = payload.model_dump(exclude_none=True)
+    for k, v in data.items():
+        setattr(ff, k, v)
+    db.commit(); db.refresh(ff)
+    return _build_form_field(ff)
+
+
+@router.delete("/{milestone_id}/tasks/{task_id}/form-fields/{field_id}")
+def delete_form_field(
+    project_id: int, milestone_id: int, task_id: int, field_id: int,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    ff = db.query(TaskFormField).filter_by(id=field_id, task_id=task_id).first()
+    if not ff: raise HTTPException(404, "Form field not found")
+    db.delete(ff); db.commit()
     return {"status": "deleted"}
 
 
@@ -1776,93 +1931,4 @@ def send_milestone_mailbox(
           <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Status</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{ms.status or ''}</td></tr>
           <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Assignee</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{ms.assignee or '—'}</td></tr>
           <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned Start</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.planned_start)}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned End</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.planned_end)}</td></tr>
-        </table>
-        <p style="font-size:13px;color:#334155;margin-bottom:8px;font-weight:bold">Tasks ({len(tasks)})</p>
-        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
-          <tr style="background:#4F46E5"><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Task #</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Name</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Assignee</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Status</th></tr>
-          {task_rows}
-        </table>
-        <p style="font-size:12px;color:#64748b;">&#128206; Full details including Subtasks &amp; Activities are in the attached Excel file.</p>
-        <p style="font-size:12px;color:#64748b;margin-top:16px;">Sent by <strong>{current_user.name}</strong> via Axon WBS</p>
-      </div>
-    </div>"""
-    subject = f"[{project_name}] Milestone M{ms.num:02d} — {ms.name or 'Details'}"
-    if not send_mailbox_email(payload.to, subject, body, excel_b64, file_name):
-        raise HTTPException(500, "Failed to send email — check server logs")
-    return {"status": "sent", "recipients": len(payload.to)}
-
-
-@router.post("/{milestone_id}/tasks/{task_id}/mailbox")
-def send_task_mailbox(
-    project_id: int, milestone_id: int, task_id: int, payload: MailboxPayload,
-    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
-):
-    ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
-    if not ms: raise HTTPException(404, "Milestone not found")
-    task = db.query(CustomTask).filter_by(id=task_id, milestone_id=milestone_id).first()
-    if not task: raise HTTPException(404, "Task not found")
-    if not payload.to: raise HTTPException(400, "At least one recipient required")
-    project = db.query(Project).filter_by(id=project_id).first()
-    project_name = project.name if project else "—"
-    excel_b64 = _b64.b64encode(_generate_task_excel(db, task, ms)).decode("utf-8")
-    file_name = f"Task_T{task.num:02d}_{(task.name or 'details').replace(' ','_')}.xlsx"
-    note_html = f"<p><strong>Note from {current_user.name}:</strong> {payload.note}</p><hr/>" if payload.note else ""
-    subs = db.query(CustomSubtask).filter_by(task_id=task.id).order_by(CustomSubtask.num).all()
-    sub_rows = "".join(
-        f"<tr><td style='padding:4px 8px;border:1px solid #e2e8f0'>S{s.num:02d}</td>"
-        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{s.name or ''}</td>"
-        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{s.assignee or '—'}</td>"
-        f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{s.status or ''}</td></tr>"
-        for s in subs
-    ) or "<tr><td colspan='4' style='padding:8px;text-align:center;color:#94a3b8;font-size:12px'>No subtasks</td></tr>"
-    body = f"""
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
-      <div style="background:linear-gradient(135deg,#091525,#0f2448);padding:24px 28px;border-radius:12px 12px 0 0;text-align:center;">
-        <h1 style="color:#fff;font-size:20px;margin:0;">AXON WBS</h1>
-        <p style="color:#4a6080;font-size:11px;margin:4px 0 0;letter-spacing:.08em;">TASK DETAILS</p>
-      </div>
-      <div style="padding:24px;background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px;">
-        {note_html}
-        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9;width:35%">Project</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{project_name}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Milestone</td><td style="padding:5px 8px;border:1px solid #e2e8f0">M{ms.num:02d} — {ms.name or ''}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Task</td><td style="padding:5px 8px;border:1px solid #e2e8f0">T{task.num:02d} — {task.name or ''}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Status</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{task.status or ''}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Assignee</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{task.assignee or '—'}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned Start</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(task.planned_start)}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned End</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(task.planned_end)}</td></tr>
-        </table>
-        <p style="font-size:13px;color:#334155;margin-bottom:8px;font-weight:bold">Subtasks ({len(subs)})</p>
-        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
-          <tr style="background:#7C3AED"><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Subtask #</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Name</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Assignee</th><th style="padding:6px 8px;border:1px solid #e2e8f0;color:#fff;font-size:12px;text-align:left">Status</th></tr>
-          {sub_rows}
-        </table>
-        <p style="font-size:12px;color:#64748b;">&#128206; Full details including Activities are in the attached Excel file.</p>
-        <p style="font-size:12px;color:#64748b;margin-top:16px;">Sent by <strong>{current_user.name}</strong> via Axon WBS</p>
-      </div>
-    </div>"""
-    subject = f"[{project_name}] Task T{task.num:02d} — {task.name or 'Details'}"
-    if not send_mailbox_email(payload.to, subject, body, excel_b64, file_name):
-        raise HTTPException(500, "Failed to send email — check server logs")
-    return {"status": "sent", "recipients": len(payload.to)}
-
-
-# ── Single milestone GET (for targeted frontend refresh without full reload) ──
-# Placed last so all static paths (/templates, /hours-summary, etc.)
-# are matched before this wildcard capture.
-@router.get("/{milestone_id}")
-def get_one_milestone(
-    project_id: int, milestone_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Return one fully-nested milestone (tasks → subtasks → activities).
-    Used by the frontend updateOneMilestone() to refresh a single card
-    after a save without triggering a full page reload."""
-    ms = db.query(CustomMilestone).options(
-        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.activities)
-    ).filter_by(id=milestone_id, project_id=project_id).first()
-    if not ms:
-        raise HTTPException(404, "Milestone not found")
-    return _build(ms, db)
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned End</td><td style="padding:5px 8px;border:1px solid #e

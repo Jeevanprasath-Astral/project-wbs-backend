@@ -233,6 +233,28 @@ def _run_lightweight_migrations():
         # Notifications: the bell-icon unread count hits this on every page load.
         "CREATE INDEX IF NOT EXISTS ix_notifications_user_id         ON notifications(user_id)",
         "CREATE INDEX IF NOT EXISTS ix_notifications_is_read         ON notifications(is_read)",
+        # ── Milestone Config Redesign (Task Form Fields) ──────────────────────
+        # TaskFormField replaces the Subtask → Question hierarchy. Each Task now
+        # has a flat list of form fields (section_name = former subtask name).
+        """CREATE TABLE IF NOT EXISTS task_form_fields (
+            id            SERIAL PRIMARY KEY,
+            task_id       INTEGER NOT NULL REFERENCES custom_tasks(id) ON DELETE CASCADE,
+            milestone_id  INTEGER NOT NULL REFERENCES custom_milestones(id) ON DELETE CASCADE,
+            project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            num           INTEGER DEFAULT 1,
+            section_name  VARCHAR(300),
+            question_text VARCHAR(500) NOT NULL,
+            input_type    VARCHAR(50) DEFAULT 'text',
+            response      TEXT,
+            created_at    TIMESTAMPTZ DEFAULT now()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_task_form_fields_task_id ON task_form_fields(task_id)",
+        "CREATE INDEX IF NOT EXISTS ix_task_form_fields_project_id ON task_form_fields(project_id)",
+        # Rename milestone names to match new nomenclature. WHERE clause uses
+        # LIKE so it catches any existing project's milestones safely. Idempotent.
+        "UPDATE custom_milestones SET name = 'Deployment for UAT' WHERE num = 7 AND name = 'Deployment'",
+        "UPDATE custom_milestones SET name = 'UAT for End User'   WHERE num = 8 AND name = 'UAT'",
+        "UPDATE custom_milestones SET name = 'Post Live Support'  WHERE num = 10 AND name = 'Support'",
     ]
     try:
         with engine.begin() as conn:
@@ -375,120 +397,91 @@ def _backfill_subtask_questions(db):
         logging.info(f"Backfilled {added} subtask question(s) onto existing custom subtasks")
 
 
-@app.on_event("startup")
-def startup():
-    start_scheduler(); start_warmup()
-    try:
-        from app.db.database import SessionLocal
-        from app.services.progress_service import fix_existing_progress
-        db = SessionLocal()
-        fix_existing_progress(db)
-        db.close()
-    except Exception as e:
-        logging.warning(f"Startup fix failed: {e}")
-    try:
-        from app.db.database import SessionLocal
-        db = SessionLocal()
-        _backfill_subtask_questions(db)
-        db.close()
-    except Exception as e:
-        logging.warning(f"Subtask-question backfill failed: {e}")
-    logging.info(f"{settings.APP_NAME} v2.0 started")
+# ── Excel-driven mapping: Subtask → new Task name (for M5-M10) ───────────────
+# For milestones 5-10 each original Subtask becomes an independent Task.
+# Key: (milestone_num, original_task_num, subtask_num) → new Task name
+# None = subtask has no new Task name (gets folded into parent Task form)
+_SUBTASK_TO_NEW_TASK: dict = {
+    # M5 Development
+    (5, 1, 1): "Database object creation",
+    (5, 1, 2): "Data extraction development",
+    (5, 1, 3): "Business logic development",
+    (5, 1, 4): "Report development",
+    (5, 1, 5): "Dashboard development",
+    (5, 1, 6): "Validation implementation",
+    (5, 1, 7): "Internal developer testing",
+    (5, 1, 8): "Bug fixing",
+    # M6 Internal Testing
+    (6, 1, 1): "Prepare test scenarios",
+    (6, 1, 2): "App testing",
+    (6, 1, 3): None,   # stays under App testing form
+    (6, 1, 4): None,
+    (6, 1, 5): None,
+    (6, 1, 6): None,
+    (6, 1, 7): "Retest",
+    (6, 1, 8): None,
+    # M7 Deployment for UAT
+    (7, 1, 1): "Server Readiness",
+    (7, 1, 2): "Master data Deploy",
+    (7, 1, 3): "Deploy solution to UAT environment",
+    (7, 1, 4): "Load sample data",
+    (7, 1, 5): "Share UAT version",
+    (7, 2, 1): "Execute smoke testing",
+    (7, 2, 2): "Verify deployment",
+    # M8 UAT for End User
+    (8, 1, 1): "Provide user training",
+    (8, 1, 2): "Conduct UAT walkthrough",
+    (8, 1, 3): "End User testing",
+    (8, 1, 4): "Validate outputs",
+    (8, 1, 5): None,
+    (8, 1, 6): None,
+    (8, 1, 7): "Fix UAT defects",
+    (8, 1, 8): "Re-deploy updated version",
+    (8, 1, 9): "UAT sign-off",
+    # M9 Go Live
+    (9, 1, 1): "Deploy production version",
+    (9, 1, 2): "Configure production environment",
+    (9, 1, 3): "Validate production data",
+    (9, 1, 4): "Perform sanity testing",
+    (9, 1, 5): "Obtain go-live approval",
+    (9, 1, 6): "Release to users",
+    # M10 Post Live Support
+    (10, 1, 1): "Monitor application/report",
+    (10, 1, 2): "Resolve production issues",
+    (10, 1, 3): None,
+    (10, 1, 4): None,
+    (10, 1, 5): "Handover project documents",
+    (10, 1, 6): "Project closure",
+}
 
-@app.on_event("shutdown")
-def shutdown():
-    stop_scheduler(); stop_warmup()
+def _migrate_form_fields(db):
+    """One-time migration: convert existing CustomSubtask+SubtaskQuestion rows
+    into TaskFormField rows.
 
-@app.get("/")
-def root(): return {"message": f"{settings.APP_NAME} API v2.0", "docs": "/docs"}
+    Strategy:
+    - M1-M4: Subtasks fold into their parent Task as Form sections.
+      Each SubtaskQuestion becomes a TaskFormField with section_name=subtask.name.
+    - M5-M10: Subtasks with a mapped new Task name get their own new CustomTask
+      (if not already present), and their Questions become FormFields of that
+      new Task. Subtasks with no mapping (None) get folded into the nearest
+      preceding named Task.
+    - WorkHours rows with a custom_subtask_id are re-pointed to the parent
+      (or newly promoted) Task.
+    """
+    from app.models.models import (
+        CustomMilestone, CustomTask, CustomSubtask, SubtaskQuestion,
+        TaskFormField, WorkHours
+    )
+    from sqlalchemy.orm import joinedload
 
-@app.get("/health")
-def health(): return {"status": "ok"}
+    # Only run if task_form_fields table is empty (idempotent guard)
+    existing = db.execute(text("SELECT COUNT(*) FROM task_form_fields")).scalar()
+    if existing > 0:
+        logging.info(f"_migrate_form_fields: already seeded ({existing} rows), skipping")
+        return
 
-@app.get("/api/ping")
-def ping(): return {"status": "ok"}
+    added_fields = 0
+    added_tasks  = 0
+    updated_wh   = 0
 
-@app.get("/api/seed-database")
-def seed_database():
-    try:
-        from seed import seed
-        seed()
-        return {"status": "success", "message": "Database seeded!"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/api/debug-accounts")
-def debug_accounts():
-    """TEMPORARY — shows current role/name/email for all users (no passwords).
-    Remove this endpoint after confirming account migration is correct."""
-    from app.db.database import SessionLocal
-    from app.models.models import User
-    db = SessionLocal()
-    users = db.query(User.id, User.role, User.name, User.email).order_by(User.id).all()
-    db.close()
-    return [{"id": u.id, "role": u.role, "name": u.name, "email": u.email} for u in users]
-
-@app.get("/api/setup-accounts")
-def setup_accounts():
-    """TEMPORARY one-time endpoint — sets correct name/email/password for all
-    5 role-based accounts using the server's own hash function (same SECRET_KEY
-    as the login endpoint). Call once after deploy, then ignore — safe to call
-    multiple times (idempotent).  Remove in the next cleanup deploy."""
-    from app.db.database import SessionLocal
-    from app.models.models import User
-    from app.core.security import hash_password, verify_password
-    # (current_email_in_db, target_name, target_email, password)
-    # Uses current email to locate the row — avoids role-name mismatches.
-    accounts = [
-        ("jeevanprasath.j@astralbusinessconsulting.in", "Jeevan Prasath. J",
-         "jeevanprasath.j@astralbusinessconsulting.in",  "DEC@jp2801"),
-        ("gayathri.p@astralbusinessconsulting.com",       "Gayathri. P",
-         "gayathri.p@astralbusinessconsulting.com",        "PManager@2026"),
-        ("manikandan.m@astralbusinessconsulting.in",       "Manikandan. M",
-         "manikandan.m@astralbusinessconsulting.in",        "FCLead@2026"),
-        # HR Manager — old email hr@wbs.com; role in DB is "HR"
-        ("hr@wbs.com",                                    "Manikandan. S",
-         "manikandan.s@astralbusinessconsulting.com",      "HRUser@2026"),
-        # Technical Lead — old email tclead@wbs.com; role in DB is "TC Lead"
-        ("tclead@wbs.com",                                "Sanjeev. V",
-         "sanjeev.v@astralbusinessconsulting.in",          "TCLead@2026"),
-    ]
-    db = SessionLocal()
-    results = []
-    try:
-        for old_email, name, new_email, pwd in accounts:
-            u = db.query(User).filter(User.email == old_email).first()
-            if not u:
-                results.append({"email": new_email, "status": "NOT FOUND (check old email)"})
-                continue
-            u.name         = name
-            u.email        = new_email
-            u.password_hash = hash_password(pwd)
-            db.flush()
-            # Immediate verify inside the same process — proves hash is correct
-            ok = verify_password(pwd, u.password_hash)
-            results.append({"email": new_email,
-                             "status": "updated",
-                             "verify": "PASS" if ok else "FAIL — hash mismatch!"})
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        return {"status": "error", "message": str(exc)}
-    finally:
-        db.close()
-    return {"status": "success", "results": results}
-
-@app.get("/api/fix-passwords")
-def fix_passwords():
-    try:
-        from app.db.database import SessionLocal
-        from app.models.models import User
-        from app.core.security import hash_password
-        db = SessionLocal()
-        for email, pwd in [("admin@wbs.com","admin123"),("fc@wbs.com","fc123"),("tech@wbs.com","tech123"),("client@wbs.com","client123")]:
-            u = db.query(User).filter_by(email=email).first()
-            if u: u.password_hash = hash_password(pwd)
-        db.commit(); db.close()
-        return {"status": "success", "message": "Passwords updated! Login: admin@wbs.com / admin123"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    milestones = db.query(CustomMilestone).o

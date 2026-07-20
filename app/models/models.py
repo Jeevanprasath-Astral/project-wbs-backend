@@ -352,6 +352,7 @@ class CustomTask(Base):
     start_time    = Column(String(10))   # "HH:MM"
     end_time      = Column(String(10))   # "HH:MM"
     subtasks     = relationship("CustomSubtask", back_populates="task", cascade="all, delete-orphan")
+    form_fields  = relationship("TaskFormField", back_populates="task", cascade="all, delete-orphan", order_by="TaskFormField.num")
     milestone    = relationship("CustomMilestone", back_populates="tasks")
 
 class CustomSubtask(Base):
@@ -438,6 +439,24 @@ class SubtaskReport(Base):
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     updated_at    = Column(DateTime(timezone=True), onupdate=func.now())
     subtask       = relationship("CustomSubtask", back_populates="reports")
+
+# ── Task Form Fields (replaces Subtask + Question hierarchy) ─────────────────
+# Each CustomTask now has a flat list of form fields (previously Subtask
+# Questions). Fields are grouped visually by section_name (formerly Subtask
+# name) but stored flat under the Task for simplicity.
+class TaskFormField(Base):
+    __tablename__ = "task_form_fields"
+    id            = Column(Integer, primary_key=True, index=True)
+    task_id       = Column(Integer, ForeignKey("custom_tasks.id"), nullable=False)
+    milestone_id  = Column(Integer, ForeignKey("custom_milestones.id"), nullable=False)
+    project_id    = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    num           = Column(Integer, default=1)          # order within task
+    section_name  = Column(String(300))                 # visual grouping header (formerly subtask name)
+    question_text = Column(String(500), nullable=False)
+    input_type    = Column(String(50), default="text")  # text|long|number|date|yesno|dropdown_*
+    response      = Column(Text)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    task          = relationship("CustomTask", back_populates="form_fields")
 
 # ── Milestone Reports (optional, multiple per Milestone) ──────────────────────
 # Reports are associated at the Milestone level — several reports can point at
@@ -573,25 +592,4 @@ class ReportTemplateItem(Base):
     __tablename__ = "report_template_items"
     id            = Column(Integer, primary_key=True, index=True)
     template_id   = Column(Integer, ForeignKey("report_templates.id"), nullable=False)
-    report_number = Column(String(100), nullable=False)
-    report_name   = Column(String(300), nullable=False)
-    department    = Column(String(150))
-    created_at    = Column(DateTime(timezone=True), server_default=func.now())
-    template      = relationship("ReportTemplate", back_populates="items")
-
-# ── Attachments ───────────────────────────────────────────────────────────────
-class Attachment(Base):
-    """Generic polymorphic attachment — one table handles all entity types.
-    entity_type: milestone | task | subtask | activity | report
-    Files stored under uploads/attachments/<entity_type>/<stored_filename>."""
-    __tablename__ = "attachments"
-    id                = Column(Integer, primary_key=True, index=True)
-    entity_type       = Column(String(50), nullable=False)
-    entity_id         = Column(Integer, nullable=False)
-    original_filename = Column(String(300), nullable=False)
-    stored_filename   = Column(String(300), nullable=False)
-    file_size         = Column(Integer)
-    mime_type         = Column(String(100))
-    uploaded_by       = Column(Integer, ForeignKey("users.id"))
-    created_at        = Column(DateTime(timezone=True), server_default=func.now())
-    uploader          = relationship("User", foreign_keys=[uploaded_by])
+    report_number = Column(String(100), nullab
