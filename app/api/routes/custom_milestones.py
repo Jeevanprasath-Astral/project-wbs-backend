@@ -1931,4 +1931,32 @@ def send_milestone_mailbox(
           <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Status</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{ms.status or ''}</td></tr>
           <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Assignee</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{ms.assignee or '—'}</td></tr>
           <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned Start</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.planned_start)}</td></tr>
-          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned End</td><td style="padding:5px 8px;border:1px solid #e
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Planned End</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.planned_end)}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Actual Start</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.actual_start)}</td></tr>
+          <tr><td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;background:#f1f5f9">Actual End</td><td style="padding:5px 8px;border:1px solid #e2e8f0">{_dfmt(ms.actual_end)}</td></tr>
+        </table>
+        <h3 style="font-size:13px;color:#334155;margin:16px 0 8px;">Tasks</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <tr style="background:#f1f5f9;">
+            <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;">#</th>
+            <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;">Task</th>
+            <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;">Assignee</th>
+            <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;">Status</th>
+          </tr>
+          {task_rows}
+        </table>
+        <p style="font-size:11px;color:#94a3b8;margin-top:16px;">Excel report attached · Axon WBS</p>
+      </div>
+    </div>
+    """
+    subject = f"Milestone M{ms.num:02d} — {ms.name or ''} | {project_name}"
+    ok = send_mailbox_email(
+        to_list=payload.to,
+        subject=subject,
+        body=body,
+        attachment_b64=excel_b64,
+        attachment_name=file_name,
+    )
+    if not ok:
+        raise HTTPException(500, "Email send failed — check BREVO_API_KEY and MAIL_ENABLED env vars")
+    return {"sent": len(payload.to), "subject": subject}
