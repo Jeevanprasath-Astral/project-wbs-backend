@@ -10,7 +10,7 @@ from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager
 from app.core.security import hash_password
 from app.services.audit_service import log_action
-from app.services.email_service import send_welcome_email
+from app.services.email_service import send_welcome_email, send_email
 from app.core.config import settings
 
 router = APIRouter(prefix="/global/team", tags=["Global Team"])
@@ -169,6 +169,47 @@ def team_stats(db: Session = Depends(get_db), current_user: User = Depends(get_c
         "by_team": {t.name: sum(1 for u in all_users if u.team_id == t.id) for t in teams},
     }
 
+@router.get("/email-status")
+def email_status(current_user: User = Depends(get_current_user)):
+    """Admin-only: check whether email is configured correctly on this deployment."""
+    if current_user.role != "Admin":
+        raise HTTPException(403, "Admin only")
+    return {
+        "mail_enabled":    settings.MAIL_ENABLED,
+        "brevo_api_key":   "SET ✓" if settings.BREVO_API_KEY else "NOT SET ✗ — add BREVO_API_KEY to Render env vars",
+        "mail_from":       settings.MAIL_FROM or "NOT SET ✗",
+        "frontend_url":    settings.FRONTEND_URL,
+        "ready_to_send":   bool(settings.MAIL_ENABLED and settings.BREVO_API_KEY),
+    }
+
+@router.post("/send-test-email")
+def send_test_email(current_user: User = Depends(get_current_user)):
+    """Admin-only: send a test welcome email to yourself to verify Brevo is configured."""
+    if current_user.role != "Admin":
+        raise HTTPException(403, "Admin only")
+    if not settings.BREVO_API_KEY:
+        raise HTTPException(400, "BREVO_API_KEY is not set — add it to Render environment variables")
+    sent = send_email(
+        to=current_user.email,
+        subject="✅ Axon WBS — email test successful",
+        body=f"""
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:28px 32px;
+                    background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;">
+          <h2 style="color:#0f172a;font-size:18px;margin:0 0 12px;">Email is working! 🎉</h2>
+          <p style="color:#334155;font-size:14px;line-height:1.6;margin:0 0 16px;">
+            Hi <strong>{current_user.name}</strong>, this test confirms that Axon WBS can
+            successfully send emails via Brevo.
+          </p>
+          <p style="color:#64748b;font-size:13px;margin:0;">
+            Sender: <strong>{settings.MAIL_FROM}</strong>
+          </p>
+        </div>
+        """,
+    )
+    if sent:
+        return {"status": "sent", "to": current_user.email}
+    raise HTTPException(500, f"Email failed — check Render logs. Verify MAIL_FROM ({settings.MAIL_FROM}) is a verified sender in your Brevo account.")
+
 @router.post("")
 def create_user(
     payload: UserCreate,
@@ -187,18 +228,20 @@ def create_user(
     db.add(u); db.commit(); db.refresh(u)
     log_action(db, actor=current_user.name, action="create_user",
                description=f"Created user {u.name} ({u.role})", user_id=current_user.id)
+    db.commit()  # commit audit log — flush() alone doesn't persist it
     # Send welcome email with credentials
-    try:
-        send_welcome_email(
-            to=u.email,
-            name=u.name,
-            temp_password=payload.password,
-            app_url=settings.FRONTEND_URL
-        )
-    except Exception as _e:
-        import logging as _log
-        _log.error(f"Welcome email failed for {u.email}: {_e}")
-    return _build_user(u, db)
+    import logging as _log
+    sent = send_welcome_email(
+        to=u.email,
+        name=u.name,
+        temp_password=payload.password,
+        app_url=settings.FRONTEND_URL
+    )
+    if not sent:
+        _log.warning(f"Welcome email NOT sent to {u.email} — check BREVO_API_KEY and MAIL_FROM on Render")
+    result = _build_user(u, db)
+    result["email_sent"] = sent
+    return result
 
 @router.patch("/{user_id}")
 def update_user(

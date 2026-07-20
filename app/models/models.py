@@ -592,4 +592,25 @@ class ReportTemplateItem(Base):
     __tablename__ = "report_template_items"
     id            = Column(Integer, primary_key=True, index=True)
     template_id   = Column(Integer, ForeignKey("report_templates.id"), nullable=False)
-    report_number = Column(String(100), nullab
+    report_number = Column(String(100), nullable=False)
+    report_name   = Column(String(300), nullable=False)
+    department    = Column(String(150))
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    template      = relationship("ReportTemplate", back_populates="items")
+
+# -- Attachments ---------------------------------------------------------------
+class Attachment(Base):
+    """Generic polymorphic attachment -- one table handles all entity types.
+    entity_type: milestone | task | subtask | activity | report
+    Files stored under uploads/attachments/<entity_type>/<stored_filename>."""
+    __tablename__ = "attachments"
+    id                = Column(Integer, primary_key=True, index=True)
+    entity_type       = Column(String(50), nullable=False)
+    entity_id         = Column(Integer, nullable=False)
+    original_filename = Column(String(300), nullable=False)
+    stored_filename   = Column(String(300), nullable=False)
+    file_size         = Column(Integer)
+    mime_type         = Column(String(100))
+    uploaded_by       = Column(Integer, ForeignKey("users.id"))
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    uploader          = relationship("User", foreign_keys=[uploaded_by])
