@@ -455,33 +455,290 @@ _SUBTASK_TO_NEW_TASK: dict = {
 }
 
 def _migrate_form_fields(db):
-    """One-time migration: convert existing CustomSubtask+SubtaskQuestion rows
-    into TaskFormField rows.
+    """Seed CustomTask rows and TaskFormField rows from the bundled Excel file.
 
-    Strategy:
-    - M1-M4: Subtasks fold into their parent Task as Form sections.
-      Each SubtaskQuestion becomes a TaskFormField with section_name=subtask.name.
-    - M5-M10: Subtasks with a mapped new Task name get their own new CustomTask
-      (if not already present), and their Questions become FormFields of that
-      new Task. Subtasks with no mapping (None) get folded into the nearest
-      preceding named Task.
-    - WorkHours rows with a custom_subtask_id are re-pointed to the parent
-      (or newly promoted) Task.
+    Reads  data/Milestone_Subtask_Questions.xlsx  (committed alongside main.py).
+
+    Strategy (per the Excel "New task name" column carry-forward logic):
+    - M1-M4: original Task rows stay as Tasks; Subtask Name -> section_name;
+             Question Text/Type -> TaskFormField.
+    - M5-M10: the "New task name" column (carry-forward per milestone x task group)
+             determines which CustomTask each question belongs to.
+             When None, the last named task is carried forward.
+             Original T-rows (e.g. "Development") are kept unchanged;
+             promoted tasks are created alongside them.
+
+    Idempotent: tasks that already have TaskFormField rows are skipped.
     """
-    from app.models.models import (
-        CustomMilestone, CustomTask, CustomSubtask, SubtaskQuestion,
-        TaskFormField, WorkHours
-    )
-    from sqlalchemy.orm import joinedload
+    import os
+    import openpyxl
+    from sqlalchemy import text
+    from collections import OrderedDict, defaultdict
+    from app.models.models import CustomMilestone, CustomTask, TaskFormField
 
-    # Only run if task_form_fields table is empty (idempotent guard)
-    existing = db.execute(text("SELECT COUNT(*) FROM task_form_fields")).scalar()
-    if existing > 0:
-        logging.info(f"_migrate_form_fields: already seeded ({existing} rows), skipping")
+    xlsx_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data", "Milestone_Subtask_Questions.xlsx"
+    )
+    if not os.path.exists(xlsx_path):
+        logging.warning(f"_migrate_form_fields: Excel not found at {xlsx_path}")
         return
 
-    added_fields = 0
-    added_tasks  = 0
-    updated_wh   = 0
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    ws = wb["Subtask Questions"]
 
-    milestones = db.query(CustomMilestone).o
+    # Column indices (0-based)
+    C_MS_NUM  = 0
+    C_T_NUM   = 2
+    C_T_NAME  = 3
+    C_NEWTASK = 4   # "New task name" -- carry-forward per (ms_num, t_num)
+    C_RESP    = 5
+    C_SUB_NUM = 6
+    C_SUB_NM  = 8   # "Subtask Name" (col 7 is blank)
+    C_Q_NUM   = 10
+    C_Q_TEXT  = 11
+    C_Q_TYPE  = 12
+
+    # 1. Parse Excel into a field plan
+    # result: { ms_num: [ {target, t_num, t_name, resp, sub, q_num, q_text, q_type} ] }
+    raw_rows = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row[C_MS_NUM]:
+            continue
+        raw_rows.append(row)
+
+    raw_rows.sort(key=lambda r: (
+        r[C_MS_NUM] or 0, r[C_T_NUM] or 0, r[C_SUB_NUM] or 0, r[C_Q_NUM] or 0
+    ))
+
+    field_plan = defaultdict(list)
+    carry_fwd = {}   # (ms_num, t_num) -> current new-task name
+
+    for row in raw_rows:
+        ms_num   = row[C_MS_NUM]
+        t_num    = row[C_T_NUM]
+        t_name   = (row[C_T_NAME] or "").strip()
+        new_task = row[C_NEWTASK]
+        resp     = (row[C_RESP] or "").strip()
+        sub_name = (row[C_SUB_NM] or "").strip()
+        q_num    = row[C_Q_NUM] or 1
+        q_text   = (row[C_Q_TEXT] or "").strip()
+        q_type   = (row[C_Q_TYPE] or "text").strip()
+
+        if not q_text:
+            continue
+
+        if ms_num in (1, 2, 3, 4):
+            # M1-M4: questions belong to the Excel task (t_name)
+            target = t_name
+        else:
+            # M5-M10: carry-forward from "New task name" column
+            key = (ms_num, t_num)
+            if new_task is not None:
+                carry_fwd[key] = str(new_task).strip()
+            target = carry_fwd.get(key, t_name)
+
+        field_plan[ms_num].append({
+            "target": target,
+            "t_num":  t_num,
+            "t_name": t_name,
+            "resp":   resp,
+            "sub":    sub_name,
+            "q_num":  q_num,
+            "q_text": q_text,
+            "q_type": q_type,
+        })
+
+    # 2. For every milestone in every project, create tasks + fields
+    added_tasks  = 0
+    added_fields = 0
+
+    for ms in db.query(CustomMilestone).all():
+        ms_num = ms.num
+        if ms_num not in field_plan:
+            continue
+
+        # Cache existing tasks by name and by num
+        by_name = {}
+        by_num  = {}
+        for t in db.query(CustomTask).filter_by(milestone_id=ms.id).all():
+            by_name[t.name] = t
+            if t.num:
+                by_num[t.num] = t
+
+        # Which tasks already have form fields? (skip re-seeding them)
+        tasks_with_fields = set()
+        for t in by_name.values():
+            cnt = db.execute(
+                text("SELECT COUNT(*) FROM task_form_fields WHERE task_id = :tid"),
+                {"tid": t.id}
+            ).scalar()
+            if cnt:
+                tasks_with_fields.add(t.id)
+
+        # Pass A: ensure every target task exists
+        seen_targets = set(by_name.keys())
+        for entry in field_plan[ms_num]:
+            tname = entry["target"]
+            if tname in seen_targets:
+                continue
+            seen_targets.add(tname)
+            # For M1-M4 try to match by num first
+            if ms_num <= 4 and entry["t_num"] and entry["t_num"] in by_num:
+                by_name[tname] = by_num[entry["t_num"]]
+                continue
+            # Create new task
+            new_t = CustomTask(
+                milestone_id=ms.id,
+                project_id=ms.project_id,
+                num=entry["t_num"] if ms_num <= 4 else None,
+                name=tname,
+                responsibility=entry["resp"],
+                status="Not Started",
+            )
+            db.add(new_t)
+            db.flush()
+            by_name[tname] = new_t
+            added_tasks += 1
+
+        # Pass B: seed form fields (skip tasks that already have them)
+        for entry in field_plan[ms_num]:
+            task = by_name.get(entry["target"])
+            if not task or task.id in tasks_with_fields:
+                continue
+            db.add(TaskFormField(
+                task_id=task.id,
+                milestone_id=ms.id,
+                project_id=ms.project_id,
+                num=entry["q_num"],
+                section_name=entry["sub"],
+                question_text=entry["q_text"],
+                input_type=entry["q_type"],
+            ))
+            added_fields += 1
+
+    db.commit()
+    logging.info(
+        f"_migrate_form_fields: seeded {added_fields} form fields "
+        f"and {added_tasks} new tasks from Excel"
+    )
+
+@app.on_event("startup")
+def startup():
+    start_scheduler(); start_warmup()
+    try:
+        from app.db.database import SessionLocal
+        from app.services.progress_service import fix_existing_progress
+        db = SessionLocal()
+        fix_existing_progress(db)
+        db.close()
+    except Exception as e:
+        logging.warning(f"Startup fix failed: {e}")
+    try:
+        from app.db.database import SessionLocal
+        db = SessionLocal()
+        _backfill_subtask_questions(db)
+        db.close()
+    except Exception as e:
+        logging.warning(f"Subtask-question backfill failed: {e}")
+    try:
+        from app.db.database import SessionLocal
+        db = SessionLocal()
+        _migrate_form_fields(db)
+        db.close()
+    except Exception as e:
+        logging.warning(f"Form-field migration failed: {e}")
+    logging.info(f"{settings.APP_NAME} v2.0 started")
+
+@app.on_event("shutdown")
+def shutdown():
+    stop_scheduler(); stop_warmup()
+
+@app.get("/")
+def root(): return {"message": f"{settings.APP_NAME} API v2.0", "docs": "/docs"}
+
+@app.get("/health")
+def health(): return {"status": "ok"}
+
+@app.get("/api/ping")
+def ping(): return {"status": "ok"}
+
+@app.get("/api/seed-database")
+def seed_database():
+    try:
+        from seed import seed
+        seed()
+        return {"status": "success", "message": "Database seeded!"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/debug-accounts")
+def debug_accounts():
+    """TEMPORARY -- shows current role/name/email for all users (no passwords).
+    Remove this endpoint after confirming account migration is correct."""
+    from app.db.database import SessionLocal
+    from app.models.models import User
+    db = SessionLocal()
+    users = db.query(User.id, User.role, User.name, User.email).order_by(User.id).all()
+    db.close()
+    return [{"id": u.id, "role": u.role, "name": u.name, "email": u.email} for u in users]
+
+@app.get("/api/setup-accounts")
+def setup_accounts():
+    """TEMPORARY one-time endpoint -- sets correct name/email/password for all
+    5 role-based accounts using the server's own hash function (same SECRET_KEY
+    as the login endpoint). Call once after deploy, then ignore -- safe to call
+    multiple times (idempotent).  Remove in the next cleanup deploy."""
+    from app.db.database import SessionLocal
+    from app.models.models import User
+    from app.core.security import hash_password, verify_password
+    accounts = [
+        ("jeevanprasath.j@astralbusinessconsulting.in", "Jeevan Prasath. J",
+         "jeevanprasath.j@astralbusinessconsulting.in",  "DEC@jp2801"),
+        ("gayathri.p@astralbusinessconsulting.com",       "Gayathri. P",
+         "gayathri.p@astralbusinessconsulting.com",        "PManager@2026"),
+        ("manikandan.m@astralbusinessconsulting.in",       "Manikandan. M",
+         "manikandan.m@astralbusinessconsulting.in",        "FCLead@2026"),
+        ("hr@wbs.com",                                    "Manikandan. S",
+         "manikandan.s@astralbusinessconsulting.com",      "HRUser@2026"),
+        ("tclead@wbs.com",                                "Sanjeev. V",
+         "sanjeev.v@astralbusinessconsulting.in",          "TCLead@2026"),
+    ]
+    db = SessionLocal()
+    results = []
+    try:
+        for old_email, name, new_email, pwd in accounts:
+            u = db.query(User).filter(User.email == old_email).first()
+            if not u:
+                results.append({"email": new_email, "status": "NOT FOUND (check old email)"})
+                continue
+            u.name         = name
+            u.email        = new_email
+            u.password_hash = hash_password(pwd)
+            db.flush()
+            ok = verify_password(pwd, u.password_hash)
+            results.append({"email": new_email,
+                             "status": "updated",
+                             "verify": "PASS" if ok else "FAIL -- hash mismatch!"})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        return {"status": "error", "message": str(exc)}
+    finally:
+        db.close()
+    return {"status": "success", "results": results}
+
+@app.get("/api/fix-passwords")
+def fix_passwords():
+    try:
+        from app.db.database import SessionLocal
+        from app.models.models import User
+        from app.core.security import hash_password
+        db = SessionLocal()
+        for email, pwd in [("admin@wbs.com","admin123"),("fc@wbs.com","fc123"),("tech@wbs.com","tech123"),("client@wbs.com","client123")]:
+            u = db.query(User).filter_by(email=email).first()
+            if u: u.password_hash = hash_password(pwd)
+        db.commit(); db.close()
+        return {"status": "success", "message": "Passwords updated! Login: admin@wbs.com / admin123"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
