@@ -268,145 +268,112 @@ def _run_lightweight_migrations():
 _run_lightweight_migrations()
 
 
-def _fix_task_names(db):
+def _fix_task_names():
     """
-    Normalize task names across all milestones in every project:
-      - Strip 'None ' prefix artefacts from the Excel migration
-      - Rename to the canonical names from the Milestone/Task master list
-      - Merge form_fields from duplicate tasks into the primary (most-fielded) one
-      - Delete tasks that don't belong in the expected list
+    Normalize task names across all milestones — pure SQL, no ORM relationship
+    loading, so it never triggers lazy-load of form_fields into memory.
     Idempotent: safe to run on every startup.
     """
-    from app.models.models import CustomMilestone, CustomTask, TaskFormField
     from sqlalchemy import text as _t
 
     MILESTONE_TASK_MAP = {
-        "Development": [
-            "Database Object Creation",
-            "Data Extraction Development",
-            "Business Logic Development",
-            "Report Development",
-            "Dashboard Development",
-            "Validation Implementation",
-            "Internal Developer Testing",
-            "Bug Fixing",
-        ],
-        "Internal Testing": [
-            "Prepare Test Scenarios",
-            "App Testing",
-            "Retest",
-        ],
-        "Deployment for UAT": [
-            "Server Readiness",
-            "Master Data Deployment",
-            "Deploy Solution to UAT Environment",
-            "Load Sample Data",
-            "Share UAT Version",
-            "Execute Smoke Testing",
-            "Verify Deployment",
-        ],
-        "UAT for End User": [
-            "Provide User Training",
-            "Conduct UAT Walkthrough",
-            "End User Testing",
-            "Validate Outputs",
-            "Fix UAT Defects",
-            "Re-deploy Updated Version",
-            "UAT Sign-off",
-        ],
-        "Go Live": [
-            "Deploy Production Version",
-            "Configure Production Environment",
-            "Validate Production Data",
-            "Perform Sanity Testing",
-            "Obtain Go-live Approval",
-            "Release to Users",
-        ],
-        "Post Live Support": [
-            "Monitor Application/Report",
-            "Resolve Production Issues",
-            "Handover Project Documents",
-            "Project Closure",
-        ],
+        "Development":        ["Database Object Creation","Data Extraction Development",
+                               "Business Logic Development","Report Development",
+                               "Dashboard Development","Validation Implementation",
+                               "Internal Developer Testing","Bug Fixing"],
+        "Internal Testing":   ["Prepare Test Scenarios","App Testing","Retest"],
+        "Deployment for UAT": ["Server Readiness","Master Data Deployment",
+                               "Deploy Solution to UAT Environment","Load Sample Data",
+                               "Share UAT Version","Execute Smoke Testing","Verify Deployment"],
+        "UAT for End User":   ["Provide User Training","Conduct UAT Walkthrough",
+                               "End User Testing","Validate Outputs","Fix UAT Defects",
+                               "Re-deploy Updated Version","UAT Sign-off"],
+        "Go Live":            ["Deploy Production Version","Configure Production Environment",
+                               "Validate Production Data","Perform Sanity Testing",
+                               "Obtain Go-live Approval","Release to Users"],
+        "Post Live Support":  ["Monitor Application/Report","Resolve Production Issues",
+                               "Handover Project Documents","Project Closure"],
     }
 
     def _norm(name):
         s = (name or "").strip()
-        if s.startswith("None "):
-            s = s[5:]
-        elif s == "None":
-            s = ""
-        return s.strip().lower()
+        return (s[5:] if s.startswith("None ") else ("" if s == "None" else s)).strip().lower()
 
-    renamed = merged = deleted = 0
+    renamed = deleted = 0
     try:
-        from app.db.database import SessionLocal
-        db = SessionLocal()
-        try:
-            for ms in db.query(CustomMilestone).all():
-                ms_norm = (ms.name or "").strip().lower()
-                expected = None
-                for key, names in MILESTONE_TASK_MAP.items():
-                    if ms_norm == key.lower():
-                        expected = names
-                        break
+        with engine.begin() as conn:
+            # Fetch all milestone ids+names in one query (no ORM, no relationships)
+            ms_rows = conn.execute(_t(
+                "SELECT id, name FROM custom_milestones"
+            )).fetchall()
+
+            for ms_id, ms_name in ms_rows:
+                ms_norm = (ms_name or "").strip().lower()
+                expected = next((v for k, v in MILESTONE_TASK_MAP.items()
+                                 if ms_norm == k.lower()), None)
                 if expected is None:
                     continue
 
-                tasks = db.query(CustomTask).filter_by(milestone_id=ms.id).all()
+                # Fetch tasks for this milestone — only id + name columns
+                task_rows = conn.execute(_t(
+                    "SELECT id, name FROM custom_tasks WHERE milestone_id = :mid"
+                ), {"mid": ms_id}).fetchall()
 
                 # Group by normalised name
                 by_norm = {}
-                for t in tasks:
-                    by_norm.setdefault(_norm(t.name), []).append(t)
+                for t_id, t_name in task_rows:
+                    by_norm.setdefault(_norm(t_name), []).append(t_id)
 
-                expected_norms = {name.lower(): name for name in expected}
+                expected_norms = {n.lower(): n for n in expected}
                 kept_ids = set()
 
                 for idx, canonical in enumerate(expected, 1):
                     norm_key = canonical.lower()
-                    matches = sorted(by_norm.get(norm_key, []),
-                                     key=lambda t: len(t.form_fields), reverse=True)
-                    if not matches:
+                    candidates = by_norm.get(norm_key, [])
+                    if not candidates:
                         continue
-                    primary = matches[0]
-                    if primary.name != canonical:
-                        primary.name = canonical
-                        renamed += 1
-                    primary.num = idx
-                    kept_ids.add(primary.id)
 
-                    # Merge form_fields from duplicates via raw SQL (avoids cascade-delete race)
-                    for dup in matches[1:]:
-                        db.execute(_t("UPDATE task_form_fields SET task_id = :pid WHERE task_id = :did"),
-                                   {"pid": primary.id, "did": dup.id})
-                        merged += db.execute(_t("SELECT changes()") if False else _t(
-                            "SELECT COUNT(*) FROM task_form_fields WHERE task_id = :pid"),
-                            {"pid": primary.id}).scalar() and 0  # count already moved; just flush
-                        db.flush()
-                        db.expire(dup)
-                        db.delete(dup)
+                    # Pick the candidate with most form_fields (SQL count, no ORM load)
+                    if len(candidates) == 1:
+                        primary_id = candidates[0]
+                    else:
+                        counts = {t_id: conn.execute(_t(
+                            "SELECT COUNT(*) FROM task_form_fields WHERE task_id = :id"
+                        ), {"id": t_id}).scalar() for t_id in candidates}
+                        primary_id = max(counts, key=counts.get)
+
+                    # Rename + renumber via SQL
+                    conn.execute(_t(
+                        "UPDATE custom_tasks SET name = :name, num = :num WHERE id = :id"
+                    ), {"name": canonical, "num": idx, "id": primary_id})
+                    renamed += 1
+                    kept_ids.add(primary_id)
+
+                    # Move form_fields from duplicates to primary, then delete duplicates
+                    for dup_id in candidates:
+                        if dup_id == primary_id:
+                            continue
+                        conn.execute(_t(
+                            "UPDATE task_form_fields SET task_id = :pid WHERE task_id = :did"
+                        ), {"pid": primary_id, "did": dup_id})
+                        conn.execute(_t(
+                            "DELETE FROM custom_tasks WHERE id = :id"
+                        ), {"id": dup_id})
                         deleted += 1
 
                 # Delete tasks not in expected list
-                for t in tasks:
-                    if t.id not in kept_ids and _norm(t.name) not in expected_norms:
-                        db.delete(t)
+                for t_id, t_name in task_rows:
+                    if t_id not in kept_ids and _norm(t_name) not in expected_norms:
+                        conn.execute(_t(
+                            "DELETE FROM custom_tasks WHERE id = :id"
+                        ), {"id": t_id})
                         deleted += 1
 
-                db.flush()
-
-            db.commit()
-            logging.info(f"_fix_task_names: renamed={renamed}, deleted={deleted}")
-        except Exception as e:
-            db.rollback()
-            logging.warning(f"_fix_task_names failed: {e}")
-        finally:
-            db.close()
+        logging.info(f"_fix_task_names: renamed={renamed}, deleted={deleted}")
     except Exception as e:
-        logging.warning(f"_fix_task_names could not acquire DB session: {e}")
+        logging.warning(f"_fix_task_names failed: {e}")
 
-_fix_task_names(None)
+_fix_task_names()
 
 def _update_user_accounts():
     """Set real names, office emails and hashed passwords for the 5 role-based
