@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from app.core.config import settings
 from app.db.database import engine, Base
 from app.models import models
@@ -373,7 +374,9 @@ def _fix_task_names():
     except Exception as e:
         logging.warning(f"_fix_task_names failed: {e}")
 
-_fix_task_names()
+# _fix_task_names() intentionally NOT called here — it was a one-time data fix
+# that has already run. Calling it on every cold start contributed to the
+# 512 MB OOM crash on Render free tier.
 
 def _update_user_accounts():
     """Set real names, office emails and hashed passwords for the 5 role-based
@@ -440,6 +443,8 @@ _update_user_accounts()
 
 app = FastAPI(title=settings.APP_NAME, description="Project WBS API", version="2.0.0")
 
+# GZip all responses >= 1 KB — cuts JSON payload by ~60-80% on slow networks
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(CORSMiddleware,
     allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -474,6 +479,16 @@ def _backfill_subtask_questions(db):
     from app.models.models import (CustomMilestone, CustomTask, CustomSubtask,
                                     Milestone, Task, Subtask, SubtaskQuestion)
     from sqlalchemy.orm import joinedload
+    from sqlalchemy import text as _sql_early
+    # Early-exit: if subtask_questions rows exist, backfill already ran.
+    # Avoids a 4-level deep ORM joinedload on every cold start (major RAM user).
+    try:
+        existing = db.execute(_sql_early("SELECT 1 FROM subtask_questions LIMIT 1")).fetchone()
+        if existing:
+            logging.info("_backfill_subtask_questions: rows exist — skipping")
+            return
+    except Exception:
+        pass  # table may not exist on first deploy; fall through
     cms = db.query(CustomMilestone).options(
         joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.questions)
     ).all()
@@ -587,6 +602,17 @@ def _migrate_form_fields(db):
         os.path.dirname(os.path.abspath(__file__)),
         "data", "Milestone_Subtask_Questions.xlsx"
     )
+    # Early-exit: if task_form_fields already has rows, migration already ran.
+    # Loading the Excel + iterating all milestones on every cold start was
+    # the primary cause of the 512 MB OOM crash on Render free tier.
+    try:
+        existing_ff = db.execute(text("SELECT COUNT(*) FROM task_form_fields")).scalar() or 0
+        if existing_ff > 0:
+            logging.info(f"_migrate_form_fields: {existing_ff} form fields exist — skipping")
+            return
+    except Exception:
+        pass  # table may not exist on first deploy; fall through
+
     if not os.path.exists(xlsx_path):
         logging.warning(f"_migrate_form_fields: Excel not found at {xlsx_path}")
         return
@@ -847,5 +873,8 @@ def fix_passwords():
             if u: u.password_hash = hash_password(pwd)
         db.commit(); db.close()
         return {"status": "success", "message": "Passwords updated! Login: admin@wbs.com / admin123"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+     return {"status": "success", "message": "Passwords updated! Login: admin@wbs.com / admin123"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
