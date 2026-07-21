@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func as sa_func
 from typing import Optional, List, Dict
@@ -222,11 +222,25 @@ def _make_list_ctx(db: Session, project_id: int) -> dict:
         u.name.strip().lower(): u.id for u in all_users if u.name
     }
 
+    # Query 4: form_field_count per task — one lightweight COUNT query instead
+    # of joinloading all form fields (which is the #1 OOM cause on free tier).
+    # Used so the "📋 Form (N)" badge still shows the correct count in compact mode.
+    ff_count_rows = (
+        db.query(TaskFormField.task_id, sa_func.count(TaskFormField.id))
+        .join(CustomTask, CustomTask.id == TaskFormField.task_id)
+        .join(CustomMilestone, CustomMilestone.id == CustomTask.milestone_id)
+        .filter(CustomMilestone.project_id == project_id)
+        .group_by(TaskFormField.task_id)
+        .all()
+    )
+    ff_count: dict = {r[0]: r[1] for r in ff_count_rows}
+
     return {
         "wh": wh,
         "ta_by_task": ta_by_task,
         "ta_by_msnum": ta_by_msnum,
         "user_name_to_id": user_name_to_id,
+        "ff_count": ff_count,
     }
 
 
@@ -318,7 +332,7 @@ def _build_subtask_ctx(s: "CustomSubtask", ctx: dict):
     }
 
 
-def _build_task_ctx(t: "CustomTask", ctx: dict):
+def _build_task_ctx(t: "CustomTask", ctx: dict, compact: bool = False):
     est, act = _task_hours_ctx(ctx, t)
     return {
         "id": t.id, "num": t.num, "name": t.name, "own_estimated_hours": t.estimated_hours or 0.0,
@@ -330,12 +344,17 @@ def _build_task_ctx(t: "CustomTask", ctx: dict):
         "estimated_hours": est, "actual_hours": act,
         "total_days": _total_days(t.planned_start, t.planned_end) or _total_days(t.actual_start, t.actual_end),
         "notes": t.notes,
-        "form_fields": [_build_form_field(f) for f in sorted(t.form_fields, key=lambda x: x.num or 0)],
+        # form_field_count is always present (from a cheap COUNT query in ctx)
+        # so the "📋 Form (N)" badge works correctly even in compact mode.
+        "form_field_count": ctx["ff_count"].get(t.id, 0),
+        # compact=True omits form_fields array — used by Log modal (only needs names)
+        # and by Milestone Config initial load (lazy-loads fields on Form panel open).
+        "form_fields": [] if compact else [_build_form_field(f) for f in sorted(t.form_fields, key=lambda x: x.num or 0)],
         "subtasks": [_build_subtask_ctx(s, ctx) for s in sorted(t.subtasks, key=lambda x: x.num or 0)],
     }
 
 
-def _build_ctx(ms: "CustomMilestone", ctx: dict):
+def _build_ctx(ms: "CustomMilestone", ctx: dict, compact: bool = False):
     est, act = _milestone_hours_ctx(ctx, ms)
     return {
         "id": ms.id, "num": ms.num, "name": ms.name,
@@ -352,7 +371,7 @@ def _build_ctx(ms: "CustomMilestone", ctx: dict):
         "estimated_hours": est, "actual_hours": act,
         "total_days": _total_days(ms.planned_start, ms.planned_end) or _total_days(ms.actual_start, ms.actual_end),
         "reports": [_build_milestone_report(r) for r in sorted(ms.reports, key=lambda x: x.id)],
-        "tasks": [_build_task_ctx(t, ctx) for t in sorted(ms.tasks, key=lambda x: x.num or 0)],
+        "tasks": [_build_task_ctx(t, ctx, compact=compact) for t in sorted(ms.tasks, key=lambda x: x.num or 0)],
     }
 
 
@@ -808,16 +827,48 @@ def get_milestone_template_detail(
     }
 
 
+# ── Single milestone (used by updateOneMilestone for targeted refresh) ────────
+# Uses /{milestone_id:int} so FastAPI only matches numeric segments and won't
+# shadow /revision-reasons, /hours-summary, or any other fixed-string routes.
+@router.get("/{milestone_id:int}")
+def get_custom_milestone(
+    project_id: int, milestone_id: int,
+    compact: bool = Query(False, description="When true, omit form_fields (same as list endpoint)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    eager_opts = [
+        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.activities),
+        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.questions),
+        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.reports),
+        joinedload(CustomMilestone.reports),
+    ]
+    if not compact:
+        eager_opts.insert(0, joinedload(CustomMilestone.tasks).joinedload(CustomTask.form_fields))
+    ms = (
+        db.query(CustomMilestone).options(*eager_opts)
+        .filter_by(id=milestone_id, project_id=project_id)
+        .first()
+    )
+    if not ms:
+        raise HTTPException(404, "Milestone not found")
+    ctx = _make_list_ctx(db, project_id)
+    return _build_ctx(ms, ctx, compact=compact)
+
+
 # ── List selected milestones for this project ─────────────────────────────────
 @router.get("")
 def list_custom_milestones(
     project_id: int,
+    compact: bool = Query(False, description="When true, omit form_fields from tasks (for dropdowns/Log modal)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    milestones = db.query(CustomMilestone).options(
-        joinedload(CustomMilestone.tasks)
-            .joinedload(CustomTask.form_fields),
+    # compact=True skips joinloading form_fields — critical for the Timesheet
+    # Log modal which only needs milestone/task names and has no use for form
+    # fields. Loading 6000+ form fields into RAM for a dropdown is the #1
+    # cause of OOM crashes on the free-tier 512 MB instance.
+    eager_opts = [
         joinedload(CustomMilestone.tasks)
             .joinedload(CustomTask.subtasks)
             .joinedload(CustomSubtask.activities),
@@ -828,13 +879,18 @@ def list_custom_milestones(
             .joinedload(CustomTask.subtasks)
             .joinedload(CustomSubtask.reports),
         joinedload(CustomMilestone.reports),
-    ).filter_by(project_id=project_id).order_by(
-        CustomMilestone.num, CustomMilestone.iteration
-    ).all()
+    ]
+    if not compact:
+        eager_opts.insert(0,
+            joinedload(CustomMilestone.tasks).joinedload(CustomTask.form_fields)
+        )
+    milestones = db.query(CustomMilestone).options(*eager_opts).filter_by(
+        project_id=project_id
+    ).order_by(CustomMilestone.num, CustomMilestone.iteration).all()
     # Pre-fetch WorkHours + TaskAssignments in 3 queries, then build entirely
     # from in-memory lookups — eliminates the O(N×T×S) per-entity DB calls.
     ctx = _make_list_ctx(db, project_id)
-    return [_build_ctx(ms, ctx) for ms in milestones]
+    return [_build_ctx(ms, ctx, compact=compact) for ms in milestones]
 
 
 # ── Add from standard template (selective Task/Subtask picking) ──────────────
@@ -1344,6 +1400,23 @@ def delete_task(
 
 
 # ── Task Form Fields (replaces Subtask+Question hierarchy) ───────────────────
+
+# GET: lazy-load form fields for a single task (called when user opens the
+# "📋 Form" panel — keeps the initial milestone list load compact/fast).
+@router.get("/{milestone_id}/tasks/{task_id}/form-fields")
+def get_task_form_fields(
+    project_id: int, milestone_id: int, task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    task = db.query(CustomTask).options(
+        joinedload(CustomTask.form_fields)
+    ).filter_by(id=task_id, milestone_id=milestone_id).first()
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return [_build_form_field(f) for f in sorted(task.form_fields, key=lambda x: x.num or 0)]
+
+
 @router.post("/{milestone_id}/tasks/{task_id}/form-fields")
 def add_form_field(
     project_id: int, milestone_id: int, task_id: int, payload: FormFieldCreate,
