@@ -385,6 +385,22 @@ def _update_user_accounts():
     failure cannot roll back the others."""
     from app.core.security import hash_password
     from sqlalchemy import text as _sql
+    # Early-exit: if all 5 real office emails are already in the DB, skip.
+    # Without this guard, 5 sequential DB round-trips add ~10 s to every cold start.
+    try:
+        with engine.begin() as _chk:
+            n = _chk.execute(_sql(
+                "SELECT COUNT(*) FROM users WHERE email IN (:e1,:e2,:e3,:e4,:e5)"
+            ), {"e1": "jeevanprasath.j@astralbusinessconsulting.in",
+                "e2": "gayathri.p@astralbusinessconsulting.com",
+                "e3": "manikandan.s@astralbusinessconsulting.com",
+                "e4": "manikandan.m@astralbusinessconsulting.in",
+                "e5": "sanjeev.v@astralbusinessconsulting.in"}).scalar() or 0
+            if n >= 5:
+                logging.info("_update_user_accounts: all accounts present — skipping")
+                return
+    except Exception:
+        pass
     # (old_email, new_name, new_email, password)
     # old_email = what the seed put in; new_email = real office address.
     # If already migrated, old_email won't exist but new_email will — still a no-op update.
