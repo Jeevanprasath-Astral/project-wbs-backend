@@ -258,6 +258,9 @@ def _run_lightweight_migrations():
         "UPDATE custom_milestones SET name = 'Post Live Support'  WHERE num = 10 AND name = 'Support'",
         # Task Notes — free-text notes field on each Task row.
         "ALTER TABLE custom_tasks ADD COLUMN IF NOT EXISTS notes TEXT",
+        # Task Estimated Hours — directly editable at Task level (Bug #1).
+        # Milestone estimated_hours = SUM(task.estimated_hours); no subtask rollup.
+        "ALTER TABLE custom_tasks ADD COLUMN IF NOT EXISTS estimated_hours FLOAT DEFAULT 0",
     ]
     for stmt in statements:
         try:

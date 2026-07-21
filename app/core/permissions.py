@@ -27,7 +27,7 @@ swap conditions with a minimal diff.
 ELEVATED_ROLES         = {"Admin", "Project Manager", "FC Lead", "TC Lead"}
 PROJECT_CREATOR_ROLES  = {"Admin", "Project Manager"}
 TEAM_MANAGER_ROLES     = {"Admin", "HR", "Project Manager"}
-TIMESHEET_MANAGER_ROLES = {"Admin", "HR"}
+TIMESHEET_MANAGER_ROLES = {"Admin", "HR", "Project Manager"}
 FINANCIAL_SETTINGS_ROLES = {"Admin", "HR"}
 
 # All role strings the app knows about — used by the Team page's role

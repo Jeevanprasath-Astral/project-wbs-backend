@@ -121,7 +121,10 @@ def _linked_assignee_id(db: Session, **assignment_filters) -> Optional[int]:
 
 
 def _task_hours(db: Session, t: CustomTask):
-    estimated = actual = 0.0
+    # Bug #1: estimated_hours is now directly stored on the Task (editable by user).
+    # Milestone estimated = SUM(task.estimated_hours); no subtask rollup for estimated.
+    estimated = t.estimated_hours or 0.0
+    actual = 0.0
     # A Task's own free-text `assignee` field (set in Milestone Configuration)
     # and the Assignments module's `assigned_to` (set independently, via
     # TaskAssignment.custom_task_id) can drift out of sync — e.g. a task
@@ -138,8 +141,7 @@ def _task_hours(db: Session, t: CustomTask):
     else:
         actual += _wh_sum_for_assignee(db, t.assignee, custom_task_id=t.id, custom_subtask_id=None)
     for s in t.subtasks:
-        s_est, s_act = _subtask_hours(db, s)
-        estimated += s_est
+        _, s_act = _subtask_hours(db, s)
         actual += s_act
     return estimated, actual
 
@@ -256,16 +258,16 @@ def _subtask_hours_ctx(ctx: dict, s: "CustomSubtask"):
 
 
 def _task_hours_ctx(ctx: dict, t: "CustomTask"):
-    estimated = 0.0
+    # Bug #1: estimated_hours is directly stored on the Task — no subtask rollup.
+    estimated = t.estimated_hours or 0.0
     linked_uid = ctx["ta_by_task"].get(t.id)
     if linked_uid is not None:
         actual = _ctx_wh_sum(ctx, ("t", t.id), user_id=linked_uid)
     else:
         actual = _ctx_wh_for_assignee(ctx, t.assignee, ("t", t.id))
     for s in t.subtasks:
-        s_est, s_act = _subtask_hours_ctx(ctx, s)
-        estimated += s_est
-        actual    += s_act
+        _, s_act = _subtask_hours_ctx(ctx, s)
+        actual += s_act
     return estimated, actual
 
 
@@ -319,7 +321,7 @@ def _build_subtask_ctx(s: "CustomSubtask", ctx: dict):
 def _build_task_ctx(t: "CustomTask", ctx: dict):
     est, act = _task_hours_ctx(ctx, t)
     return {
-        "id": t.id, "num": t.num, "name": t.name,
+        "id": t.id, "num": t.num, "name": t.name, "own_estimated_hours": t.estimated_hours or 0.0,
         "responsibility": t.responsibility,
         "status": t.status, "assignee": t.assignee,
         "planned_start": t.planned_start, "planned_end": t.planned_end,
@@ -497,6 +499,7 @@ class TaskCreate(BaseModel):
     actual_end: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    estimated_hours: Optional[float] = None
 
 class TaskUpdate(BaseModel):
     name: Optional[str] = None
@@ -510,6 +513,7 @@ class TaskUpdate(BaseModel):
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     notes: Optional[str] = None
+    estimated_hours: Optional[float] = None
 
 class SubtaskCreate(BaseModel):
     name: str
@@ -698,9 +702,9 @@ def _build_form_field(f: TaskFormField):
 
 
 def _build_task(t: CustomTask, db: Session = None):
-    est, act = _task_hours(db, t) if db is not None else (0.0, 0.0)
+    est, act = _task_hours(db, t) if db is not None else (t.estimated_hours or 0.0, 0.0)
     return {
-        "id": t.id, "num": t.num, "name": t.name,
+        "id": t.id, "num": t.num, "name": t.name, "own_estimated_hours": t.estimated_hours or 0.0,
         "responsibility": t.responsibility,
         "status": t.status, "assignee": t.assignee,
         "planned_start": t.planned_start, "planned_end": t.planned_end,
@@ -1285,7 +1289,8 @@ def add_task(
                     assignee=payload.assignee,
                     planned_start=_parse_dt(payload.planned_start), planned_end=_parse_dt(payload.planned_end),
                     actual_start=_parse_dt(payload.actual_start), actual_end=_parse_dt(payload.actual_end),
-                    start_time=payload.start_time, end_time=payload.end_time)
+                    start_time=payload.start_time, end_time=payload.end_time,
+                    estimated_hours=payload.estimated_hours or 0.0)
     db.add(ct); db.commit(); db.refresh(ct)
     if ct.assignee:
         _notify_task_assignment(db, project_id, ct, ms.name)
@@ -1305,7 +1310,7 @@ def update_task(
     old_assignee = t.assignee
     _set_fields(t, payload, ["name", "responsibility", "status", "assignee",
                               "planned_start", "planned_end", "actual_start", "actual_end",
-                              "start_time", "end_time", "notes"])
+                              "start_time", "end_time", "notes", "estimated_hours"])
     if t.status == "Completed" and old_status != "Completed" and not t.actual_end:
         t.actual_end = datetime.utcnow()
     db.flush()
