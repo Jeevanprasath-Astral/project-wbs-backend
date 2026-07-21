@@ -875,6 +875,3 @@ def fix_passwords():
         return {"status": "success", "message": "Passwords updated! Login: admin@wbs.com / admin123"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-     return {"status": "success", "message": "Passwords updated! Login: admin@wbs.com / admin123"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
