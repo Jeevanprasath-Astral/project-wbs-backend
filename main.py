@@ -15,7 +15,7 @@ from app.api.routes import (auth, projects, milestones, responses,
                              report_templates, attachments)
 from fastapi.staticfiles import StaticFiles
 from app.services.scheduler import start_scheduler, stop_scheduler
-from app.utils.warmup import start_warmup, stop_warmup
+
 import logging
 import os
 
@@ -777,7 +777,7 @@ def _migrate_form_fields(db):
 
 @app.on_event("startup")
 def startup():
-    start_scheduler(); start_warmup()
+    start_scheduler()
     try:
         from app.db.database import SessionLocal
         from app.services.progress_service import fix_existing_progress
@@ -804,7 +804,7 @@ def startup():
 
 @app.on_event("shutdown")
 def shutdown():
-    stop_scheduler(); stop_warmup()
+    stop_scheduler()
 
 @app.get("/")
 def root(): return {"message": f"{settings.APP_NAME} API v2.0", "docs": "/docs"}
