@@ -65,8 +65,8 @@ class BillingUpdate(BaseModel):
 
 
 def _require_admin(user: User):
-    if user.role not in ("Admin", "HR"):
-        raise HTTPException(403, "Admin or HR only")
+    if user.role not in ("Admin", "HR", "Project Manager"):
+        raise HTTPException(403, "Admin, HR, or Project Manager only")
 
 
 def _resolve_milestone(db: Session, milestone_id: Optional[int]):

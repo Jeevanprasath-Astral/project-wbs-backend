@@ -1,15 +1,22 @@
 """Billing Reports — Monthly Billing Tracker & Billing Status Report.
 
 Endpoints:
-  GET /billing-reports/monthly-tracker   — plan vs actual grouped by month × billing_type
-  GET /billing-reports/billing-status    — per-entry with computed billing status
+  GET /billing-reports/monthly-tracker         — plan vs actual grouped by month × billing_type
+  GET /billing-reports/monthly-tracker/export  — same data as xlsx download
+  GET /billing-reports/billing-status          — per-entry with computed billing status
+  GET /billing-reports/billing-status/export   — same data as xlsx download
 """
+import io
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func as sa_func
 from typing import Optional
 from datetime import date as date_cls
 from collections import defaultdict
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 from app.db.database import get_db
 from app.models.models import ProjectBilling, CustomMilestone, Project, User
@@ -227,3 +234,199 @@ def billing_status_report(
             "billing_type":  billing_type,
         },
     }
+
+
+# ── Excel helpers ─────────────────────────────────────────────────────────────
+
+def _xl_header_style():
+    """Returns (Font, PatternFill, Alignment, Border) for header cells."""
+    fill   = PatternFill("solid", fgColor="4F46E5")
+    font   = Font(bold=True, color="FFFFFF", size=10)
+    align  = Alignment(horizontal="center", vertical="center")
+    thin   = Side(style="thin", color="FFFFFF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    return font, fill, align, border
+
+
+def _xl_subtotal_style():
+    fill   = PatternFill("solid", fgColor="EDE9FE")
+    font   = Font(bold=True, size=9)
+    align  = Alignment(horizontal="center", vertical="center")
+    return font, fill, align
+
+
+def _xl_grand_style():
+    fill   = PatternFill("solid", fgColor="7C3AED")
+    font   = Font(bold=True, color="FFFFFF", size=10)
+    align  = Alignment(horizontal="center", vertical="center")
+    return font, fill, align
+
+
+def _set_col_widths(ws, widths):
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def _fmt_inr(v):
+    return f"₹{v:,.2f}" if v is not None else "—"
+
+
+# ── Monthly Tracker Export ────────────────────────────────────────────────────
+
+@router.get("/monthly-tracker/export")
+def monthly_billing_tracker_export(
+    project_id:   Optional[int] = None,
+    start_date:   Optional[str] = None,
+    end_date:     Optional[str] = None,
+    billing_type: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Download Monthly Billing Tracker as .xlsx"""
+    # Reuse the same data logic
+    data = monthly_billing_tracker(
+        project_id=project_id, start_date=start_date,
+        end_date=end_date, billing_type=billing_type,
+        db=db, current_user=current_user,
+    )
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Monthly Billing Tracker"
+
+    # ── Header row
+    headers = ["Month", "Billing Type", "Planned Amount (₹)", "Actual Amount (₹)", "Variance (₹)", "Entry Count"]
+    hfont, hfill, halign, hborder = _xl_header_style()
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = hfont; cell.fill = hfill; cell.alignment = halign; cell.border = hborder
+
+    ws.row_dimensions[1].height = 22
+
+    # ── Data rows + month subtotals
+    row_num = 2
+    rows_by_month = defaultdict(list)
+    for r in data["rows"]:
+        rows_by_month[r["month"]].append(r)
+
+    for month_key in sorted(rows_by_month.keys()):
+        month_rows = rows_by_month[month_key]
+        for r in month_rows:
+            ws.cell(row=row_num, column=1, value=r["month"])
+            ws.cell(row=row_num, column=2, value=r["billing_type"])
+            ws.cell(row=row_num, column=3, value=r["planned_amount"])
+            ws.cell(row=row_num, column=4, value=r["actual_amount"])
+            ws.cell(row=row_num, column=5, value=r["variance"])
+            ws.cell(row=row_num, column=6, value=r["entry_count"])
+            # Right-align currency columns
+            for col in (3, 4, 5):
+                ws.cell(row=row_num, column=col).alignment = Alignment(horizontal="right")
+            row_num += 1
+
+        # Month subtotal row
+        mt = next((m for m in data["month_totals"] if m["month"] == month_key), None)
+        if mt:
+            sfont, sfill, salign = _xl_subtotal_style()
+            vals = [month_key, "SUBTOTAL", mt["planned_amount"], mt["actual_amount"], mt["variance"], mt["entry_count"]]
+            for col, v in enumerate(vals, 1):
+                cell = ws.cell(row=row_num, column=col, value=v)
+                cell.font = sfont; cell.fill = sfill
+                cell.alignment = Alignment(horizontal="right") if col >= 3 else salign
+            row_num += 1
+
+    # Grand total row
+    gt = data["grand_total"]
+    gfont, gfill, galign = _xl_grand_style()
+    vals = ["GRAND TOTAL", "", gt["planned_amount"], gt["actual_amount"], gt["variance"], gt["entry_count"]]
+    for col, v in enumerate(vals, 1):
+        cell = ws.cell(row=row_num, column=col, value=v)
+        cell.font = gfont; cell.fill = gfill
+        cell.alignment = Alignment(horizontal="right") if col >= 3 else galign
+
+    _set_col_widths(ws, [14, 22, 20, 20, 18, 12])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=monthly_billing_tracker.xlsx"},
+    )
+
+
+# ── Billing Status Export ─────────────────────────────────────────────────────
+
+@router.get("/billing-status/export")
+def billing_status_report_export(
+    project_id:    Optional[int] = None,
+    status_filter: Optional[str] = None,
+    billing_type:  Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Download Billing Status Report as .xlsx"""
+    data = billing_status_report(
+        project_id=project_id, status_filter=status_filter,
+        billing_type=billing_type, db=db, current_user=current_user,
+    )
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Billing Status"
+
+    headers = [
+        "Project", "Milestone", "Billing Type",
+        "Planned Date", "Planned Amount (₹)",
+        "Actual Date", "Actual Amount (₹)",
+        "Status", "Days Variance", "Description", "Remarks",
+    ]
+    hfont, hfill, halign, hborder = _xl_header_style()
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = hfont; cell.fill = hfill; cell.alignment = halign; cell.border = hborder
+    ws.row_dimensions[1].height = 22
+
+    STATUS_COLORS_XL = {
+        "Overdue":         "FEE2E2",
+        "Upcoming":        "DBEAFE",
+        "Delayed":         "FEF3C7",
+        "On Time":         "D1FAE5",
+        "Before Schedule": "EDE9FE",
+    }
+
+    for row_num, r in enumerate(data["rows"], 2):
+        vals = [
+            r["project"], r["milestone"], r["billing_type"],
+            r["planned_billing_date"],  r["planned_billing_amount"],
+            r["actual_billing_date"],   r["actual_billing_amount"],
+            r["status"], r["days_variance"], r["description"], r["remarks"],
+        ]
+        status_color = STATUS_COLORS_XL.get(r["status"], "FFFFFF")
+        fill = PatternFill("solid", fgColor=status_color)
+        for col, v in enumerate(vals, 1):
+            cell = ws.cell(row=row_num, column=col, value=v)
+            cell.fill = fill
+            if col in (5, 7):
+                cell.alignment = Alignment(horizontal="right")
+
+    # Summary sheet
+    ws2 = wb.create_sheet("Summary")
+    ws2.cell(row=1, column=1, value="Status").font = Font(bold=True)
+    ws2.cell(row=1, column=2, value="Count").font = Font(bold=True)
+    for i, (status, count) in enumerate(data["summary"].items(), 2):
+        ws2.cell(row=i, column=1, value=status)
+        ws2.cell(row=i, column=2, value=count)
+    ws2.column_dimensions["A"].width = 20
+    ws2.column_dimensions["B"].width = 10
+
+    _set_col_widths(ws, [20, 22, 18, 14, 20, 14, 20, 16, 13, 25, 25])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=billing_status_report.xlsx"},
+    )
