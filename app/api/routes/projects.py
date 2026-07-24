@@ -4,7 +4,9 @@ from typing import List
 from app.db.database import get_db
 from app.models.models import (Project, ProjectMilestone, Milestone, User, ProjectMember, ProjectBilling,
                                CustomMilestone, CustomTask, CustomSubtask, SubtaskQuestion, SubtaskReport,
-                               Activity, TaskFormField, MilestoneReport, ProjectReport, WorkHours)
+                               Activity, TaskFormField, MilestoneReport, ProjectReport, WorkHours,
+                               SubtaskStatus, Response, Notification, AuditLog, ProjectCost,
+                               TaskAssignment, FinancialAuditLog)
 from app.schemas.schemas import ProjectCreate, ProjectOut, ProjectUpdate
 from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager, can_create_project
@@ -189,53 +191,91 @@ def add_new_member(project_id: int, payload: AddMemberRequest, db: Session = Dep
 
 @router.delete("/{project_id}")
 def delete_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Delete a project and all its related data (Admin only)."""
+    """Delete a project and all its related data (Admin only).
+
+    Explicitly pre-deletes every child table in dependency order (leaf tables
+    first) so PostgreSQL FK constraints are never violated.  We bypass SQLAlchemy
+    ORM cascade entirely — mixing ORM cascade with synchronize_session=False
+    bulk-deletes causes the session's identity map to go stale, which can leave
+    cascade-only tables partially un-deleted and trigger FK violations.
+    """
     if current_user.role != "Admin":
         raise HTTPException(403, "Only Admin can delete projects")
     p = db.query(Project).filter_by(id=project_id).first()
     if not p:
         raise HTTPException(404, "Project not found")
 
-    # Pre-delete tables that have NOT NULL FKs to projects but are NOT covered
-    # by the ORM cascade relationships on the Project model.
-    # Without this PostgreSQL RESTRICT blocks the delete.
-    # Order: leaf tables first, then their parents.
+    project_name = p.name   # capture before the row is gone
 
-    # 1. Billing entries (project_billings.project_id NOT NULL, no ORM cascade)
-    db.query(ProjectBilling).filter_by(project_id=project_id).delete(synchronize_session=False)
+    try:
+        # ── LEAF TABLES (deepest FKs first) ──────────────────────────────────
 
-    # 2. NULL out all WorkHours FK references for this project before deleting
-    #    their referents (custom_milestones, custom_tasks, milestone_reports).
-    #    These columns are nullable so SET NULL is safe.
-    db.query(WorkHours).filter_by(project_id=project_id).update(
-        {WorkHours.custom_milestone_id: None,
-         WorkHours.custom_task_id: None,
-         WorkHours.custom_subtask_id: None,
-         WorkHours.milestone_report_id: None},
-        synchronize_session=False
-    )
+        # Standard milestone responses (project_id NOT NULL, not ORM-cascaded)
+        db.query(Response).filter_by(project_id=project_id).delete(synchronize_session=False)
 
-    # 3. Custom milestone tree (NOT NULL project_id, no ORM cascade from Project).
-    #    Delete leaf tables first so FKs are satisfied at each step.
-    db.query(Activity).filter_by(project_id=project_id).delete(synchronize_session=False)
-    db.query(SubtaskReport).filter_by(project_id=project_id).delete(synchronize_session=False)
-    db.query(SubtaskQuestion).filter_by(project_id=project_id).delete(synchronize_session=False)
-    db.query(TaskFormField).filter_by(project_id=project_id).delete(synchronize_session=False)
-    db.query(CustomSubtask).filter_by(project_id=project_id).delete(synchronize_session=False)
-    db.query(MilestoneReport).filter_by(project_id=project_id).delete(synchronize_session=False)
-    db.query(CustomTask).filter_by(project_id=project_id).delete(synchronize_session=False)
-    db.query(CustomMilestone).filter_by(project_id=project_id).delete(synchronize_session=False)
+        # SubtaskStatus links both project_id (NOT NULL) and project_milestone_id (NOT NULL).
+        # Must be deleted before project_milestones.
+        db.query(SubtaskStatus).filter_by(project_id=project_id).delete(synchronize_session=False)
 
-    # 4. DA project-level reports (project_reports_da.project_id NOT NULL)
-    db.query(ProjectReport).filter_by(project_id=project_id).delete(synchronize_session=False)
+        # Billing entries
+        db.query(ProjectBilling).filter_by(project_id=project_id).delete(synchronize_session=False)
 
-    log_action(db, actor=current_user.name, action="delete",
-               description=f"Project '{p.name}' deleted",
-               project_id=project_id, entity_type="project",
-               entity_id=project_id, user_id=current_user.id)
-    db.delete(p)
-    db.commit()
-    return {"status": "ok", "message": f"Project '{p.name}' deleted"}
+        # ── CUSTOM MILESTONE TREE ─────────────────────────────────────────────
+        # Deepest level first so FK constraints are always satisfied.
+        db.query(Activity).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(SubtaskReport).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(SubtaskQuestion).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(TaskFormField).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(CustomSubtask).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(MilestoneReport).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(CustomTask).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(CustomMilestone).filter_by(project_id=project_id).delete(synchronize_session=False)
+
+        # DA project-level reports
+        db.query(ProjectReport).filter_by(project_id=project_id).delete(synchronize_session=False)
+
+        # Standard project milestones (after SubtaskStatus cleared above)
+        db.query(ProjectMilestone).filter_by(project_id=project_id).delete(synchronize_session=False)
+
+        # ── DIRECT PROJECT CHILDREN ───────────────────────────────────────────
+        db.query(ProjectMember).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(ProjectCost).filter_by(project_id=project_id).delete(synchronize_session=False)
+        db.query(Notification).filter_by(project_id=project_id).delete(synchronize_session=False)
+        # Delete all audit log entries for this project (history gone with the project).
+        db.query(AuditLog).filter_by(project_id=project_id).delete(synchronize_session=False)
+
+        # ── NULLABLE FK TABLES — set project_id to NULL (preserve history) ───
+        # work_hours: NULL out project_id + all milestone-level FKs
+        db.query(WorkHours).filter_by(project_id=project_id).update(
+            {"project_id": None, "custom_milestone_id": None,
+             "custom_task_id": None, "custom_subtask_id": None,
+             "milestone_report_id": None},
+            synchronize_session=False
+        )
+        # task_assignments: unlink from project, keep the assignment record
+        db.query(TaskAssignment).filter(
+            TaskAssignment.project_id == project_id
+        ).update({"project_id": None}, synchronize_session=False)
+        # financial audit log: keep billing history, just remove project link
+        db.query(FinancialAuditLog).filter_by(project_id=project_id).update(
+            {"project_id": None}, synchronize_session=False
+        )
+
+        # ── AUDIT LOG FOR THIS DELETE (project_id=None — project no longer exists) ──
+        log_action(db, actor=current_user.name, action="delete",
+                   description=f"Project '{project_name}' (id={project_id}) deleted",
+                   project_id=None, entity_type="project",
+                   entity_id=project_id, user_id=current_user.id)
+
+        # ── FINALLY: DELETE THE PROJECT ROW ──────────────────────────────────
+        db.query(Project).filter_by(id=project_id).delete(synchronize_session=False)
+        db.commit()
+
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Delete failed: {exc}")
+
+    return {"status": "ok", "message": f"Project '{project_name}' deleted"}
 
 
 @router.delete("/{project_id}/team/{member_id}")
