@@ -656,7 +656,7 @@ def global_projects_list(
     current_user: User = Depends(get_current_user)
 ):
     projects = db.query(Project).order_by(Project.name).all()
-    return [{"id": p.id, "name": p.name, "client": p.client, "status": p.status} for p in projects]
+    return [{"id": p.id, "name": p.name, "client": p.client, "status": p.status, "project_type": p.project_type} for p in projects]
 
 
 # ── Helper: all users list ────────────────────────────────────────────────────

@@ -175,7 +175,19 @@ def _make_list_ctx(db: Session, project_id: int) -> dict:
     """
     from collections import defaultdict
 
-    # Query 1: all work-hour rows for this project
+    # Query 1a: MilestoneReport id → parent milestone id (for DA timesheet roll-up)
+    # DA work hours have milestone_report_id set but no custom_milestone_id; we
+    # need to map them to the parent milestone so actual_hours rolls up correctly.
+    rpt_to_ms: dict = {}
+    for rpt_id, ms_id in (
+        db.query(MilestoneReport.id, MilestoneReport.milestone_id)
+        .join(CustomMilestone, CustomMilestone.id == MilestoneReport.milestone_id)
+        .filter(CustomMilestone.project_id == project_id)
+        .all()
+    ):
+        rpt_to_ms[rpt_id] = ms_id
+
+    # Query 1b: all work-hour rows for this project
     all_wh = db.query(WorkHours).filter(WorkHours.project_id == project_id).all()
 
     # wh[(entity_type_char, entity_id)][user_id_or_None] = cumulative hours
@@ -197,6 +209,12 @@ def _make_list_ctx(db: Session, project_id: int) -> dict:
             key = ('t', row.custom_task_id)
         elif row.custom_milestone_id is not None:
             key = ('ms', row.custom_milestone_id)
+        elif row.milestone_report_id is not None:
+            # Req 8 — DA timesheet: roll report hours up to parent milestone
+            ms_id = rpt_to_ms.get(row.milestone_report_id)
+            if ms_id is None:
+                continue
+            key = ('ms', ms_id)
         else:
             continue
         wh[key][uid]  += h
