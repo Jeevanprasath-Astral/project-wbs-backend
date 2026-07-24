@@ -273,6 +273,20 @@ def _run_lightweight_migrations():
         "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS actual_billing_date   DATE",
         "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS actual_billing_amount FLOAT",
 
+        # ── Project Billings — add columns missing from older DB schemas ──────
+        # planned_billing_date is no longer stored in the model (derived from
+        # milestone.planned_end at API time). If the column exists in the DB and
+        # is NOT NULL, every INSERT fails. Drop it so inserts succeed.
+        "ALTER TABLE project_billings DROP COLUMN IF EXISTS planned_billing_date",
+        # These columns were added to the model after the initial table creation;
+        # no prior migration existed to ALTER the live DB table.
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS milestone_id   INTEGER REFERENCES custom_milestones(id) ON DELETE SET NULL",
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS billing_type   VARCHAR(100)",
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS description    TEXT",
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS remarks        TEXT",
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS created_by     INTEGER REFERENCES users(id) ON DELETE SET NULL",
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS created_at     TIMESTAMPTZ DEFAULT now()",
+
         # ── Financial Audit Log ───────────────────────────────────────────────
         """CREATE TABLE IF NOT EXISTS financial_audit_logs (
             id          SERIAL PRIMARY KEY,
