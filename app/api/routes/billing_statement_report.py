@@ -108,14 +108,14 @@ def billing_statement_export(
     if project_id:
         q = q.filter(ProjectBilling.project_id == project_id)
     if start_date:
-        q = q.filter(ProjectBilling.date >= date_cls.fromisoformat(start_date))
+        q = q.filter(ProjectBilling.actual_billing_date >= date_cls.fromisoformat(start_date))
     if end_date:
-        q = q.filter(ProjectBilling.date <= date_cls.fromisoformat(end_date))
+        q = q.filter(ProjectBilling.actual_billing_date <= date_cls.fromisoformat(end_date))
     if billing_type:
         q = q.filter(ProjectBilling.billing_type == billing_type)
 
-    # Order by project_id then date for grouping + running total
-    entries = q.order_by(ProjectBilling.project_id, ProjectBilling.date).all()
+    # Order by project_id then actual_billing_date for grouping + running total
+    entries = q.order_by(ProjectBilling.project_id, ProjectBilling.actual_billing_date).all()
 
     # ── Load related data ─────────────────────────────────────────────────────
     proj_ids = list({e.project_id for e in entries})
@@ -162,9 +162,9 @@ def billing_statement_export(
     for i, pid in enumerate(sorted(proj_ids, key=lambda x: proj_map.get(x, Project()).name or "")):
         p = proj_map.get(pid)
         p_entries = proj_entries.get(pid, [])
-        total = sum(float(e.amount or 0) for e in p_entries)
+        total = sum(float(e.actual_billing_amount if e.actual_billing_amount is not None else (e.planned_billing_amount or 0)) for e in p_entries)
         count = len(p_entries)
-        most_recent = max((str(e.date) for e in p_entries if e.date), default="—")
+        most_recent = max((str(e.actual_billing_date) for e in p_entries if e.actual_billing_date), default="—")
         types_used = ", ".join(sorted({e.billing_type for e in p_entries if e.billing_type}))
 
         grand_total += total
@@ -219,7 +219,7 @@ def billing_statement_export(
         running = 0.0
 
         for j, e in enumerate(p_entries):
-            amt = float(e.amount or 0)
+            amt = float(e.actual_billing_amount if e.actual_billing_amount is not None else (e.planned_billing_amount or 0))
             running += amt
             m_name = milestone_cache.get(e.milestone_id) if e.milestone_id else None
 
@@ -228,7 +228,7 @@ def billing_statement_export(
             row_vals = [
                 p.name if p else "—",
                 p.client if p else "—",
-                str(e.date) if e.date else "—",
+                str(e.actual_billing_date) if e.actual_billing_date else "—",
                 e.billing_type or "—",
                 _fmt(amt),
                 _fmt(running),
@@ -249,7 +249,7 @@ def billing_statement_export(
 
         # Project subtotal row
         if p_entries:
-            proj_total_val = sum(float(e.amount or 0) for e in p_entries)
+            proj_total_val = sum(float(e.actual_billing_amount if e.actual_billing_amount is not None else (e.planned_billing_amount or 0)) for e in p_entries)
             _write_row(ws2, row_num2, [
                 f"  {p.name if p else '—'} — Total", "", "", "",
                 _fmt(proj_total_val), "", "", "", "",
@@ -276,9 +276,9 @@ def billing_statement_export(
     from collections import defaultdict
     month_data = defaultdict(lambda: {"total": 0.0, "count": 0, "projects": set()})
     for e in entries:
-        if e.date:
-            key = e.date.strftime("%Y-%m")
-            month_data[key]["total"]   += float(e.amount or 0)
+        if e.actual_billing_date:
+            key = e.actual_billing_date.strftime("%Y-%m")
+            month_data[key]["total"]   += float(e.actual_billing_amount if e.actual_billing_amount is not None else (e.planned_billing_amount or 0))
             month_data[key]["count"]   += 1
             p = proj_map.get(e.project_id)
             if p:

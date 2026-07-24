@@ -12,7 +12,8 @@ from app.api.routes import (auth, projects, milestones, responses,
                              profitability_report, project_billings,
                              team_utilization_report, cost_breakdown_report,
                              billing_statement_report, hours_tracker,
-                             report_templates, attachments)
+                             report_templates, attachments, billing_reports,
+                             da_project_reports)
 from fastapi.staticfiles import StaticFiles
 from app.services.scheduler import start_scheduler, stop_scheduler
 
@@ -261,6 +262,91 @@ def _run_lightweight_migrations():
         # Task Estimated Hours — directly editable at Task level (Bug #1).
         # Milestone estimated_hours = SUM(task.estimated_hours); no subtask rollup.
         "ALTER TABLE custom_tasks ADD COLUMN IF NOT EXISTS estimated_hours FLOAT DEFAULT 0",
+
+        # ── Billing History schema overhaul ───────────────────────────────────
+        # Rename date → planned_billing_date, amount → planned_billing_amount.
+        # planned_billing_date is derived from milestone.planned_end at API time;
+        # the column is kept for backward-compat storage but marked read-only in UI.
+        # Add actual_billing_date + actual_billing_amount (filled after billing done).
+        "ALTER TABLE project_billings RENAME COLUMN date   TO planned_billing_date",
+        "ALTER TABLE project_billings RENAME COLUMN amount TO planned_billing_amount",
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS actual_billing_date   DATE",
+        "ALTER TABLE project_billings ADD COLUMN IF NOT EXISTS actual_billing_amount FLOAT",
+
+        # ── Financial Audit Log ───────────────────────────────────────────────
+        """CREATE TABLE IF NOT EXISTS financial_audit_logs (
+            id          SERIAL PRIMARY KEY,
+            project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            billing_id  INTEGER,
+            action      VARCHAR(20) NOT NULL,
+            changed_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            snapshot    TEXT,
+            changed_at  TIMESTAMPTZ DEFAULT now()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_financial_audit_logs_project_id ON financial_audit_logs(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_financial_audit_logs_changed_at ON financial_audit_logs(changed_at)",
+
+        # ── MilestoneReport: planned_hours + actual_hours (for Data Analytics) ─
+        "ALTER TABLE milestone_reports ADD COLUMN IF NOT EXISTS planned_hours FLOAT DEFAULT 0",
+        "ALTER TABLE milestone_reports ADD COLUMN IF NOT EXISTS actual_hours  FLOAT DEFAULT 0",
+
+        # ── Req 8: DA Timesheet — milestone_report_id FK on work_hours ─────────
+        # Links a Timesheet log entry to a specific MilestoneReport for Data
+        # Analytics projects. actual_hours on MilestoneReport is recomputed
+        # as SUM(hours_spent) on every create/update/delete of a work_hours row.
+        "ALTER TABLE work_hours ADD COLUMN IF NOT EXISTS milestone_report_id INTEGER REFERENCES milestone_reports(id) ON DELETE SET NULL",
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_milestone_report_id ON work_hours(milestone_report_id)",
+
+        # ── DA Report Master — project_reports_da table ───────────────────────
+        # Holds the project-level catalogue of reports for Data Analytics projects.
+        # Named project_reports_da to avoid clash with existing project_reports table
+        # (which stores Excel-exported project schedule reports).
+        """
+        CREATE TABLE IF NOT EXISTS project_reports_da (
+            id            SERIAL PRIMARY KEY,
+            project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            report_number VARCHAR(100) NOT NULL,
+            report_name   VARCHAR(300) NOT NULL,
+            department    VARCHAR(150),
+            created_at    TIMESTAMPTZ DEFAULT NOW(),
+            updated_at    TIMESTAMPTZ,
+            CONSTRAINT uq_da_project_report_number UNIQUE (project_id, report_number)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_project_reports_da_project_id ON project_reports_da(project_id)",
+
+        # ── DA Report Master — add FK + batch_number to milestone_reports ─────
+        "ALTER TABLE milestone_reports ADD COLUMN IF NOT EXISTS project_report_id INTEGER REFERENCES project_reports_da(id) ON DELETE SET NULL",
+        "ALTER TABLE milestone_reports ADD COLUMN IF NOT EXISTS batch_number INTEGER NOT NULL DEFAULT 1",
+        "CREATE INDEX IF NOT EXISTS ix_milestone_reports_project_report_id ON milestone_reports(project_report_id)",
+        "CREATE INDEX IF NOT EXISTS ix_milestone_reports_batch ON milestone_reports(milestone_id, batch_number)",
+
+        # ── DA Report Master — unique index (replaces legacy name-based constraint)
+        # Partial: only enforced when project_report_id is set (new rows).
+        # Old rows that still have project_report_id IS NULL are unaffected.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_milestone_project_report ON milestone_reports(milestone_id, project_report_id) WHERE project_report_id IS NOT NULL",
+
+        # ── DA Report Master — backfill: populate project_reports_da from existing
+        # milestone_reports rows so legacy data keeps working.
+        """
+        INSERT INTO project_reports_da (project_id, report_number, report_name, department)
+        SELECT DISTINCT project_id, report_number, report_name, department
+        FROM milestone_reports
+        WHERE project_report_id IS NULL
+          AND report_number IS NOT NULL
+          AND report_number <> ''
+        ON CONFLICT (project_id, report_number) DO NOTHING
+        """,
+
+        # ── DA Report Master — backfill: link existing milestone_reports rows ──
+        """
+        UPDATE milestone_reports mr
+        SET project_report_id = pr.id
+        FROM project_reports_da pr
+        WHERE mr.project_report_id IS NULL
+          AND mr.project_id = pr.project_id
+          AND mr.report_number = pr.report_number
+        """,
     ]
     for stmt in statements:
         try:
@@ -474,7 +560,8 @@ for router in [auth, projects, milestones, responses, dashboard,
                project_reports, profitability_report, project_billings,
                team_utilization_report, cost_breakdown_report,
                billing_statement_report, hours_tracker,
-               report_templates, attachments]:
+               report_templates, attachments, billing_reports,
+               da_project_reports]:
     app.include_router(router.router, prefix="/api")
 
 # Extra routers from global_team module (custom roles + assignment categories)

@@ -6,7 +6,8 @@ from datetime import datetime, date, timedelta
 from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.models import (WorkHours, User, Project, TaskAssignment, Team,
-                                CustomMilestone, CustomTask, CustomSubtask, Activity)
+                                CustomMilestone, CustomTask, CustomSubtask, Activity,
+                                MilestoneReport)
 from app.core.deps import get_current_user
 from app.core.permissions import is_elevated
 
@@ -42,6 +43,7 @@ class WorkHoursCreate(BaseModel):
     is_billable: Optional[bool] = True
     work_type: Optional[str] = None   # Billable | Non-Billable | No Work | Training | R&D
     notes: Optional[str] = None
+    milestone_report_id: Optional[int] = None   # Req 8 — DA timesheet
 
 class WorkHoursUpdate(BaseModel):
     end_time: Optional[str] = None
@@ -51,10 +53,21 @@ class WorkHoursUpdate(BaseModel):
     is_billable: Optional[bool] = None
     work_type: Optional[str] = None   # Billable | Non-Billable | No Work | Training | R&D
     notes: Optional[str] = None
+    milestone_report_id: Optional[int] = None   # Req 8 — re-link if needed
 
 def _actual_hours(w: WorkHours):
     """Actual Working Hours = Total Time Taken (hours_spent) - Buffer Time"""
     return round(max((w.hours_spent or 0) - (w.buffer_hours or 0), 0), 2)
+
+def _recompute_report_hours(db: Session, report_id: int):
+    """Req 8 — recompute MilestoneReport.actual_hours = SUM(work_hours WHERE milestone_report_id = report_id)."""
+    total = db.query(func.sum(WorkHours.hours_spent)).filter(
+        WorkHours.milestone_report_id == report_id
+    ).scalar() or 0.0
+    rpt = db.query(MilestoneReport).filter_by(id=report_id).first()
+    if rpt:
+        rpt.actual_hours = round(float(total), 2)
+        db.commit()
 
 def _resolve_level_name(w: WorkHours, db: Session):
     """Resolve a human-readable name for whichever level this entry targets."""
@@ -105,6 +118,7 @@ def _build(w: WorkHours, db: Session):
         "work_type": w.work_type or ("Billable" if (w.is_billable if w.is_billable is not None else True) else "Non-Billable"),
         "actual_working_hours": _actual_hours(w),
         "notes": w.notes,
+        "milestone_report_id": w.milestone_report_id,
         "created_at": w.created_at,
     }
 
@@ -338,6 +352,15 @@ def log_hours(
         if asg:
             derived_project_id = asg.project_id
 
+    # Req 8 — DA timesheet: resolve project + task_name from MilestoneReport
+    if payload.milestone_report_id:
+        rpt = db.query(MilestoneReport).filter_by(id=payload.milestone_report_id).first()
+        if rpt:
+            task_name = task_name or rpt.report_name
+            ms = db.query(CustomMilestone).filter_by(id=rpt.milestone_id).first()
+            if ms:
+                derived_project_id = derived_project_id or ms.project_id
+
     final_project_id = derived_project_id if derived_project_id is not None else payload.project_id
 
     # Resolve who this entry is attributed to. Only Admin/Functional
@@ -361,6 +384,7 @@ def log_hours(
         custom_task_id=payload.custom_task_id,
         custom_subtask_id=payload.custom_subtask_id,
         activity_id=payload.activity_id,
+        milestone_report_id=payload.milestone_report_id,   # Req 8
         date=date.fromisoformat(payload.date),
         start_time=start, end_time=end,
         hours_spent=hours,
@@ -372,6 +396,9 @@ def log_hours(
         notes=payload.notes,
     )
     db.add(w); db.commit(); db.refresh(w)
+    # Req 8 — recompute MilestoneReport.actual_hours after logging
+    if payload.milestone_report_id:
+        _recompute_report_hours(db, payload.milestone_report_id)
     return _build(w, db)
 
 @router.patch("/{wh_id}")
@@ -402,12 +429,24 @@ def update_hours(
         w.is_billable = payload.is_billable
         w.work_type = 'Billable' if payload.is_billable else 'Non-Billable'
     if payload.notes: w.notes = payload.notes
+    old_report_id = w.milestone_report_id
+    if payload.milestone_report_id is not None:
+        w.milestone_report_id = payload.milestone_report_id
     db.commit(); db.refresh(w)
+    # Req 8 — recompute actual_hours for affected report(s)
+    if old_report_id:
+        _recompute_report_hours(db, old_report_id)
+    if w.milestone_report_id and w.milestone_report_id != old_report_id:
+        _recompute_report_hours(db, w.milestone_report_id)
     return _build(w, db)
 
 @router.delete("/{wh_id}")
 def delete_hours(wh_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     w = db.query(WorkHours).filter_by(id=wh_id).first()
     if not w: raise HTTPException(404, "Record not found")
+    report_id_to_recompute = w.milestone_report_id   # Req 8
     db.delete(w); db.commit()
+    # Req 8 — recompute actual_hours after deleting a DA timesheet entry
+    if report_id_to_recompute:
+        _recompute_report_hours(db, report_id_to_recompute)
     return {"status": "deleted"}

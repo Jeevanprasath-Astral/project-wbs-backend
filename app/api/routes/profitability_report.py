@@ -160,7 +160,9 @@ def _project_metrics(db: Session, project: Project):
     # Billing = SUM of all ProjectBilling entries for this project.
     # Falls back to 0 if no entries recorded yet.
     billing = float(
-        db.query(func.coalesce(func.sum(ProjectBilling.amount), 0.0))
+        db.query(func.coalesce(
+            func.sum(func.coalesce(ProjectBilling.actual_billing_amount,
+                                   ProjectBilling.planned_billing_amount)), 0.0))
           .filter(ProjectBilling.project_id == pid).scalar() or 0.0
     )
     net_profit   = billing - total_cost

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
 from app.db.database import get_db
-from app.models.models import Project, ProjectMilestone, Milestone, User, ProjectMember
+from app.models.models import Project, ProjectMilestone, Milestone, User, ProjectMember, ProjectBilling, CustomMilestone, WorkHours
 from app.schemas.schemas import ProjectCreate, ProjectOut, ProjectUpdate
 from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager, can_create_project
@@ -193,6 +193,38 @@ def delete_project(project_id: int, db: Session = Depends(get_db), current_user:
     p = db.query(Project).filter_by(id=project_id).first()
     if not p:
         raise HTTPException(404, "Project not found")
+
+    # Pre-delete tables that have NOT NULL FKs to projects but are NOT covered
+    # by the ORM cascade relationships on the Project model.
+    # Without this PostgreSQL RESTRICT blocks the delete.
+
+    # 1. Billing entries (project_billings.project_id NOT NULL, no ORM cascade)
+    db.query(ProjectBilling).filter_by(project_id=project_id).delete(synchronize_session=False)
+
+    # 2. NULL out WorkHours FKs that reference milestones/tasks in this project.
+    #    custom_milestones may be cascade-deleted at DB level, but work_hours
+    #    referencing those milestones would RESTRICT that cascade.
+    milestone_ids = [
+        m.id for m in db.query(CustomMilestone).filter_by(project_id=project_id).all()
+    ]
+    if milestone_ids:
+        from sqlalchemy import update as sa_update
+        db.query(WorkHours).filter(
+            WorkHours.custom_milestone_id.in_(milestone_ids)
+        ).update({WorkHours.custom_milestone_id: None}, synchronize_session=False)
+
+        # Collect task IDs under those milestones
+        from app.models.models import CustomTask
+        task_ids = [
+            t.id for t in db.query(CustomTask).filter(
+                CustomTask.milestone_id.in_(milestone_ids)
+            ).all()
+        ]
+        if task_ids:
+            db.query(WorkHours).filter(
+                WorkHours.custom_task_id.in_(task_ids)
+            ).update({WorkHours.custom_task_id: None}, synchronize_session=False)
+
     log_action(db, actor=current_user.name, action="delete",
                description=f"Project '{p.name}' deleted",
                project_id=project_id, entity_type="project",

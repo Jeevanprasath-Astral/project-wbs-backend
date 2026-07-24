@@ -279,6 +279,7 @@ class WorkHours(Base):
     custom_task_id       = Column(Integer, ForeignKey("custom_tasks.id"), nullable=True)
     custom_subtask_id    = Column(Integer, ForeignKey("custom_subtasks.id"), nullable=True)
     activity_id          = Column(Integer, ForeignKey("activities.id"), nullable=True)
+    milestone_report_id  = Column(Integer, ForeignKey("milestone_reports.id"), nullable=True)  # Req 8 — DA timesheet
     date          = Column(Date, nullable=False)
     start_time    = Column(DateTime)
     end_time      = Column(DateTime)
@@ -460,25 +461,50 @@ class TaskFormField(Base):
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     task          = relationship("CustomTask", back_populates="form_fields")
 
-# ── Milestone Reports (optional, multiple per Milestone) ──────────────────────
-# Reports are associated at the Milestone level — several reports can point at
-# the same Milestone instead of needing separate task/subtask structure per
-# report. report_number is unique within a Milestone to avoid duplicates.
-class MilestoneReport(Base):
-    __tablename__ = "milestone_reports"
-    __table_args__ = (UniqueConstraint("milestone_id", "report_number", name="uq_milestone_report_number"),)
+# ── DA Project Report Master (one list of reports per DA project) ─────────────
+# Defines the project-level catalogue of reports for Data Analytics projects.
+# MilestoneReport rows reference these via project_report_id FK.
+class ProjectReport(Base):
+    __tablename__ = "project_reports_da"          # "da" suffix avoids clash with Excel project_reports table
+    __table_args__ = (UniqueConstraint("project_id", "report_number", name="uq_da_project_report_number"),)
     id            = Column(Integer, primary_key=True, index=True)
-    milestone_id  = Column(Integer, ForeignKey("custom_milestones.id"), nullable=False)
     project_id    = Column(Integer, ForeignKey("projects.id"), nullable=False)
     report_number = Column(String(100), nullable=False)
     report_name   = Column(String(300), nullable=False)
     department    = Column(String(150))
-    status        = Column(String(50), default="Not Started")
-    assigned_to   = Column(String(200))
-    due_date      = Column(Date)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     updated_at    = Column(DateTime(timezone=True), onupdate=func.now())
-    milestone     = relationship("CustomMilestone", back_populates="reports")
+    # back-ref to milestone assignments
+    milestone_reports = relationship("MilestoneReport", back_populates="project_report")
+
+# ── Milestone Reports (optional, multiple per Milestone) ──────────────────────
+# Reports are associated at the Milestone level. Each row links to a master
+# ProjectReport and belongs to a batch within that Milestone.
+class MilestoneReport(Base):
+    __tablename__ = "milestone_reports"
+    __table_args__ = (
+        # Legacy unique constraint removed — replaced by partial index in DB
+        # (migration drops uq_milestone_report_number and creates the index)
+        UniqueConstraint("milestone_id", "report_number", name="uq_milestone_report_number"),
+    )
+    id                = Column(Integer, primary_key=True, index=True)
+    milestone_id      = Column(Integer, ForeignKey("custom_milestones.id"), nullable=False)
+    project_id        = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    report_number     = Column(String(100), nullable=False)
+    report_name       = Column(String(300), nullable=False)
+    department        = Column(String(150))
+    status            = Column(String(50), default="Not Started")
+    assigned_to       = Column(String(200))
+    due_date          = Column(Date)
+    planned_hours     = Column(Float, default=0.0)   # Req 7 — DA milestone reports
+    actual_hours      = Column(Float, default=0.0)   # Req 8 — auto-computed from WorkHours
+    # DA Report Master FK (new — backfilled from existing report_number match)
+    project_report_id = Column(Integer, ForeignKey("project_reports_da.id"), nullable=True)
+    batch_number      = Column(Integer, default=1, nullable=False)  # which batch within this milestone
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
+    milestone         = relationship("CustomMilestone", back_populates="reports")
+    project_report    = relationship("ProjectReport", back_populates="milestone_reports")
 
 # ── Timesheet Calendar: Holidays / Leave / Permissions ────────────────────────
 class Holiday(Base):
@@ -516,22 +542,41 @@ class Permission(Base):
 
 # ── Billing History ───────────────────────────────────────────────────────────
 class ProjectBilling(Base):
-    """One billing entry for a project — replaces the single billing_amount field
-    on Project. Multiple entries per project allow tracking milestone payments,
-    change requests, additional scope, etc. separately. The profitability report
-    uses SUM(amount) across all entries as the project's Revenue figure."""
+    """One billing entry for a project.
+    Planned Billing Date is derived from the linked milestone's planned_end —
+    it is NOT stored separately; the API always returns milestone.planned_end.
+    Actual Billing Date + Actual Billing Amount are entered after billing occurs.
+    The profitability report uses SUM(planned_billing_amount) as Revenue."""
     __tablename__ = "project_billings"
+    id                     = Column(Integer, primary_key=True, index=True)
+    project_id             = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    milestone_id           = Column(Integer, ForeignKey("custom_milestones.id"), nullable=True)
+    # Planned amount — entered at record creation
+    planned_billing_amount = Column(Float, nullable=False, default=0.0)
+    # Actual — filled in after billing is done (nullable until then)
+    actual_billing_date    = Column(Date, nullable=True)
+    actual_billing_amount  = Column(Float, nullable=True)
+    billing_type           = Column(String(100))   # Development / AMC / SaaS / Gappeo / Other
+    description            = Column(Text)
+    remarks                = Column(Text)
+    created_by             = Column(Integer, ForeignKey("users.id"))
+    created_at             = Column(DateTime(timezone=True), server_default=func.now())
+    project                = relationship("Project", backref="billings")
+    milestone              = relationship("CustomMilestone")
+
+# ── Financial Settings Audit Log ──────────────────────────────────────────────
+class FinancialAuditLog(Base):
+    """Records every create/update/delete on project_billings.
+    Independent from the general AuditLog so financial history is never
+    mixed with operational changes."""
+    __tablename__ = "financial_audit_logs"
     id           = Column(Integer, primary_key=True, index=True)
-    project_id   = Column(Integer, ForeignKey("projects.id"), nullable=False)
-    date         = Column(Date, nullable=False)
-    amount       = Column(Float, nullable=False, default=0.0)
-    billing_type = Column(String(100))   # Milestone Payment / Change Request / etc.
-    description  = Column(Text)
-    milestone_id = Column(Integer, ForeignKey("custom_milestones.id"), nullable=True)
-    remarks      = Column(Text)
-    created_by   = Column(Integer, ForeignKey("users.id"))
-    created_at   = Column(DateTime(timezone=True), server_default=func.now())
-    project      = relationship("Project", backref="billings")
+    project_id   = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    billing_id   = Column(Integer, nullable=True)   # project_billings.id (not FK — survives delete)
+    action       = Column(String(20), nullable=False)   # "Created" | "Updated" | "Deleted"
+    changed_by   = Column(Integer, ForeignKey("users.id"), nullable=True)
+    snapshot     = Column(Text)   # JSON snapshot of the billing record at time of change
+    changed_at   = Column(DateTime(timezone=True), server_default=func.now())
 
 # ── Cost Management ───────────────────────────────────────────────────────────
 class ProjectCost(Base):

@@ -212,6 +212,14 @@ def get_calendar(
     start = date_cls(year, mon, 1)
     end = date_cls(year, mon, days_in_month)
 
+    # Restrict the Calendar view to 1st → today for the current month.
+    # Future dates are hidden in the Calendar tab only — Holidays, Leave, and
+    # Permissions tabs are unaffected (they query independently without this cap).
+    today_date = date_cls.today()
+    if (year, mon) == (today_date.year, today_date.month):
+        end = min(end, today_date)
+        days_in_month = end.day   # loop only up to today
+
     # Work hours logged anywhere in the app (Work Hours page, Milestone
     # Configuration, etc.) all land in the same WorkHours table — so this
     # automatically reflects entries made from any module.

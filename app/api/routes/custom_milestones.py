@@ -9,7 +9,7 @@ from app.models.models import (CustomMilestone, CustomTask, CustomSubtask, Activ
                                 SubtaskQuestion, SubtaskReport, MilestoneReport,
                                 TaskFormField,
                                 Milestone, Task, Subtask, User, WorkHours, Project,
-                                TaskAssignment)
+                                TaskAssignment, ProjectReport)
 from sqlalchemy.exc import IntegrityError
 from app.core.deps import get_current_user
 from app.services.audit_service import log_action
@@ -615,6 +615,7 @@ class ReportCreate(BaseModel):
     status: Optional[str] = None
     assigned_to: Optional[str] = None
     due_date: Optional[str] = None
+    planned_hours: Optional[float] = None   # Req 7 — DA milestone reports
 
 class ReportUpdate(BaseModel):
     report_number: Optional[str] = None
@@ -623,6 +624,12 @@ class ReportUpdate(BaseModel):
     status: Optional[str] = None
     assigned_to: Optional[str] = None
     due_date: Optional[str] = None
+    planned_hours: Optional[float] = None   # Req 7 — DA milestone reports
+
+class BatchAssignPayload(BaseModel):
+    """Payload for assigning reports from the DA master catalogue to a batch within a milestone."""
+    project_report_ids: List[int]   # IDs from project_reports_da
+    batch_number: Optional[int] = None  # if None → auto-assign next available batch number
 
 class TemplateSelection(BaseModel):
     """Selective copy from the standard template. Omit entirely to copy the
@@ -706,9 +713,19 @@ def _build_report(r: SubtaskReport):
 
 def _build_milestone_report(r: MilestoneReport):
     return {
-        "id": r.id, "report_number": r.report_number, "report_name": r.report_name,
-        "department": r.department, "status": r.status, "assigned_to": r.assigned_to,
-        "due_date": r.due_date,
+        "id":                r.id,
+        "report_number":     r.report_number,
+        "report_name":       r.report_name,
+        "department":        r.department,
+        "status":            r.status,
+        "assigned_to":       r.assigned_to,
+        "due_date":          r.due_date,
+        # Req 7 — DA milestone reports
+        "planned_hours":     float(r.planned_hours or 0.0),
+        "actual_hours":      float(r.actual_hours  or 0.0),
+        # DA Report Master — new fields
+        "project_report_id": r.project_report_id,
+        "batch_number":      r.batch_number if r.batch_number is not None else 1,
     }
 
 
@@ -1215,6 +1232,20 @@ def delete_milestone(
 ):
     ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
     if not ms: raise HTTPException(404, "Milestone not found")
+
+    # Collect all task IDs under this milestone so we can NULL out work_hours FKs
+    task_ids = [t.id for t in ms.tasks]
+
+    # Set NULL on WorkHours that reference this milestone or its tasks.
+    # Without this, PostgreSQL RESTRICT blocks the delete.
+    db.query(WorkHours).filter(WorkHours.custom_milestone_id == milestone_id).update(
+        {WorkHours.custom_milestone_id: None}, synchronize_session=False
+    )
+    if task_ids:
+        db.query(WorkHours).filter(WorkHours.custom_task_id.in_(task_ids)).update(
+            {WorkHours.custom_task_id: None}, synchronize_session=False
+        )
+
     db.delete(ms); db.commit()
     return {"status": "deleted"}
 
@@ -1395,6 +1426,12 @@ def delete_task(
 ):
     t = db.query(CustomTask).filter_by(id=task_id, milestone_id=milestone_id).first()
     if not t: raise HTTPException(404, "Task not found")
+
+    # NULL out WorkHours FK before deletion — PostgreSQL RESTRICT blocks delete otherwise
+    db.query(WorkHours).filter(WorkHours.custom_task_id == task_id).update(
+        {WorkHours.custom_task_id: None}, synchronize_session=False
+    )
+
     db.delete(t); db.commit()
     return {"status": "deleted"}
 
@@ -1758,7 +1795,8 @@ def add_milestone_report(
         milestone_id=milestone_id, project_id=project_id,
         report_number=payload.report_number.strip(), report_name=payload.report_name.strip(),
         department=payload.department, status=payload.status or "Not Started",
-        assigned_to=payload.assigned_to, due_date=_parse_date(payload.due_date)
+        assigned_to=payload.assigned_to, due_date=_parse_date(payload.due_date),
+        planned_hours=payload.planned_hours or 0.0,   # Req 7
     )
     db.add(r)
     try:
@@ -1800,10 +1838,11 @@ def update_milestone_report(
         if not data["report_name"].strip():
             raise HTTPException(400, "Report Name is required")
         r.report_name = data["report_name"].strip()
-    if "department" in data:   r.department  = data["department"]
-    if "status" in data:       r.status      = data["status"]
-    if "assigned_to" in data:  r.assigned_to = data["assigned_to"]
-    if "due_date" in data:     r.due_date    = _parse_date(data["due_date"])
+    if "department" in data:    r.department    = data["department"]
+    if "status" in data:        r.status        = data["status"]
+    if "assigned_to" in data:   r.assigned_to   = data["assigned_to"]
+    if "due_date" in data:      r.due_date      = _parse_date(data["due_date"])
+    if "planned_hours" in data: r.planned_hours = data["planned_hours"]   # Req 7
     try:
         db.flush()
         if r.assigned_to and r.assigned_to != old_assigned_to:
@@ -1825,6 +1864,114 @@ def delete_milestone_report(
     if not r: raise HTTPException(404, "Report not found")
     db.delete(r); db.commit()
     return {"status": "deleted"}
+
+
+# ── DA Batch endpoints ────────────────────────────────────────────────────────
+# A "batch" is a numbered subset of the master report list assigned to a
+# milestone for one processing pass. Reports in earlier batches are still
+# selectable for later batches within the same milestone (each batch is
+# independent — the uniqueness constraint is (milestone_id, project_report_id),
+# so the same master report cannot appear twice within the same milestone).
+
+@router.post("/{milestone_id}/reports/batch", status_code=201)
+def add_report_batch(
+    project_id: int,
+    milestone_id: int,
+    payload: BatchAssignPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Assign a batch of master reports to a milestone.
+    Each project_report_id in the payload becomes one MilestoneReport row
+    with the same batch_number. If batch_number is omitted, the next
+    available batch number for this milestone is used automatically.
+    """
+    ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
+    if not ms:
+        raise HTTPException(404, "Milestone not found")
+
+    if not payload.project_report_ids:
+        raise HTTPException(400, "No reports provided in batch")
+
+    # Determine batch number
+    if payload.batch_number:
+        batch_num = payload.batch_number
+    else:
+        max_batch = db.query(sa_func.max(MilestoneReport.batch_number)).filter_by(
+            milestone_id=milestone_id
+        ).scalar()
+        batch_num = (max_batch or 0) + 1
+
+    created = []
+    for pr_id in payload.project_report_ids:
+        # Check master report belongs to this project
+        pr = db.query(ProjectReport).filter_by(id=pr_id, project_id=project_id).first()
+        if not pr:
+            raise HTTPException(404, f"Master report id={pr_id} not found in project")
+
+        # Check uniqueness: same report cannot already be in this milestone
+        existing = db.query(MilestoneReport).filter_by(
+            milestone_id=milestone_id, project_report_id=pr_id
+        ).first()
+        if existing:
+            raise HTTPException(
+                400,
+                f"Report '{pr.report_number}' is already assigned to this milestone (batch {existing.batch_number})."
+            )
+
+        mr = MilestoneReport(
+            milestone_id=milestone_id,
+            project_id=project_id,
+            report_number=pr.report_number,
+            report_name=pr.report_name,
+            department=pr.department,
+            status="Not Started",
+            planned_hours=0.0,
+            actual_hours=0.0,
+            project_report_id=pr_id,
+            batch_number=batch_num,
+        )
+        db.add(mr)
+        created.append(mr)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(400, "One or more reports conflict with existing milestone assignments.")
+
+    for mr in created:
+        db.refresh(mr)
+
+    return {
+        "batch_number": batch_num,
+        "reports": [_build_milestone_report(mr) for mr in created],
+    }
+
+
+@router.delete("/{milestone_id}/reports/batch/{batch_num}", status_code=200)
+def delete_report_batch(
+    project_id: int,
+    milestone_id: int,
+    batch_num: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove all reports in a specific batch from this milestone."""
+    ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
+    if not ms:
+        raise HTTPException(404, "Milestone not found")
+
+    rows = db.query(MilestoneReport).filter_by(
+        milestone_id=milestone_id, batch_number=batch_num
+    ).all()
+    if not rows:
+        raise HTTPException(404, f"No reports found in batch {batch_num} for this milestone")
+
+    for row in rows:
+        db.delete(row)
+    db.commit()
+    return {"status": "deleted", "batch_number": batch_num, "count": len(rows)}
 
 
 # ── Project-level Working Hours summary (req 1d / req #2) ────────────────────
@@ -1978,6 +2125,39 @@ def _generate_task_excel(db: Session, task: CustomTask, ms: CustomMilestone) -> 
     for i, w in enumerate([25,30,15,20,15,15,12], 1):
         ws3.column_dimensions[ws3.cell(1,i).column_letter].width = w
     buf = _io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+# ── Req 8: Flat reports list for DA timesheet dropdown ───────────────────────
+@router.get("/milestone-reports-flat")
+def list_milestone_reports_flat(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Return a flat list of all MilestoneReports for a project (for DA timesheet dropdown).
+    Route must be before /{milestone_id:int} to avoid shadowing."""
+    milestones = (
+        db.query(CustomMilestone)
+        .filter_by(project_id=project_id, is_active=True)
+        .order_by(CustomMilestone.num)
+        .all()
+    )
+    result = []
+    for ms in milestones:
+        for rpt in ms.reports:
+            result.append({
+                "id":             rpt.id,
+                "report_number":  rpt.report_number,
+                "report_name":    rpt.report_name,
+                "milestone_id":    ms.id,
+                "milestone_num":   ms.num,
+                "milestone_name":  ms.name,
+                "planned_hours":   float(rpt.planned_hours or 0.0),
+                "actual_hours":    float(rpt.actual_hours  or 0.0),
+                "project_report_id": rpt.project_report_id,
+                "batch_number":    rpt.batch_number if rpt.batch_number is not None else 1,
+            })
+    return result
 
 
 class MailboxPayload(BaseModel):

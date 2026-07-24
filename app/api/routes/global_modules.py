@@ -115,6 +115,18 @@ def global_assignments(
 
     assignments = q.order_by(TaskAssignment.created_at.desc()).all()
 
+    # Filter out orphaned assignments — where custom_task_id is set but the
+    # CustomTask no longer exists (deleted task with no FK cascade).
+    custom_task_ids = {a.custom_task_id for a in assignments if a.custom_task_id}
+    if custom_task_ids:
+        living_task_ids = {
+            t.id for t in db.query(CustomTask).filter(CustomTask.id.in_(custom_task_ids)).all()
+        }
+        assignments = [
+            a for a in assignments
+            if a.custom_task_id is None or a.custom_task_id in living_task_ids
+        ]
+
     # Perf: batch-fetch all referenced projects/users in 2 queries instead of
     # up to 3 queries per row (N+1) — matters once there are dozens+ of tasks.
     project_ids = {a.project_id for a in assignments if a.project_id}
