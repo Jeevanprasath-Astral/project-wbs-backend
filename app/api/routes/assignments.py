@@ -186,7 +186,14 @@ def list_assignments(
     if not assignments:
         return []
     user_map, task_map, wh_map = _bulk_prefetch(assignments, db)
-    return [_build_assignment(a, db, user_map, task_map, wh_map) for a in assignments]
+    results = []
+    for a in assignments:
+        # Bug 4: skip assignments whose linked task was deleted (custom_task_id
+        # still set but task no longer exists — orphaned rows from task deletion).
+        if a.custom_task_id and a.custom_task_id not in task_map:
+            continue
+        results.append(_build_assignment(a, db, user_map, task_map, wh_map))
+    return results
 
 @router.get("/my")
 def my_assignments(

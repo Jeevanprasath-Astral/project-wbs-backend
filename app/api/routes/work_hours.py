@@ -60,13 +60,15 @@ def _actual_hours(w: WorkHours):
     return round(max((w.hours_spent or 0) - (w.buffer_hours or 0), 0), 2)
 
 def _recompute_report_hours(db: Session, report_id: int):
-    """Req 8 — recompute MilestoneReport.actual_hours = SUM(work_hours WHERE milestone_report_id = report_id)."""
-    total = db.query(func.sum(WorkHours.hours_spent)).filter(
+    """Req 8 — recompute MilestoneReport.actual_hours = SUM(net hours) for this report.
+    Net hours = hours_spent - buffer_hours (same formula used everywhere else in the app)."""
+    rows = db.query(WorkHours.hours_spent, WorkHours.buffer_hours).filter(
         WorkHours.milestone_report_id == report_id
-    ).scalar() or 0.0
+    ).all()
+    total = sum(max((r.hours_spent or 0.0) - (r.buffer_hours or 0.0), 0.0) for r in rows)
     rpt = db.query(MilestoneReport).filter_by(id=report_id).first()
     if rpt:
-        rpt.actual_hours = round(float(total), 2)
+        rpt.actual_hours = round(total, 2)
         db.commit()
 
 def _resolve_level_name(w: WorkHours, db: Session):

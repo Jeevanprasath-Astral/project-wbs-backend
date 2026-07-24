@@ -1251,17 +1251,26 @@ def delete_milestone(
     ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
     if not ms: raise HTTPException(404, "Milestone not found")
 
-    # Collect all task IDs under this milestone so we can NULL out work_hours FKs
-    task_ids = [t.id for t in ms.tasks]
+    # NULL out all WorkHours FK columns that reference rows under this milestone.
+    # This must happen BEFORE db.delete(ms) so PostgreSQL RESTRICT doesn't fire.
 
-    # Set NULL on WorkHours that reference this milestone or its tasks.
-    # Without this, PostgreSQL RESTRICT blocks the delete.
+    task_ids = [t.id for t in ms.tasks]
+    report_ids = [r.id for r in ms.reports]
+
+    # 1. milestone-level reference
     db.query(WorkHours).filter(WorkHours.custom_milestone_id == milestone_id).update(
         {WorkHours.custom_milestone_id: None}, synchronize_session=False
     )
+    # 2. task-level references
     if task_ids:
         db.query(WorkHours).filter(WorkHours.custom_task_id.in_(task_ids)).update(
             {WorkHours.custom_task_id: None}, synchronize_session=False
+        )
+    # 3. DA report references (milestone_report_id) — this was missing and caused
+    #    PostgreSQL RESTRICT to block deletion of milestones with logged DA hours.
+    if report_ids:
+        db.query(WorkHours).filter(WorkHours.milestone_report_id.in_(report_ids)).update(
+            {WorkHours.milestone_report_id: None}, synchronize_session=False
         )
 
     db.delete(ms); db.commit()

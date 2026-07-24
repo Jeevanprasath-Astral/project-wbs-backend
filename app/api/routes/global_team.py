@@ -5,7 +5,8 @@ from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.models import (User, ProjectMember, Project, TaskAssignment, Team,
                                CustomRole, AssignmentCategory, WorkHours, AuditLog,
-                               Notification, LeaveRequest, Permission, PasswordResetToken)
+                               Notification, LeaveRequest, Permission, PasswordResetToken,
+                               ReportTemplate, Attachment, FinancialAuditLog)
 from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager
 from app.core.security import hash_password
@@ -388,7 +389,23 @@ def remove_user_permanently(
     # 8. Delete password reset tokens (keyed by email, not user_id)
     db.query(PasswordResetToken).filter_by(email=user_email).delete(synchronize_session=False)
 
-    # 9. Delete the user record
+    # 9. NULL out nullable FK columns in other tables that reference this user.
+    #    These columns are nullable so we SET NULL rather than delete the rows
+    #    (preserving historical project/billing/attachment records).
+    db.query(Project).filter(Project.created_by == user_id).update(
+        {Project.created_by: None}, synchronize_session=False
+    )
+    db.query(ReportTemplate).filter(ReportTemplate.created_by == user_id).update(
+        {ReportTemplate.created_by: None}, synchronize_session=False
+    )
+    db.query(Attachment).filter(Attachment.uploaded_by == user_id).update(
+        {Attachment.uploaded_by: None}, synchronize_session=False
+    )
+    db.query(FinancialAuditLog).filter(FinancialAuditLog.changed_by == user_id).update(
+        {FinancialAuditLog.changed_by: None}, synchronize_session=False
+    )
+
+    # 10. Delete the user record
     db.delete(u)
 
     log_action(
