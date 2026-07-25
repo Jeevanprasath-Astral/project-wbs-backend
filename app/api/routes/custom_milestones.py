@@ -2231,7 +2231,8 @@ def send_milestone_mailbox(
     note_html = f"<p><strong>Note from {current_user.name}:</strong> {payload.note}</p><hr/>" if payload.note else ""
     tasks = db.query(CustomTask).filter_by(milestone_id=ms.id).order_by(CustomTask.num).all()
     task_rows = "".join(
-        f"<tr><td style='padding:4px 8px;border:1px solid #e2e8f0'>T{t.num:02d}</td>"
+        f"<tr><td style='padding:4px 8px;border:1px solid #e2e8f0'>"
+        f"{'T{:02d}'.format(t.num) if t.num is not None else '—'}</td>"
         f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{t.name or ''}</td>"
         f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{t.assignee or '—'}</td>"
         f"<td style='padding:4px 8px;border:1px solid #e2e8f0'>{t.status or ''}</td></tr>"
