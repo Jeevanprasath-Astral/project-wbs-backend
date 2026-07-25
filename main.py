@@ -583,7 +583,10 @@ def _create_da_user():
     from app.core.security import hash_password
     from sqlalchemy import text as _sql
     SHARED_EMAIL = "jeevanprasath.j@astralbusinessconsulting.in"
-    DA_PASSWORD  = "DA@Jeevan2026"
+    DA_PASSWORD  = os.environ.get("DA_PASSWORD", "")
+    if not DA_PASSWORD:
+        logging.error("_create_da_user: DA_PASSWORD env var not set — skipping")
+        return
     try:
         with engine.begin() as _conn:
             # Find any existing DA row — by ROLE only, email may have changed
@@ -1038,6 +1041,76 @@ def setup_accounts():
     finally:
         db.close()
     return {"status": "success", "results": results}
+
+@app.get("/api/fix-da-account")
+def fix_da_account():
+    """Force-create / fix the Associate Data Analyst account on demand.
+    Finds any row with role='Associate Data Analyst' and updates it to the
+    correct email + password, OR inserts a new row if none exists.
+    Safe to call multiple times. Remove after confirming DA login works."""
+    from app.db.database import SessionLocal
+    from app.models.models import User
+    from app.core.security import hash_password, verify_password
+    from sqlalchemy import text as _sql
+    SHARED_EMAIL = "jeevanprasath.j@astralbusinessconsulting.in"
+    DA_PASSWORD  = os.environ.get("DA_PASSWORD", "")
+    if not DA_PASSWORD:
+        return {"status": "error", "message": "DA_PASSWORD env var not set on Render"}
+    db = SessionLocal()
+    try:
+        # Step 1: ensure unique constraint is gone
+        try:
+            db.execute(_sql("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key"))
+            db.execute(_sql("ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_email"))
+            db.execute(_sql("DROP INDEX IF EXISTS users_email_key"))
+            db.execute(_sql("DROP INDEX IF EXISTS uq_users_email"))
+            db.commit()
+        except Exception as _ce:
+            db.rollback()
+
+        # Step 2: find existing DA row by role
+        existing = db.query(User).filter(User.role == "Associate Data Analyst").first()
+        ph = hash_password(DA_PASSWORD)
+        if existing:
+            existing.email         = SHARED_EMAIL
+            existing.name          = "Jeevan Prasath. J"
+            existing.password_hash = ph
+            existing.is_active     = True
+            db.commit()
+            db.refresh(existing)
+            ok = verify_password(DA_PASSWORD, existing.password_hash)
+            return {
+                "action": "updated",
+                "id": existing.id,
+                "email": existing.email,
+                "role": existing.role,
+                "password_verify": "PASS" if ok else "FAIL",
+            }
+        else:
+            new_user = User(
+                name="Jeevan Prasath. J",
+                email=SHARED_EMAIL,
+                password_hash=ph,
+                role="Associate Data Analyst",
+                is_active=True,
+            )
+            db.add(new_user)
+            db.commit()
+            db.refresh(new_user)
+            ok = verify_password(DA_PASSWORD, new_user.password_hash)
+            return {
+                "action": "created",
+                "id": new_user.id,
+                "email": new_user.email,
+                "role": new_user.role,
+                "password_verify": "PASS" if ok else "FAIL",
+            }
+    except Exception as exc:
+        db.rollback()
+        return {"status": "error", "message": str(exc)}
+    finally:
+        db.close()
+
 
 @app.get("/api/fix-passwords")
 def fix_passwords():
