@@ -6,7 +6,7 @@ from app.models.models import (ProjectMilestone, SubtaskStatus, Notification, Pr
                                 User, CustomMilestone, CustomTask, CustomSubtask, Activity,
                                 WorkHours, LeaveRequest, Permission, Holiday)
 from app.services.notification_service import create_notification
-from app.services.email_service import email_overdue, email_due_reminder, send_email
+from app.services.email_service import send_email
 from datetime import datetime, timedelta, date as date_type
 import logging
 import os
@@ -198,6 +198,72 @@ def check_overdue_and_reminders():
             create_notification(
                 db, ct.project_id, "reminder",
                 f"Task '{ct.name}' is due in {days_left} day(s).",
+                user_id=user.id if user else None,
+                email_to=user.email if user else None,
+                send_now=bool(user and user.email),
+                email_subject=email_subject,
+                email_body=email_body,
+            )
+
+        # Due-soon reminders for CustomSubtask (2 days before deadline)
+        upcoming_subtasks = db.query(CustomSubtask).filter(
+            CustomSubtask.planned_end > now,
+            CustomSubtask.planned_end <= reminder_threshold,
+            CustomSubtask.status.notin_(["Completed", "Overdue"]),
+        ).all()
+        for cs in upcoming_subtasks:
+            days_left = (cs.planned_end - now).days
+            user = _resolve_user_by_name(db, cs.assignee)
+            project = db.query(Project).filter_by(id=cs.project_id).first()
+            project_name = project.name if project else "—"
+            due_str = cs.planned_end.strftime("%Y-%m-%d") if cs.planned_end else "—"
+            email_subject = f"[{project_name}] Reminder — Subtask due in {days_left} day(s)"
+            email_body = f"""
+            <p>Hi {user.name if user else (cs.assignee or 'Team')},</p>
+            <p>This is a reminder that the following subtask is due soon:</p>
+            <p><strong>Project:</strong> {project_name}</p>
+            <p><strong>Subtask:</strong> {cs.name}</p>
+            <p><strong>Due Date:</strong> {due_str}</p>
+            <p><strong>Days Remaining:</strong> {days_left}</p>
+            <p>Please ensure timely completion.</p>
+            <p>Regards,<br>Project WBS System</p>
+            """
+            create_notification(
+                db, cs.project_id, "reminder",
+                f"Subtask '{cs.name}' is due in {days_left} day(s).",
+                user_id=user.id if user else None,
+                email_to=user.email if user else None,
+                send_now=bool(user and user.email),
+                email_subject=email_subject,
+                email_body=email_body,
+            )
+
+        # Due-soon reminders for Activity (2 days before deadline)
+        upcoming_activities = db.query(Activity).filter(
+            Activity.planned_end > now,
+            Activity.planned_end <= reminder_threshold,
+            Activity.status.notin_(["Completed", "Overdue"]),
+        ).all()
+        for act in upcoming_activities:
+            days_left = (act.planned_end - now).days
+            user = _resolve_user_by_name(db, act.assignee)
+            project = db.query(Project).filter_by(id=act.project_id).first()
+            project_name = project.name if project else "—"
+            due_str = act.planned_end.strftime("%Y-%m-%d") if act.planned_end else "—"
+            email_subject = f"[{project_name}] Reminder — Activity due in {days_left} day(s)"
+            email_body = f"""
+            <p>Hi {user.name if user else (act.assignee or 'Team')},</p>
+            <p>This is a reminder that the following activity is due soon:</p>
+            <p><strong>Project:</strong> {project_name}</p>
+            <p><strong>Activity:</strong> {act.name}</p>
+            <p><strong>Due Date:</strong> {due_str}</p>
+            <p><strong>Days Remaining:</strong> {days_left}</p>
+            <p>Please ensure timely completion.</p>
+            <p>Regards,<br>Project WBS System</p>
+            """
+            create_notification(
+                db, act.project_id, "reminder",
+                f"Activity '{act.name}' is due in {days_left} day(s).",
                 user_id=user.id if user else None,
                 email_to=user.email if user else None,
                 send_now=bool(user and user.email),

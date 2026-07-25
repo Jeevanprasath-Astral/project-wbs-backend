@@ -1231,6 +1231,26 @@ def update_milestone(
                               "schedule_variance_reason"])
     if ms.status == "Completed" and old_status != "Completed" and not ms.actual_end:
         ms.actual_end = datetime.utcnow()
+        # Send milestone completion email to assignee
+        _ms_user = _resolve_user_by_name(db, ms.assignee) if ms.assignee else None
+        _project = db.query(Project).filter_by(id=project_id).first()
+        _proj_name = _project.name if _project else "—"
+        _completed_str = ms.actual_end.strftime("%Y-%m-%d")
+        create_notification(
+            db, project_id, "milestone_complete",
+            f"Milestone '{ms.name}' has been completed in project '{_proj_name}'.",
+            user_id=_ms_user.id if _ms_user else None,
+            email_to=_ms_user.email if _ms_user else None,
+            send_now=bool(_ms_user and _ms_user.email),
+            email_subject=f"[COMPLETED] Milestone — {ms.name} | {_proj_name}",
+            email_body=f"""
+    <p>Dear Team,</p>
+    <p>Milestone <strong>{ms.name}</strong> has been successfully completed in <strong>{_proj_name}</strong>.</p>
+    <p><strong>Completion Date:</strong> {_completed_str}</p>
+    <p>Great work! Please proceed to the next milestone.</p>
+    <p>Regards,<br>Project WBS System</p>
+    """,
+        )
     db.flush()
     if ms.assignee and ms.assignee != old_assignee:
         _notify_assignee(db, project_id, "Milestone", ms.name, ms.assignee, ms.planned_end)

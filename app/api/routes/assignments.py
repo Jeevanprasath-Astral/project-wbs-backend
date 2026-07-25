@@ -9,7 +9,6 @@ from app.core.deps import get_current_user
 from app.core.permissions import is_elevated, can_view_elevated
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
-from app.services.email_service import email_task_assigned
 
 router = APIRouter(prefix="/projects/{project_id}/assignments", tags=["Assignments"])
 
