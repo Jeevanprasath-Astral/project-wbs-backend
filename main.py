@@ -367,7 +367,11 @@ def _run_lightweight_migrations():
         # belong to two user rows with different roles (e.g. Admin + DA).
         # Login differentiates them by password. Other emails remain unique in
         # practice — only Jeevan's account intentionally has two rows.
+        # Try all possible auto-generated names PostgreSQL might use.
         "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key",
+        "ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_email",
+        "DROP INDEX IF EXISTS users_email_key",
+        "DROP INDEX IF EXISTS uq_users_email",
     ]
     for stmt in statements:
         try:
@@ -569,35 +573,45 @@ _update_user_accounts()
 
 
 def _create_da_user():
-    """Ensure the Associate Data Analyst account exists using the SAME work
-    email as Admin but a different password and role.
-    The unique constraint on users.email is dropped by the migration above, so
-    two rows sharing the same email is now allowed.
-    Login differentiates them purely by password.
-    Idempotent: skips insert if a DA row already exists for this email."""
+    """Ensure the Associate Data Analyst account is correct.
+    Strategy:
+      - If a row with role='Associate Data Analyst' already exists (any email),
+        UPDATE it to the correct email + password. This handles old Gmail rows.
+      - If no DA row exists at all, INSERT a new one.
+    The unique constraint on users.email is dropped by the migration above.
+    Idempotent and safe to run on every startup."""
     from app.core.security import hash_password
     from sqlalchemy import text as _sql
     SHARED_EMAIL = "jeevanprasath.j@astralbusinessconsulting.in"
     DA_PASSWORD  = "DA@Jeevan2026"
     try:
         with engine.begin() as _conn:
-            # Check if DA row already exists (role = 'Associate Data Analyst')
-            exists = _conn.execute(_sql(
-                "SELECT id FROM users WHERE email = :e AND role = :r"
-            ), {"e": SHARED_EMAIL, "r": "Associate Data Analyst"}).fetchone()
-            if exists:
-                logging.info("_create_da_user: DA account already exists — skipping")
-                return
-            _conn.execute(_sql(
-                """INSERT INTO users (name, email, password_hash, role, is_active)
-                   VALUES (:name, :email, :ph, :role, true)"""
-            ), {
-                "name": "Jeevan Prasath. J",
-                "email": SHARED_EMAIL,
-                "ph":   hash_password(DA_PASSWORD),
-                "role": "Associate Data Analyst",
-            })
-            logging.info(f"_create_da_user: created DA account for {SHARED_EMAIL!r}")
+            # Find any existing DA row — by ROLE only, email may have changed
+            existing = _conn.execute(_sql(
+                "SELECT id FROM users WHERE role = :r LIMIT 1"
+            ), {"r": "Associate Data Analyst"}).fetchone()
+
+            if existing:
+                # Correct email + password in-place (handles Gmail→work-email migration)
+                _conn.execute(_sql(
+                    """UPDATE users
+                       SET email = :e, password_hash = :ph, name = :name, is_active = true
+                       WHERE role = :r"""
+                ), {"e": SHARED_EMAIL, "ph": hash_password(DA_PASSWORD),
+                    "name": "Jeevan Prasath. J", "r": "Associate Data Analyst"})
+                logging.info(f"_create_da_user: updated DA account → {SHARED_EMAIL!r}")
+            else:
+                # No DA row at all — insert fresh
+                _conn.execute(_sql(
+                    """INSERT INTO users (name, email, password_hash, role, is_active)
+                       VALUES (:name, :email, :ph, :role, true)"""
+                ), {
+                    "name": "Jeevan Prasath. J",
+                    "email": SHARED_EMAIL,
+                    "ph":   hash_password(DA_PASSWORD),
+                    "role": "Associate Data Analyst",
+                })
+                logging.info(f"_create_da_user: created DA account for {SHARED_EMAIL!r}")
     except Exception as _ex:
         logging.error(f"_create_da_user FAIL: {_ex}")
 
