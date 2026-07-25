@@ -363,11 +363,10 @@ def _run_lightweight_migrations():
         """,
 
         # ── Allow duplicate emails for multi-role accounts ────────────────────
-        # Drops the UNIQUE constraint on users.email so one email address can
+        # Drops the UNIQUE index on users.email so one email address can
         # belong to two user rows with different roles (e.g. Admin + DA).
-        # Login differentiates them by password. Other emails remain unique in
-        # practice — only Jeevan's account intentionally has two rows.
-        # Try all possible auto-generated names PostgreSQL might use.
+        # The actual index name in this DB is ix_users_email.
+        "DROP INDEX IF EXISTS ix_users_email",
         "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key",
         "ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_email",
         "DROP INDEX IF EXISTS users_email_key",
@@ -1058,8 +1057,9 @@ def fix_da_account():
         return {"status": "error", "message": "DA_PASSWORD env var not set on Render"}
     db = SessionLocal()
     try:
-        # Step 1: ensure unique constraint is gone
+        # Step 1: ensure unique index is gone (actual name in this DB: ix_users_email)
         try:
+            db.execute(_sql("DROP INDEX IF EXISTS ix_users_email"))
             db.execute(_sql("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key"))
             db.execute(_sql("ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_email"))
             db.execute(_sql("DROP INDEX IF EXISTS users_email_key"))
