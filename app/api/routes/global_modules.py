@@ -11,7 +11,7 @@ from app.models.models import (TaskAssignment, ProjectMilestone, Project,
                                 Milestone, CustomTask, CustomSubtask, Activity,
                                 CustomMilestone, AuditLog)
 from app.core.deps import get_current_user
-from app.core.permissions import is_elevated
+from app.core.permissions import is_elevated, can_view_elevated
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
 import io
@@ -93,9 +93,9 @@ def global_assignments(
 ):
     q = db.query(TaskAssignment)
 
-    # Admin/FC Lead/TC Lead see everything; Functional Consultant kept for
+    # Elevated roles + DA see everything; Functional Consultant kept for
     # backward compatibility; everyone else only their own.
-    if not is_elevated(current_user) and current_user.role != "Functional Consultant":
+    if not can_view_elevated(current_user) and current_user.role != "Functional Consultant":
         q = q.filter_by(assigned_to=current_user.id)
 
     if project_id:
@@ -746,8 +746,8 @@ def global_audit_log(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not is_elevated(current_user):
-        raise HTTPException(403, "Only elevated roles can view the audit log")
+    if not can_view_elevated(current_user):
+        raise HTTPException(403, "Only elevated roles or Associate Data Analyst can view the audit log")
 
     q = db.query(AuditLog)
     if project_id:
@@ -832,8 +832,8 @@ def global_audit_log_export(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not is_elevated(current_user):
-        raise HTTPException(403, "Only elevated roles can export the audit log")
+    if not can_view_elevated(current_user):
+        raise HTTPException(403, "Only elevated roles or Associate Data Analyst can export the audit log")
 
     q = db.query(AuditLog)
     if project_id:

@@ -361,6 +361,13 @@ def _run_lightweight_migrations():
           AND mr.project_id = pr.project_id
           AND mr.report_number = pr.report_number
         """,
+
+        # ── Allow duplicate emails for multi-role accounts ────────────────────
+        # Drops the UNIQUE constraint on users.email so one email address can
+        # belong to two user rows with different roles (e.g. Admin + DA).
+        # Login differentiates them by password. Other emails remain unique in
+        # practice — only Jeevan's account intentionally has two rows.
+        "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key",
     ]
     for stmt in statements:
         try:
@@ -559,6 +566,43 @@ def _update_user_accounts():
             logging.error(f"_update_user_accounts FAIL {old_email!r}: {_ex}")
 
 _update_user_accounts()
+
+
+def _create_da_user():
+    """Ensure the Associate Data Analyst account exists using the SAME work
+    email as Admin but a different password and role.
+    The unique constraint on users.email is dropped by the migration above, so
+    two rows sharing the same email is now allowed.
+    Login differentiates them purely by password.
+    Idempotent: skips insert if a DA row already exists for this email."""
+    from app.core.security import hash_password
+    from sqlalchemy import text as _sql
+    SHARED_EMAIL = "jeevanprasath.j@astralbusinessconsulting.in"
+    DA_PASSWORD  = "DA@Jeevan2026"
+    try:
+        with engine.begin() as _conn:
+            # Check if DA row already exists (role = 'Associate Data Analyst')
+            exists = _conn.execute(_sql(
+                "SELECT id FROM users WHERE email = :e AND role = :r"
+            ), {"e": SHARED_EMAIL, "r": "Associate Data Analyst"}).fetchone()
+            if exists:
+                logging.info("_create_da_user: DA account already exists — skipping")
+                return
+            _conn.execute(_sql(
+                """INSERT INTO users (name, email, password_hash, role, is_active)
+                   VALUES (:name, :email, :ph, :role, true)"""
+            ), {
+                "name": "Jeevan Prasath. J",
+                "email": SHARED_EMAIL,
+                "ph":   hash_password(DA_PASSWORD),
+                "role": "Associate Data Analyst",
+            })
+            logging.info(f"_create_da_user: created DA account for {SHARED_EMAIL!r}")
+    except Exception as _ex:
+        logging.error(f"_create_da_user FAIL: {_ex}")
+
+_create_da_user()
+
 
 app = FastAPI(title=settings.APP_NAME, description="Project WBS API", version="2.0.0")
 

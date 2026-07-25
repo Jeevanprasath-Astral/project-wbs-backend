@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.models import ProjectCost, Project, User
 from app.core.deps import get_current_user
-from app.core.permissions import is_elevated
+from app.core.permissions import can_manage_cost
 from app.utils.cloudinary_helper import upload_file, delete_file, build_url
 
 router = APIRouter(prefix="/projects/{project_id}/costs", tags=["Cost Management"])
@@ -23,8 +23,8 @@ COST_CATEGORIES = [
 
 
 def _require_admin(current_user: User):
-    if not is_elevated(current_user):
-        raise HTTPException(status_code=403, detail="Admin or Lead access required for Cost Management changes")
+    if not can_manage_cost(current_user):
+        raise HTTPException(status_code=403, detail="Admin, Lead, or Associate Data Analyst access required for Cost Management")
 
 
 def _serialize(c: ProjectCost) -> dict:

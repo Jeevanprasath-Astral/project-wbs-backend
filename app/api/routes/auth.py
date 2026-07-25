@@ -15,8 +15,10 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 @router.post("/login", response_model=TokenResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
-    if not user or not verify_password(payload.password, user.password_hash):
+    # Fetch ALL rows with this email (supports dual-role accounts sharing one email)
+    users = db.query(User).filter(User.email == payload.email).all()
+    user = next((u for u in users if verify_password(payload.password, u.password_hash)), None)
+    if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     token = create_access_token({"sub": str(user.id), "role": user.role})
     return {"token": token, "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role}}

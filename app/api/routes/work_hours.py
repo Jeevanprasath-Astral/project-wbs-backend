@@ -9,7 +9,7 @@ from app.models.models import (WorkHours, User, Project, TaskAssignment, Team,
                                 CustomMilestone, CustomTask, CustomSubtask, Activity,
                                 MilestoneReport)
 from app.core.deps import get_current_user
-from app.core.permissions import is_elevated
+from app.core.permissions import is_elevated, can_view_elevated
 
 router = APIRouter(prefix="/work-hours", tags=["Work Hours"])
 
@@ -138,7 +138,7 @@ def list_work_hours(
     current_user: User = Depends(get_current_user)
 ):
     q = db.query(WorkHours)
-    if not is_elevated(current_user) and current_user.role != "Functional Consultant":
+    if not can_view_elevated(current_user) and current_user.role != "Functional Consultant":
         q = q.filter(WorkHours.user_id == current_user.id)
     if project_id: q = q.filter(WorkHours.project_id == project_id)
     if user_id:    q = q.filter(WorkHours.user_id == user_id)
@@ -371,7 +371,7 @@ def log_hours(
     # regardless of what's in the payload.
     target_user_id = current_user.id
     if payload.user_id and payload.user_id != current_user.id:
-        if is_elevated(current_user) or current_user.role == "Functional Consultant":
+        if can_view_elevated(current_user) or current_user.role == "Functional Consultant":
             target_user_id = payload.user_id
         else:
             raise HTTPException(403, "You can only log hours for yourself")

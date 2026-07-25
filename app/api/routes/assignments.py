@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from app.db.database import get_db
 from app.models.models import TaskAssignment, User, ProjectMember, Notification, Project, CustomTask, WorkHours
 from app.core.deps import get_current_user
-from app.core.permissions import is_elevated
+from app.core.permissions import is_elevated, can_view_elevated
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
 from app.services.email_service import email_task_assigned
@@ -175,8 +175,8 @@ def list_assignments(
     current_user: User = Depends(get_current_user)
 ):
     q = db.query(TaskAssignment).filter_by(project_id=project_id)
-    # Admin/FC Lead/TC Lead see everything; everyone else only their own.
-    if not is_elevated(current_user):
+    # Elevated roles + DA see everything; everyone else only their own.
+    if not can_view_elevated(current_user):
         q = q.filter_by(assigned_to=current_user.id)
     if team:
         q = q.filter_by(team=team)
