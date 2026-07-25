@@ -63,8 +63,16 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             db.commit()
             # Build reset link using FRONTEND_URL from config
             reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
-            send_password_reset_email(to=user.email, name=user.name, reset_link=reset_link)
-            _log.info(f"Password reset email dispatched to {user.email}")
+            sent = send_password_reset_email(to=user.email, name=user.name, reset_link=reset_link)
+            if sent:
+                _log.info(f"Password reset email dispatched to {user.email}")
+            else:
+                _log.error(
+                    f"Password reset email FAILED for {user.email}. "
+                    f"Check BREVO_API_KEY env var and that sender {settings.MAIL_FROM} is "
+                    f"verified in your Brevo account. "
+                    f"FRONTEND_URL={settings.FRONTEND_URL}"
+                )
         else:
             _log.info(f"Forgot-password: email not found in DB: {payload.email}")
     except Exception as _exc:

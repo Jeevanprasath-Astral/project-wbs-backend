@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000
     DEBUG: bool = True
-    FRONTEND_URL: str = "http://localhost:5173"
+    FRONTEND_URL: str = "https://axon-wbs.netlify.app"
     MAIL_USERNAME: str = "contact@connectome.co.in"
     MAIL_PASSWORD: str = ""          # Set MAIL_PASSWORD env var on Render
     MAIL_FROM: str = "contact@connectome.co.in"

@@ -2219,10 +2219,14 @@ def send_milestone_mailbox(
 ):
     ms = db.query(CustomMilestone).filter_by(id=milestone_id, project_id=project_id).first()
     if not ms: raise HTTPException(404, "Milestone not found")
-    if not payload.to: raise HTTPException(400, "At least one recipient required")
+    clean_to = [e.strip() for e in payload.to if e and e.strip()]
+    if not clean_to: raise HTTPException(400, "At least one valid recipient email is required")
     project = db.query(Project).filter_by(id=project_id).first()
     project_name = project.name if project else "—"
-    excel_b64 = _b64.b64encode(_generate_milestone_excel(db, ms)).decode("utf-8")
+    try:
+        excel_b64 = _b64.b64encode(_generate_milestone_excel(db, ms)).decode("utf-8")
+    except Exception as _xl_err:
+        raise HTTPException(500, f"Failed to generate Excel report: {_xl_err}")
     file_name = f"Milestone_M{ms.num:02d}_{(ms.name or 'details').replace(' ','_')}.xlsx"
     note_html = f"<p><strong>Note from {current_user.name}:</strong> {payload.note}</p><hr/>" if payload.note else ""
     tasks = db.query(CustomTask).filter_by(milestone_id=ms.id).order_by(CustomTask.num).all()
@@ -2267,12 +2271,13 @@ def send_milestone_mailbox(
     """
     subject = f"Milestone M{ms.num:02d} — {ms.name or ''} | {project_name}"
     ok = send_mailbox_email(
-        to_list=payload.to,
+        to_list=clean_to,
         subject=subject,
         body=body,
         attachment_b64=excel_b64,
         attachment_name=file_name,
     )
     if not ok:
-        raise HTTPException(500, "Email send failed — check BREVO_API_KEY and MAIL_ENABLED env vars")
-    return {"sent": len(payload.to), "subject": subject}
+        raise HTTPException(500, "Email send failed — verify BREVO_API_KEY is set in Render env vars "
+                                 "and that your sender email is approved in your Brevo account")
+    return {"sent": len(clean_to), "subject": subject}

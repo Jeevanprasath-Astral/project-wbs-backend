@@ -13,6 +13,10 @@ def send_email(to: str, subject: str, body: str) -> bool:
     if not settings.BREVO_API_KEY:
         logger.error("BREVO_API_KEY is not set — email not sent")
         return False
+    to = to.strip() if to else to
+    if not to:
+        logger.error("send_email: recipient email is empty — email not sent")
+        return False
     try:
         payload = _json.dumps({
             "sender": {"name": "Axon WBS", "email": settings.MAIL_FROM},
@@ -136,10 +140,14 @@ def send_mailbox_email(
     if not settings.BREVO_API_KEY:
         logger.error("BREVO_API_KEY is not set — mailbox email not sent")
         return False
+    clean_recipients = [e.strip() for e in to_list if e and e.strip()]
+    if not clean_recipients:
+        logger.error("send_mailbox_email: no valid recipients after stripping whitespace — email not sent")
+        return False
     try:
         payload = _json.dumps({
             "sender": {"name": "Axon WBS", "email": settings.MAIL_FROM},
-            "to": [{"email": e} for e in to_list if e],
+            "to": [{"email": e} for e in clean_recipients],
             "subject": subject,
             "htmlContent": body,
             "attachment": [{"content": attachment_b64, "name": attachment_name}]
