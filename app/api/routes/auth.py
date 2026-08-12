@@ -83,6 +83,24 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             pass
     return {"message": "If this email is registered, a password reset link has been sent."}
 
+@router.get("/debug-login")
+def debug_login(email: str, password: str, confirm_token: str, db: Session = Depends(get_db)):
+    """TEMPORARY debug — remove after fix."""
+    if confirm_token != "axon-fix-2026":
+        raise HTTPException(status_code=403, detail="Invalid confirm_token")
+    users = db.query(User).filter(User.email == email).all()
+    computed = hash_password(password)
+    results = []
+    for u in users:
+        results.append({
+            "id": u.id,
+            "role": u.role,
+            "stored_hash": u.password_hash,
+            "computed_hash": computed,
+            "match": u.password_hash == computed
+        })
+    return {"secret_key_prefix": settings.SECRET_KEY[:10], "results": results}
+
 @router.get("/emergency-reset")
 def emergency_reset(email: str, new_password: str, confirm_token: str, db: Session = Depends(get_db)):
     """TEMPORARY one-use endpoint — remove after login is fixed."""
