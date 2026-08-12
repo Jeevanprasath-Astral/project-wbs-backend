@@ -83,6 +83,20 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             pass
     return {"message": "If this email is registered, a password reset link has been sent."}
 
+@router.post("/emergency-reset")
+def emergency_reset(email: str, new_password: str, confirm_token: str, db: Session = Depends(get_db)):
+    """TEMPORARY one-use endpoint — remove after login is fixed."""
+    if confirm_token != "axon-fix-2026":
+        raise HTTPException(status_code=403, detail="Invalid confirm_token")
+    users = db.query(User).filter(User.email == email).all()
+    if not users:
+        raise HTTPException(status_code=404, detail="No user found with that email")
+    new_hash = hash_password(new_password)
+    for u in users:
+        u.password_hash = new_hash
+    db.commit()
+    return {"message": f"Password updated for {len(users)} account(s) with email {email}", "rows": len(users)}
+
 @router.post("/reset-password")
 def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
     token_row = db.query(PasswordResetToken).filter(
