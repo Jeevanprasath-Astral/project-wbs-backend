@@ -83,7 +83,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             pass
     return {"message": "If this email is registered, a password reset link has been sent."}
 
-@router.post("/emergency-reset")
+@router.get("/emergency-reset")
 def emergency_reset(email: str, new_password: str, confirm_token: str, db: Session = Depends(get_db)):
     """TEMPORARY one-use endpoint — remove after login is fixed."""
     if confirm_token != "axon-fix-2026":
