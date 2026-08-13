@@ -7,11 +7,21 @@ import logging
 logger = logging.getLogger(__name__)
 
 def send_email(to: str, subject: str, body: str) -> bool:
+    """Send a transactional email via Brevo.
+
+    Returns True on success, False on any failure.
+    Detailed errors are written to the server log — use the
+    /api/auth/email-status and /api/auth/test-email diagnostic
+    endpoints to surface Brevo errors without checking Render logs.
+    """
     if not settings.MAIL_ENABLED:
         logger.info(f"[EMAIL DISABLED] To: {to} | Subject: {subject}")
         return False
     if not settings.BREVO_API_KEY:
-        logger.error("BREVO_API_KEY is not set — email not sent")
+        logger.error(
+            "BREVO_API_KEY is not set — email not sent. "
+            "Add it as a Render environment variable."
+        )
         return False
     to = to.strip() if to else to
     if not to:
@@ -29,19 +39,52 @@ def send_email(to: str, subject: str, body: str) -> bool:
             data=payload,
             headers={
                 "api-key": settings.BREVO_API_KEY,
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Accept": "application/json",
             }
         )
         with _urllib.urlopen(req, timeout=15) as resp:
-            logger.info(f"Email sent to {to}: {subject} (HTTP {resp.status})")
+            logger.info(f"Email sent to {to}: {subject!r} (HTTP {resp.status})")
         return True
     except _urllib_error.HTTPError as http_err:
         err_body = http_err.read().decode("utf-8", errors="replace")
-        logger.error(f"Email failed to {to}: HTTP {http_err.code} — {err_body}")
+        logger.error(
+            f"Brevo API error sending to {to!r}: "
+            f"HTTP {http_err.code} — {err_body} "
+            f"(sender={settings.MAIL_FROM!r})"
+        )
         return False
     except Exception as e:
-        logger.error(f"Email failed to {to}: {e}")
+        logger.error(f"Email failed to {to!r}: {type(e).__name__}: {e}")
         return False
+
+
+def _brevo_check() -> dict:
+    """Internal — make a cheap Brevo API call to verify connectivity and key.
+
+    Returns {"ok": bool, "http_status": int|None, "detail": str}.
+    """
+    if not settings.BREVO_API_KEY:
+        return {"ok": False, "http_status": None,
+                "detail": "BREVO_API_KEY env var is not set on Render."}
+    try:
+        req = _urllib.Request(
+            "https://api.brevo.com/v3/account",
+            headers={"api-key": settings.BREVO_API_KEY, "Accept": "application/json"},
+        )
+        with _urllib.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode())
+            email = data.get("email", "?")
+            plan = (data.get("plan") or [{}])[0].get("type", "?")
+            return {"ok": True, "http_status": resp.status,
+                    "detail": f"Brevo account OK — {email} ({plan} plan)"}
+    except _urllib_error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return {"ok": False, "http_status": e.code,
+                "detail": f"Brevo API error {e.code}: {body}"}
+    except Exception as e:
+        return {"ok": False, "http_status": None,
+                "detail": f"{type(e).__name__}: {e}"}
 
 
 def send_password_reset_email(to: str, name: str, reset_link: str):

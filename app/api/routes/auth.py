@@ -6,7 +6,7 @@ from app.schemas.schemas import (LoginRequest, TokenResponse, UserCreate, UserOu
                                   ForgotPasswordRequest, ResetPasswordRequest)
 from app.core.security import verify_password, hash_password, create_access_token
 from app.core.deps import get_current_user
-from app.services.email_service import send_password_reset_email
+from app.services.email_service import send_password_reset_email, send_email, _brevo_check
 from app.core.config import settings
 from datetime import datetime, timedelta
 import secrets
@@ -17,11 +17,24 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     # Fetch ALL rows with this email (supports dual-role accounts sharing one email)
     users = db.query(User).filter(User.email == payload.email).all()
-    user = next((u for u in users if verify_password(payload.password, u.password_hash)), None)
-    if not user:
+    matched_user = None
+    for u in users:
+        if verify_password(payload.password, u.password_hash):
+            matched_user = u
+            # Silently upgrade legacy HMAC hash to bcrypt on first successful login.
+            # This is the self-service migration path for all non-seeded accounts.
+            if not u.password_hash.startswith('$2'):
+                u.password_hash = hash_password(payload.password)
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            break
+    if not matched_user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    token = create_access_token({"sub": str(user.id), "role": user.role})
-    return {"token": token, "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role}}
+    token = create_access_token({"sub": str(matched_user.id), "role": matched_user.role})
+    return {"token": token, "user": {"id": matched_user.id, "name": matched_user.name,
+                                     "email": matched_user.email, "role": matched_user.role}}
 
 @router.post("/register", response_model=UserOut)
 def register(payload: UserCreate, db: Session = Depends(get_db),
@@ -67,11 +80,15 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             if sent:
                 _log.info(f"Password reset email dispatched to {user.email}")
             else:
+                brevo_check = _brevo_check()
                 _log.error(
-                    f"Password reset email FAILED for {user.email}. "
-                    f"Check BREVO_API_KEY env var and that sender {settings.MAIL_FROM} is "
-                    f"verified in your Brevo account. "
-                    f"FRONTEND_URL={settings.FRONTEND_URL}"
+                    f"Password reset email FAILED for {user.email!r}. "
+                    f"Brevo account check: {brevo_check}. "
+                    f"BREVO_API_KEY set: {bool(settings.BREVO_API_KEY)}. "
+                    f"MAIL_FROM: {settings.MAIL_FROM!r}. "
+                    f"MAIL_ENABLED: {settings.MAIL_ENABLED}. "
+                    f"Diagnostic: GET /api/auth/email-status?confirm_token=axon-fix-2026 "
+                    f"or GET /api/auth/test-email?to={user.email}&confirm_token=axon-fix-2026"
                 )
         else:
             _log.info(f"Forgot-password: email not found in DB: {payload.email}")
@@ -131,3 +148,57 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     db.delete(token_row)
     db.commit()
     return {"message": "Password updated successfully. You can now log in with your new password."}
+
+
+# ── Email diagnostics (admin/debug only — gated by confirm_token) ─────────────
+
+@router.get("/email-status")
+def email_status(confirm_token: str):
+    """Check Brevo configuration without sending anything.
+
+    Usage: GET /api/auth/email-status?confirm_token=axon-fix-2026
+    """
+    if confirm_token != "axon-fix-2026":
+        raise HTTPException(status_code=403, detail="Invalid confirm_token")
+    check = _brevo_check()
+    return {
+        "mail_enabled":    settings.MAIL_ENABLED,
+        "brevo_key_set":   bool(settings.BREVO_API_KEY),
+        "brevo_key_prefix": settings.BREVO_API_KEY[:12] + "…" if settings.BREVO_API_KEY else "(not set)",
+        "mail_from":       settings.MAIL_FROM,
+        "frontend_url":    settings.FRONTEND_URL,
+        "brevo_account":   check,
+    }
+
+
+@router.get("/test-email")
+def test_email(to: str, confirm_token: str):
+    """Send a real test email to verify Brevo is working end-to-end.
+
+    Usage: GET /api/auth/test-email?to=you@example.com&confirm_token=axon-fix-2026
+    """
+    if confirm_token != "axon-fix-2026":
+        raise HTTPException(status_code=403, detail="Invalid confirm_token")
+    sent = send_email(
+        to=to,
+        subject="Axon WBS — Email Test",
+        body=f"""
+        <div style="font-family:Arial,sans-serif;padding:24px;max-width:480px;">
+          <h2 style="color:#0f172a;">✅ Email is working!</h2>
+          <p>This is a test email sent from <strong>Axon WBS</strong>.</p>
+          <p>Sender: <code>{settings.MAIL_FROM}</code></p>
+          <p>If you received this, Brevo is configured correctly.</p>
+        </div>
+        """,
+    )
+    if sent:
+        return {"sent": True, "message": f"Test email dispatched to {to}. Check inbox (and spam folder)."}
+    brevo = _brevo_check()
+    return {
+        "sent": False,
+        "message": "Email failed to send. See details below.",
+        "brevo_account": brevo,
+        "mail_enabled":  settings.MAIL_ENABLED,
+        "brevo_key_set": bool(settings.BREVO_API_KEY),
+        "mail_from":     settings.MAIL_FROM,
+    }

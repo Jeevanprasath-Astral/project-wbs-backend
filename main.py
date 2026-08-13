@@ -645,22 +645,28 @@ def _update_user_accounts():
     for old_email, name, new_email, temp_pwd in accounts:
         try:
             with engine.begin() as _conn:
-                # Only update name+email. Password is only set if the row is
-                # being migrated from its OLD placeholder email — once the real
-                # email is already in place the password is left untouched so
-                # that a user-changed password survives redeploys.
-                already_migrated = _conn.execute(_sql(
-                    "SELECT id FROM users WHERE email = :new_email"
+                # Smart upgrade: if the stored hash is still HMAC (legacy), force it
+                # to bcrypt using the known temp_pwd. If it's already bcrypt, only
+                # sync the name so user-changed passwords survive redeploys.
+                row = _conn.execute(_sql(
+                    "SELECT id, password_hash FROM users WHERE email = :new_email"
                 ), {"new_email": new_email}).fetchone()
 
-                if already_migrated:
-                    # Row already has the real email — sync name AND password_hash.
-                    # Always re-hashing ensures the stored hash matches the current
-                    # hashing scheme (bcrypt) regardless of any prior SECRET_KEY changes.
-                    res = _conn.execute(_sql(
-                        "UPDATE users SET name = :name, password_hash = :ph WHERE email = :new_email"
-                    ), {"name": name, "new_email": new_email, "ph": hash_password(temp_pwd)})
-                    logging.info(f"_update_user_accounts SYNCED {new_email}")
+                if row:
+                    current_hash = row[1] or ""
+                    if current_hash.startswith('$2'):
+                        # Already a bcrypt hash — user may have changed their password.
+                        # Only sync name; do NOT overwrite their custom password.
+                        _conn.execute(_sql(
+                            "UPDATE users SET name = :name WHERE email = :new_email"
+                        ), {"name": name, "new_email": new_email})
+                        logging.info(f"_update_user_accounts NAME-ONLY {new_email} (bcrypt ok)")
+                    else:
+                        # Still a legacy HMAC hash (or blank) — force upgrade to bcrypt.
+                        _conn.execute(_sql(
+                            "UPDATE users SET name = :name, password_hash = :ph WHERE email = :new_email"
+                        ), {"name": name, "new_email": new_email, "ph": hash_password(temp_pwd)})
+                        logging.info(f"_update_user_accounts UPGRADED hash for {new_email}")
                 else:
                     # Still on old placeholder email — full migration with initial password.
                     res = _conn.execute(_sql(

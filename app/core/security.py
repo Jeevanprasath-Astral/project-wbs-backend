@@ -13,9 +13,25 @@ def hash_password(password: str) -> str:
     return _pwd_context.hash(password)
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify password using bcrypt constant-time comparison."""
+    """Verify password.
+
+    Supports two formats during the HMAC→bcrypt migration window:
+    - bcrypt ($2b$ / $2a$ prefix) — new hashes, no SECRET_KEY dependency.
+    - HMAC-SHA256 (64-char hex) — legacy hashes from before the switch.
+
+    Once all users have logged in at least once with the new code, the
+    HMAC branch below can be removed.
+    """
     try:
-        return _pwd_context.verify(plain, hashed)
+        if hashed.startswith('$2'):
+            # Modern bcrypt hash
+            return _pwd_context.verify(plain, hashed)
+        # Legacy HMAC-SHA256 fallback (64-char lowercase hex)
+        import hashlib
+        import hmac as _hmac
+        secret = settings.SECRET_KEY.encode('utf-8')
+        expected = _hmac.new(secret, plain.encode('utf-8'), hashlib.sha256).hexdigest()
+        return _hmac.compare_digest(expected, hashed)
     except Exception:
         return False
 
