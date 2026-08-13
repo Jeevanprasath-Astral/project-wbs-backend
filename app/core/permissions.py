@@ -31,7 +31,7 @@ swap conditions with a minimal diff.
 
 ELEVATED_ROLES         = {"Admin", "Project Manager", "FC Lead", "TC Lead"}
 DA_ROLES               = {"Associate Data Analyst"}
-PROJECT_CREATOR_ROLES  = {"Admin", "Project Manager"}
+PROJECT_CREATOR_ROLES  = {"Admin", "Project Manager", "FC Lead"}
 TEAM_MANAGER_ROLES     = {"Admin", "HR", "Project Manager"}
 TIMESHEET_MANAGER_ROLES = {"Admin", "HR", "Project Manager"}
 FINANCIAL_SETTINGS_ROLES = {"Admin", "HR", "Project Manager", "Associate Data Analyst"}
@@ -76,8 +76,7 @@ def can_manage_cost(user) -> bool:
 
 
 def can_create_project(user) -> bool:
-    """Only Admin and Project Manager may create new projects.
-    FC Lead / TC Lead are elevated but cannot create projects."""
+    """Admin, Project Manager, and FC Lead may create new projects."""
     return getattr(user, "role", None) in PROJECT_CREATOR_ROLES
 
 

@@ -13,7 +13,7 @@ from app.api.routes import (auth, projects, milestones, responses,
                              team_utilization_report, cost_breakdown_report,
                              billing_statement_report, hours_tracker,
                              report_templates, attachments, billing_reports,
-                             da_project_reports)
+                             da_project_reports, proposal_estimates)
 from fastapi.staticfiles import StaticFiles
 from app.services.scheduler import start_scheduler, stop_scheduler
 
@@ -371,6 +371,100 @@ def _run_lightweight_migrations():
         "ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_email",
         "DROP INDEX IF EXISTS users_email_key",
         "DROP INDEX IF EXISTS uq_users_email",
+
+        # ── Proposal Estimates ────────────────────────────────────────────────
+        """CREATE TABLE IF NOT EXISTS proposal_estimates (
+            id               SERIAL PRIMARY KEY,
+            client_name      VARCHAR(300) NOT NULL,
+            project_name     VARCHAR(300),
+            project_category VARCHAR(100),
+            status           VARCHAR(50) DEFAULT 'Draft',
+            version          INTEGER DEFAULT 1,
+            created_by       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            approved_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at       TIMESTAMPTZ DEFAULT now(),
+            updated_at       TIMESTAMPTZ,
+            submitted_at     TIMESTAMPTZ,
+            approved_at      TIMESTAMPTZ
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_proposal_estimates_created_by ON proposal_estimates(created_by)",
+        "CREATE INDEX IF NOT EXISTS ix_proposal_estimates_status     ON proposal_estimates(status)",
+
+        """CREATE TABLE IF NOT EXISTS proposal_sections (
+            id           SERIAL PRIMARY KEY,
+            proposal_id  INTEGER NOT NULL REFERENCES proposal_estimates(id) ON DELETE CASCADE,
+            section_type VARCHAR(100) NOT NULL,
+            content      TEXT,
+            updated_at   TIMESTAMPTZ
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_proposal_section ON proposal_sections(proposal_id, section_type)",
+
+        """CREATE TABLE IF NOT EXISTS proposal_reports (
+            id                    SERIAL PRIMARY KEY,
+            proposal_id           INTEGER NOT NULL REFERENCES proposal_estimates(id) ON DELETE CASCADE,
+            sl_no                 INTEGER NOT NULL,
+            report_name           VARCHAR(300) NOT NULL,
+            frequency             VARCHAR(100),
+            output_automated      BOOLEAN DEFAULT FALSE,
+            output_methods        TEXT,
+            rough_input           TEXT,
+            input_form            TEXT,
+            input_gen_automated   BOOLEAN DEFAULT FALSE,
+            data_validated        BOOLEAN DEFAULT FALSE,
+            validation_complexity TEXT,
+            created_at            TIMESTAMPTZ DEFAULT now()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_proposal_reports_proposal_id ON proposal_reports(proposal_id)",
+
+        # ── Phase 2: estimation_mode on proposal_estimates ────────────────────
+        "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS estimation_mode VARCHAR(10) DEFAULT 'hours'",
+
+        # ── Phase 2: estimation rows ──────────────────────────────────────────
+        """CREATE TABLE IF NOT EXISTS proposal_estimation_rows (
+            id               SERIAL PRIMARY KEY,
+            proposal_id      INTEGER NOT NULL REFERENCES proposal_estimates(id) ON DELETE CASCADE,
+            sl_no            INTEGER NOT NULL,
+            description      VARCHAR(500) NOT NULL,
+            role_description VARCHAR(200),
+            quantity         FLOAT DEFAULT 0,
+            cost_rate        FLOAT DEFAULT 0,
+            total_cost       FLOAT DEFAULT 0,
+            created_at       TIMESTAMPTZ DEFAULT now()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_proposal_estimation_rows_proposal_id ON proposal_estimation_rows(proposal_id)",
+
+        # ── Phase 3: audit log ────────────────────────────────────────────────
+        """CREATE TABLE IF NOT EXISTS proposal_audit_logs (
+            id          SERIAL PRIMARY KEY,
+            proposal_id INTEGER NOT NULL REFERENCES proposal_estimates(id) ON DELETE CASCADE,
+            action      VARCHAR(100) NOT NULL,
+            from_status VARCHAR(50),
+            to_status   VARCHAR(50),
+            note        TEXT,
+            changed_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            changed_at  TIMESTAMPTZ DEFAULT now()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_proposal_audit_logs_proposal_id ON proposal_audit_logs(proposal_id)",
+
+        """CREATE TABLE IF NOT EXISTS proposal_features (
+            id                  SERIAL PRIMARY KEY,
+            proposal_id         INTEGER NOT NULL UNIQUE REFERENCES proposal_estimates(id) ON DELETE CASCADE,
+            feat_viz            BOOLEAN DEFAULT FALSE,
+            feat_viz_types      TEXT,
+            feat_alerts         BOOLEAN DEFAULT FALSE,
+            feat_alerts_detail  TEXT,
+            feat_access         BOOLEAN DEFAULT FALSE,
+            feat_access_detail  TEXT,
+            feat_rules          BOOLEAN DEFAULT FALSE,
+            feat_rules_detail   TEXT,
+            feat_mobile         BOOLEAN DEFAULT FALSE,
+            feat_mobile_detail  TEXT,
+            feat_master         BOOLEAN DEFAULT FALSE,
+            feat_master_detail  TEXT,
+            feat_audit          BOOLEAN DEFAULT FALSE,
+            feat_audit_detail   TEXT,
+            updated_at          TIMESTAMPTZ
+        )""",
     ]
     for stmt in statements:
         try:
@@ -635,7 +729,7 @@ for router in [auth, projects, milestones, responses, dashboard,
                team_utilization_report, cost_breakdown_report,
                billing_statement_report, hours_tracker,
                report_templates, attachments, billing_reports,
-               da_project_reports]:
+               da_project_reports, proposal_estimates]:
     app.include_router(router.router, prefix="/api")
 
 # Extra routers from global_team module (custom roles + assignment categories)

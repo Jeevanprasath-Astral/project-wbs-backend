@@ -11,7 +11,7 @@ from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager
 from app.core.security import hash_password
 from app.services.audit_service import log_action
-from app.services.email_service import send_welcome_email, send_email
+from app.services.email_service import send_welcome_email, send_email, send_role_change_email
 from app.core.config import settings
 
 router = APIRouter(prefix="/global/team", tags=["Global Team"])
@@ -255,6 +255,7 @@ def update_user(
         raise HTTPException(403, "Only Admin or HR can update users")
     u = db.query(User).filter_by(id=user_id).first()
     if not u: raise HTTPException(404, "User not found")
+    old_role = u.role
     if payload.name:     u.name = payload.name
     if payload.role:     u.role = payload.role
     if payload.password: u.password_hash = hash_password(payload.password)
@@ -264,6 +265,17 @@ def update_user(
     log_action(db, actor=current_user.name, action="update_user",
                description=f"Updated user {u.name}", user_id=current_user.id)
     db.commit(); db.refresh(u)
+    # Send role-change email if role was changed
+    if payload.role and payload.role != old_role:
+        try:
+            send_role_change_email(
+                to=u.email, name=u.name,
+                old_role=old_role, new_role=u.role,
+                app_url=settings.FRONTEND_URL
+            )
+        except Exception as e:
+            import logging as _log
+            _log.getLogger(__name__).error(f"Role change email failed for {u.email}: {e}")
     return _build_user(u, db)
 
 @router.delete("/{user_id}")

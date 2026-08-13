@@ -11,9 +11,11 @@ from app.models.models import (TaskAssignment, ProjectMilestone, Project,
                                 Milestone, CustomTask, CustomSubtask, Activity,
                                 CustomMilestone, AuditLog)
 from app.core.deps import get_current_user
-from app.core.permissions import is_elevated, can_view_elevated
+from app.core.permissions import is_elevated, can_view_elevated, is_admin
+from app.core.config import settings
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
+from app.services.email_service import send_task_deletion_email
 import io
 
 router = APIRouter(prefix="/global", tags=["Global Modules"])
@@ -57,6 +59,7 @@ def _build_global_assignment(a: TaskAssignment, db: Session, project_map=None, u
         "assigned_to": a.assigned_to,
         "assigned_to_name": assignee.name if assignee else "—",
         "assigned_to_role": assignee.role if assignee else "—",
+        "assigned_by": a.assigned_by,
         "assigned_by_name": assigner.name if assigner else "—",
         "team": a.team,
         "milestone_num": a.milestone_num,
@@ -254,6 +257,19 @@ def create_global_assignment(
     return _build_global_assignment(a, db)
 
 
+@router.get("/assignments/{assignment_id}")
+def get_global_assignment(
+    assignment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Fetch a single assignment by id — used by the detail slide-in panel."""
+    a = db.query(TaskAssignment).filter_by(id=assignment_id).first()
+    if not a:
+        raise HTTPException(404, "Assignment not found")
+    return _build_global_assignment(a, db)
+
+
 class GlobalAssignmentUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
@@ -275,10 +291,13 @@ def update_global_assignment(
     current_user: User = Depends(get_current_user)
 ):
     """Project-agnostic update — works for both project-linked tasks and
-    General Tasks, since it looks the assignment up by id alone."""
+    General Tasks, since it looks the assignment up by id alone.
+    Only the assigner (assigned_by) or an Admin may edit."""
     a = db.query(TaskAssignment).filter_by(id=assignment_id).first()
     if not a:
         raise HTTPException(404, "Assignment not found")
+    if not is_admin(current_user) and a.assigned_by != current_user.id:
+        raise HTTPException(403, "Only the assigner or an Admin can edit this task")
 
     for k, v in payload.model_dump(exclude_none=True).items():
         setattr(a, k, v)
@@ -303,16 +322,38 @@ def delete_global_assignment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not is_elevated(current_user):
-        raise HTTPException(403, "Only Admin, FC Lead or TC Lead can delete assignments")
+    """Delete an assignment. Only the assigner (assigned_by) or an Admin may delete.
+    Sends a deletion notification email to the assignee."""
     a = db.query(TaskAssignment).filter_by(id=assignment_id).first()
     if not a:
         raise HTTPException(404, "Assignment not found")
-    db.delete(a)
+    if not is_admin(current_user) and a.assigned_by != current_user.id:
+        raise HTTPException(403, "Only the assigner or an Admin can delete this task")
+
+    # Capture data needed for email before deleting
+    task_title = a.title
+    assignee = db.query(User).filter_by(id=a.assigned_to).first()
+
     log_action(db, actor=current_user.name, action="delete_assignment",
                description=f"Deleted assignment '{a.title}'",
                project_id=a.project_id, user_id=current_user.id)
+    db.delete(a)
     db.commit()
+
+    # Notify the assignee that their task was deleted
+    if assignee and assignee.email:
+        try:
+            send_task_deletion_email(
+                to=assignee.email,
+                name=assignee.name,
+                task_title=task_title,
+                deleted_by=current_user.name,
+                app_url=settings.FRONTEND_URL,
+            )
+        except Exception as e:
+            import logging as _log
+            _log.getLogger(__name__).error(f"Task deletion email failed for {assignee.email}: {e}")
+
     return {"status": "deleted"}
 
 

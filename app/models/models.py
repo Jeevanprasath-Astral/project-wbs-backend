@@ -645,6 +645,128 @@ class ReportTemplateItem(Base):
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     template      = relationship("ReportTemplate", back_populates="items")
 
+# ── Proposal Estimates ────────────────────────────────────────────────────────
+class ProposalEstimate(Base):
+    """Top-level Proposal Estimate header."""
+    __tablename__ = "proposal_estimates"
+    id               = Column(Integer, primary_key=True, index=True)
+    client_name      = Column(String(300), nullable=False)
+    project_name     = Column(String(300))
+    project_category = Column(String(100))   # ERP | Analytics | Automation | Application | Custom Project
+    status           = Column(String(50), default="Draft")  # Draft | Submitted | Approved | Rejected | Archived
+    version          = Column(Integer, default=1)
+    estimation_mode  = Column(String(10), default="hours")  # hours | days (1 day = 7 hours)
+    created_by       = Column(Integer, ForeignKey("users.id"))
+    approved_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at       = Column(DateTime(timezone=True), onupdate=func.now())
+    submitted_at     = Column(DateTime(timezone=True), nullable=True)
+    approved_at      = Column(DateTime(timezone=True), nullable=True)
+    creator          = relationship("User", foreign_keys=[created_by])
+    approver         = relationship("User", foreign_keys=[approved_by])
+    sections         = relationship("ProposalSection",  back_populates="proposal",
+                                    cascade="all, delete-orphan")
+    reports          = relationship("ProposalReport",   back_populates="proposal",
+                                    cascade="all, delete-orphan", order_by="ProposalReport.sl_no")
+    features         = relationship("ProposalFeatures", back_populates="proposal",
+                                    cascade="all, delete-orphan", uselist=False)
+    estimation_rows  = relationship("ProposalEstimationRow", back_populates="proposal",
+                                    cascade="all, delete-orphan", order_by="ProposalEstimationRow.sl_no")
+    audit_logs       = relationship("ProposalAuditLog", back_populates="proposal",
+                                    cascade="all, delete-orphan", order_by="ProposalAuditLog.changed_at.desc()")
+
+class ProposalSection(Base):
+    """Free-text narrative sections (Companies, Business Units, Workflow)."""
+    __tablename__ = "proposal_sections"
+    id          = Column(Integer, primary_key=True, index=True)
+    proposal_id = Column(Integer, ForeignKey("proposal_estimates.id", ondelete="CASCADE"),
+                         nullable=False)
+    section_type = Column(String(100), nullable=False)  # companies | units | workflow
+    content      = Column(Text)
+    updated_at   = Column(DateTime(timezone=True), onupdate=func.now())
+    proposal     = relationship("ProposalEstimate", back_populates="sections")
+
+class ProposalReport(Base):
+    """F4 — one row per deliverable report in the proposal."""
+    __tablename__ = "proposal_reports"
+    id                  = Column(Integer, primary_key=True, index=True)
+    proposal_id         = Column(Integer, ForeignKey("proposal_estimates.id", ondelete="CASCADE"),
+                                 nullable=False)
+    sl_no               = Column(Integer, nullable=False)
+    report_name         = Column(String(300), nullable=False)
+    frequency           = Column(String(100))         # Daily | Weekly | Monthly | Ad-hoc | On-demand
+    output_automated    = Column(Boolean, default=False)
+    output_methods      = Column(Text)                # JSON: ["email","whatsapp","folder"]
+    rough_input         = Column(Text)
+    input_form          = Column(Text)                # JSON: ["excel","pdf","api"]
+    input_gen_automated = Column(Boolean, default=False)
+    data_validated      = Column(Boolean, default=False)
+    validation_complexity = Column(Text)              # only when data_validated=True
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+    proposal            = relationship("ProposalEstimate", back_populates="reports")
+
+class ProposalFeatures(Base):
+    """F5 — one row per proposal; all feature toggles + conditional details."""
+    __tablename__ = "proposal_features"
+    id          = Column(Integer, primary_key=True, index=True)
+    proposal_id = Column(Integer, ForeignKey("proposal_estimates.id", ondelete="CASCADE"),
+                         nullable=False, unique=True)
+    # Visualization
+    feat_viz              = Column(Boolean, default=False)
+    feat_viz_types        = Column(Text)    # JSON list of chart types
+    # Alerts & Notifications
+    feat_alerts           = Column(Boolean, default=False)
+    feat_alerts_detail    = Column(Text)
+    # Access Control
+    feat_access           = Column(Boolean, default=False)
+    feat_access_detail    = Column(Text)
+    # Business Rules / Conditional Logic
+    feat_rules            = Column(Boolean, default=False)
+    feat_rules_detail     = Column(Text)
+    # Mobile Access
+    feat_mobile           = Column(Boolean, default=False)
+    feat_mobile_detail    = Column(Text)
+    # Master Data Management
+    feat_master           = Column(Boolean, default=False)
+    feat_master_detail    = Column(Text)
+    # Audit Trail / History Log
+    feat_audit            = Column(Boolean, default=False)
+    feat_audit_detail     = Column(Text)
+    updated_at  = Column(DateTime(timezone=True), onupdate=func.now())
+    proposal    = relationship("ProposalEstimate", back_populates="features")
+
+class ProposalEstimationRow(Base):
+    """Phase 2 — one row in the effort estimation table."""
+    __tablename__ = "proposal_estimation_rows"
+    id               = Column(Integer, primary_key=True, index=True)
+    proposal_id      = Column(Integer, ForeignKey("proposal_estimates.id", ondelete="CASCADE"),
+                              nullable=False)
+    sl_no            = Column(Integer, nullable=False)
+    description      = Column(String(500), nullable=False)  # work item / deliverable
+    role_description = Column(String(200))                   # team role / member type
+    quantity         = Column(Float, default=0)              # hours OR man-days
+    cost_rate        = Column(Float, default=0)              # ₹ per hour
+    # total_cost is derived: if hours → qty×rate; if days → qty×7×rate
+    # stored for fast reads; recomputed on every save
+    total_cost       = Column(Float, default=0)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    proposal         = relationship("ProposalEstimate", back_populates="estimation_rows")
+
+class ProposalAuditLog(Base):
+    """Phase 3 — immutable log of every status change / significant edit."""
+    __tablename__ = "proposal_audit_logs"
+    id          = Column(Integer, primary_key=True, index=True)
+    proposal_id = Column(Integer, ForeignKey("proposal_estimates.id", ondelete="CASCADE"),
+                         nullable=False)
+    action      = Column(String(100), nullable=False)  # created | submitted | approved | rejected | archived | edited
+    from_status = Column(String(50))
+    to_status   = Column(String(50))
+    note        = Column(Text)
+    changed_by  = Column(Integer, ForeignKey("users.id"), nullable=True)
+    changed_at  = Column(DateTime(timezone=True), server_default=func.now())
+    actor       = relationship("User", foreign_keys=[changed_by])
+    proposal    = relationship("ProposalEstimate", back_populates="audit_logs")
+
 # -- Attachments ---------------------------------------------------------------
 class Attachment(Base):
     """Generic polymorphic attachment -- one table handles all entity types.
