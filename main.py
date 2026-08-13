@@ -465,6 +465,25 @@ def _run_lightweight_migrations():
             feat_audit_detail   TEXT,
             updated_at          TIMESTAMPTZ
         )""",
+
+        # ── Proposal Estimates Phase 4: structured feature Q&A + canonical hours ─
+        # answers: JSON column on proposal_features stores structured Q&A answers
+        # (question_id → answer string) for the feature scoping questions.
+        "ALTER TABLE proposal_features ADD COLUMN IF NOT EXISTS answers JSON",
+
+        # quantity_hours: canonical storage for estimation rows (always in hours).
+        # Switching display mode (hours/days) is now purely cosmetic — no data change.
+        "ALTER TABLE proposal_estimation_rows ADD COLUMN IF NOT EXISTS quantity_hours FLOAT DEFAULT 0",
+
+        # Backfill quantity_hours from existing quantity + proposal's estimation_mode.
+        # Only touches rows where quantity_hours is still 0 but quantity > 0.
+        """UPDATE proposal_estimation_rows per
+           SET quantity_hours = CASE
+               WHEN (SELECT estimation_mode FROM proposal_estimates WHERE id = per.proposal_id) = 'days'
+               THEN COALESCE(per.quantity, 0) * 7
+               ELSE COALESCE(per.quantity, 0)
+           END
+           WHERE quantity_hours = 0 AND COALESCE(per.quantity, 0) > 0""",
     ]
     for stmt in statements:
         try:

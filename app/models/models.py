@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, Date, Float, ForeignKey, Enum, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, Date, Float, ForeignKey, Enum, UniqueConstraint, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.db.database import Base
@@ -732,6 +732,9 @@ class ProposalFeatures(Base):
     # Audit Trail / History Log
     feat_audit            = Column(Boolean, default=False)
     feat_audit_detail     = Column(Text)
+    # Structured Q&A answers — dict of question_id → answer text
+    # Questions are defined as static config on the frontend; answers are stored here
+    answers     = Column(JSON, nullable=True)
     updated_at  = Column(DateTime(timezone=True), onupdate=func.now())
     proposal    = relationship("ProposalEstimate", back_populates="features")
 
@@ -744,9 +747,10 @@ class ProposalEstimationRow(Base):
     sl_no            = Column(Integer, nullable=False)
     description      = Column(String(500), nullable=False)  # work item / deliverable
     role_description = Column(String(200))                   # team role / member type
-    quantity         = Column(Float, default=0)              # hours OR man-days
+    quantity         = Column(Float, default=0)              # display value in current mode (legacy — kept for compat)
+    quantity_hours   = Column(Float, default=0)              # CANONICAL: always stored in hours (1 day = 7 hrs)
     cost_rate        = Column(Float, default=0)              # ₹ per hour
-    # total_cost is derived: if hours → qty×rate; if days → qty×7×rate
+    # total_cost = quantity_hours × cost_rate (always hours-based)
     # stored for fast reads; recomputed on every save
     total_cost       = Column(Float, default=0)
     created_at       = Column(DateTime(timezone=True), server_default=func.now())

@@ -33,7 +33,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.db.database import get_db
 from app.models.models import (
@@ -143,6 +143,8 @@ def _ser_features(f: ProposalFeatures) -> dict:
             return json.loads(v)
         except Exception:
             return []
+    # answers is stored as JSON (dict); return {} if not set
+    answers = f.answers if isinstance(f.answers, dict) else {}
     return {
         "id":                 f.id,
         "proposal_id":        f.proposal_id,
@@ -160,6 +162,7 @@ def _ser_features(f: ProposalFeatures) -> dict:
         "feat_master_detail": f.feat_master_detail,
         "feat_audit":         f.feat_audit,
         "feat_audit_detail":  f.feat_audit_detail,
+        "answers":            answers,
     }
 
 
@@ -222,9 +225,43 @@ class FeaturesUpsert(BaseModel):
     feat_master_detail:  Optional[str]  = None
     feat_audit:          Optional[bool] = None
     feat_audit_detail:   Optional[str]  = None
+    answers:             Optional[dict] = None  # structured Q&A: question_id → answer string
+
+
+# ─── Internal query helper ────────────────────────────────────────────────────
+
+def _get_proposal(db: Session, proposal_id: int) -> "ProposalEstimate | None":
+    """Load a proposal with creator+approver eagerly to avoid N+1 on serialisation."""
+    return (
+        db.query(ProposalEstimate)
+        .options(
+            selectinload(ProposalEstimate.creator),
+            selectinload(ProposalEstimate.approver),
+        )
+        .filter_by(id=proposal_id)
+        .first()
+    )
 
 
 # ─── Proposal CRUD ────────────────────────────────────────────────────────────
+
+@router.get("/proposal-estimates/team-members")
+def list_team_members(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return all active users for the Role/Team dropdown in Estimation."""
+    users = (
+        db.query(User)
+        .filter(User.is_active == True)
+        .order_by(User.name)
+        .all()
+    )
+    return [
+        {"id": u.id, "name": u.name, "role": u.role, "cost_rate": u.cost_rate or 0}
+        for u in users
+    ]
+
 
 @router.get("/proposal-estimates")
 def list_proposals(
@@ -233,7 +270,13 @@ def list_proposals(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    q = db.query(ProposalEstimate)
+    q = (
+        db.query(ProposalEstimate)
+        .options(
+            selectinload(ProposalEstimate.creator),
+            selectinload(ProposalEstimate.approver),
+        )
+    )
     if status:
         q = q.filter(ProposalEstimate.status == status)
     if category:
@@ -274,7 +317,7 @@ def get_proposal(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    p = db.query(ProposalEstimate).filter_by(id=proposal_id).first()
+    p = _get_proposal(db, proposal_id)
     if not p:
         raise HTTPException(404, "Proposal not found")
     return _ser_proposal(p)
@@ -583,10 +626,11 @@ def upsert_features(
         db.add(f)
 
     for field, val in payload.dict(exclude_none=True).items():
-        if field.endswith("_types") or field in (
-            "feat_viz_types",
-        ):
+        if field.endswith("_types") or field in ("feat_viz_types",):
             setattr(f, field, json.dumps(val) if isinstance(val, list) else val)
+        elif field == "answers":
+            # answers is a dict; SQLAlchemy JSON column handles serialization natively
+            setattr(f, field, val if isinstance(val, dict) else {})
         else:
             setattr(f, field, val)
 
@@ -599,20 +643,28 @@ def upsert_features(
 # PHASE 2 — Estimation Engine
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _compute_total(quantity: float, cost_rate: float, mode: str) -> float:
-    """Hours mode: qty × rate.  Days mode: qty × 7 × rate."""
-    hrs = quantity * 7 if mode == "days" else quantity
-    return round(hrs * cost_rate, 2)
+def _to_hours(quantity: float, mode: str) -> float:
+    """Convert display quantity to canonical hours. Days mode: qty × 7."""
+    return quantity * 7 if mode == "days" else quantity
+
+
+def _compute_total(quantity_hours: float, cost_rate: float) -> float:
+    """Total cost = quantity_hours × cost_rate (always hours-based)."""
+    return round((quantity_hours or 0) * (cost_rate or 0), 2)
 
 
 def _ser_estimation_row(r: ProposalEstimationRow, mode: str) -> dict:
+    # quantity_hours is canonical; derive display quantity from it
+    qty_hours = r.quantity_hours if (r.quantity_hours is not None and r.quantity_hours > 0) else (r.quantity or 0)
+    display_qty = round(qty_hours / 7, 4) if mode == "days" else qty_hours
     return {
         "id":               r.id,
         "proposal_id":      r.proposal_id,
         "sl_no":            r.sl_no,
         "description":      r.description,
         "role_description": r.role_description,
-        "quantity":         r.quantity,
+        "quantity":         display_qty,          # mode-adjusted display value
+        "quantity_hours":   qty_hours,             # always in hours
         "cost_rate":        r.cost_rate,
         "total_cost":       r.total_cost,
         "unit":             "day(s)" if mode == "days" else "hr(s)",
@@ -656,18 +708,41 @@ def get_estimation(
         .all()
     )
     serialized = [_ser_estimation_row(r, mode) for r in rows]
-    # summary
-    total_qty   = sum(r.quantity or 0 for r in rows)
+
+    # ── Summary totals — always derived from quantity_hours (canonical) ──────────
+    def _row_hours(r: ProposalEstimationRow) -> float:
+        return r.quantity_hours if (r.quantity_hours is not None and r.quantity_hours > 0) else (r.quantity or 0)
+
+    total_hours = sum(_row_hours(r) for r in rows)
+    total_qty   = round(total_hours / 7, 4) if mode == "days" else total_hours
     total_cost  = sum(r.total_cost or 0 for r in rows)
-    total_hours = sum(
-        (r.quantity * 7 if mode == "days" else r.quantity) for r in rows
-    )
+
+    # ── Role-wise summary ────────────────────────────────────────────────────────
+    role_map: dict = {}
+    for r in rows:
+        role = (r.role_description or "").strip() or "Unspecified"
+        if role not in role_map:
+            role_map[role] = {"hours": 0.0, "cost": 0.0}
+        role_map[role]["hours"] += _row_hours(r)
+        role_map[role]["cost"]  += r.total_cost or 0
+
+    role_totals = [
+        {
+            "role":  role,
+            "hours": round(vals["hours"], 2),
+            "qty":   round(vals["hours"] / 7, 2) if mode == "days" else round(vals["hours"], 2),
+            "cost":  round(vals["cost"], 2),
+        }
+        for role, vals in role_map.items()
+    ]
+
     return {
         "mode":        mode,
         "rows":        serialized,
         "total_qty":   round(total_qty, 2),
         "total_hours": round(total_hours, 2),
         "total_cost":  round(total_cost, 2),
+        "role_totals": role_totals,
     }
 
 
@@ -684,12 +759,10 @@ def set_estimation_mode(
     p = db.query(ProposalEstimate).filter_by(id=proposal_id).first()
     if not p:
         raise HTTPException(404, "Proposal not found")
-    old_mode = p.estimation_mode or "hours"
     p.estimation_mode = payload.mode
-    # Recompute all row totals when mode changes
-    if old_mode != payload.mode:
-        for r in db.query(ProposalEstimationRow).filter_by(proposal_id=proposal_id).all():
-            r.total_cost = _compute_total(r.quantity or 0, r.cost_rate or 0, payload.mode)
+    # Mode switch is purely cosmetic — quantity_hours (canonical) is unchanged.
+    # total_cost = quantity_hours × cost_rate which doesn't depend on mode.
+    # No row recompute needed.
     db.commit()
     db.refresh(p)
     return {"mode": p.estimation_mode}
@@ -716,16 +789,18 @@ def add_estimation_row(
             .first()
         )
         sl_no = (last.sl_no + 1) if last else 1
-    qty  = payload.quantity or 0
-    rate = payload.cost_rate or 0
+    qty       = payload.quantity or 0
+    rate      = payload.cost_rate or 0
+    qty_hours = _to_hours(qty, mode)
     row = ProposalEstimationRow(
         proposal_id=proposal_id,
         sl_no=sl_no,
         description=payload.description,
         role_description=payload.role_description,
         quantity=qty,
+        quantity_hours=qty_hours,
         cost_rate=rate,
-        total_cost=_compute_total(qty, rate, mode),
+        total_cost=_compute_total(qty_hours, rate),
     )
     db.add(row)
     db.commit()
@@ -757,9 +832,12 @@ def update_estimation_row(
         row.role_description = payload.role_description
     if payload.quantity is not None:
         row.quantity = payload.quantity
+        row.quantity_hours = _to_hours(payload.quantity, mode)
     if payload.cost_rate is not None:
         row.cost_rate = payload.cost_rate
-    row.total_cost = _compute_total(row.quantity or 0, row.cost_rate or 0, mode)
+    # Derive quantity_hours for total computation (use existing canonical if quantity unchanged)
+    qty_hours = row.quantity_hours if row.quantity_hours else _to_hours(row.quantity or 0, mode)
+    row.total_cost = _compute_total(qty_hours, row.cost_rate or 0)
     db.commit()
     db.refresh(row)
     return _ser_estimation_row(row, mode)
@@ -817,6 +895,7 @@ def get_audit_log(
 ):
     logs = (
         db.query(ProposalAuditLog)
+        .options(selectinload(ProposalAuditLog.actor))
         .filter_by(proposal_id=proposal_id)
         .order_by(ProposalAuditLog.changed_at.desc())
         .all()
