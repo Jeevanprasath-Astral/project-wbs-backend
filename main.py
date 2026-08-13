@@ -611,19 +611,22 @@ def _update_user_accounts():
     failure cannot roll back the others."""
     from app.core.security import hash_password
     from sqlalchemy import text as _sql
-    # Early-exit: if all 5 real office emails are already in the DB, skip.
-    # Without this guard, 5 sequential DB round-trips add ~10 s to every cold start.
+    # Early-exit: skip only when all 5 accounts exist AND all already have bcrypt hashes.
+    # We must NOT skip if any hash is still a legacy HMAC hex string, because the
+    # per-account loop below is responsible for upgrading those to bcrypt.
     try:
         with engine.begin() as _chk:
-            n = _chk.execute(_sql(
-                "SELECT COUNT(*) FROM users WHERE email IN (:e1,:e2,:e3,:e4,:e5)"
+            rows = _chk.execute(_sql(
+                "SELECT password_hash FROM users WHERE email IN (:e1,:e2,:e3,:e4,:e5)"
             ), {"e1": "jeevanprasath.j@astralbusinessconsulting.in",
                 "e2": "gayathri.p@astralbusinessconsulting.com",
                 "e3": "manikandan.s@astralbusinessconsulting.com",
                 "e4": "manikandan.m@astralbusinessconsulting.in",
-                "e5": "sanjeev.v@astralbusinessconsulting.in"}).scalar() or 0
-            if n >= 5:
-                logging.info("_update_user_accounts: all accounts present — skipping")
+                "e5": "sanjeev.v@astralbusinessconsulting.in"}).fetchall()
+            all_bcrypt = (len(rows) >= 5 and
+                          all(r[0] and r[0].startswith('$2') for r in rows))
+            if all_bcrypt:
+                logging.info("_update_user_accounts: all accounts present with bcrypt hashes — skipping")
                 return
     except Exception:
         pass
