@@ -654,11 +654,13 @@ def _update_user_accounts():
                 ), {"new_email": new_email}).fetchone()
 
                 if already_migrated:
-                    # Row already has the real email — only sync name, leave password alone.
+                    # Row already has the real email — sync name AND password_hash.
+                    # Always re-hashing ensures the stored hash matches the current
+                    # hashing scheme (bcrypt) regardless of any prior SECRET_KEY changes.
                     res = _conn.execute(_sql(
-                        "UPDATE users SET name = :name WHERE email = :new_email"
-                    ), {"name": name, "new_email": new_email})
-                    logging.info(f"_update_user_accounts NAME-ONLY {new_email}")
+                        "UPDATE users SET name = :name, password_hash = :ph WHERE email = :new_email"
+                    ), {"name": name, "new_email": new_email, "ph": hash_password(temp_pwd)})
+                    logging.info(f"_update_user_accounts SYNCED {new_email}")
                 else:
                     # Still on old placeholder email — full migration with initial password.
                     res = _conn.execute(_sql(

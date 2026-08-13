@@ -89,17 +89,15 @@ def debug_login(email: str, password: str, confirm_token: str, db: Session = Dep
     if confirm_token != "axon-fix-2026":
         raise HTTPException(status_code=403, detail="Invalid confirm_token")
     users = db.query(User).filter(User.email == email).all()
-    computed = hash_password(password)
     results = []
     for u in users:
         results.append({
             "id": u.id,
             "role": u.role,
-            "stored_hash": u.password_hash,
-            "computed_hash": computed,
-            "match": u.password_hash == computed
+            "stored_hash": u.password_hash[:20] + "…",
+            "match": verify_password(password, u.password_hash),
         })
-    return {"secret_key_prefix": settings.SECRET_KEY[:10], "results": results}
+    return {"results": results}
 
 @router.get("/emergency-reset")
 def emergency_reset(email: str, new_password: str, confirm_token: str, db: Session = Depends(get_db)):

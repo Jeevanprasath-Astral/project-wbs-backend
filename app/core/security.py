@@ -1,20 +1,21 @@
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-import hashlib
-import hmac as hmac_lib
+from passlib.context import CryptContext
 from app.core.config import settings
 
+# bcrypt is self-contained — does NOT depend on SECRET_KEY.
+# Changing SECRET_KEY on Render will never invalidate stored passwords.
+_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 def hash_password(password: str) -> str:
-    """Hash password using HMAC-SHA256 — works on all Python versions."""
-    secret = settings.SECRET_KEY.encode('utf-8')
-    return hmac_lib.new(secret, password.encode('utf-8'), hashlib.sha256).hexdigest()
+    """Hash password using bcrypt (salted, self-contained)."""
+    return _pwd_context.hash(password)
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify password using constant-time comparison."""
+    """Verify password using bcrypt constant-time comparison."""
     try:
-        expected = hash_password(plain)
-        return hmac_lib.compare_digest(expected, hashed)
+        return _pwd_context.verify(plain, hashed)
     except Exception:
         return False
 
