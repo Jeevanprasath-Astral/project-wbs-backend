@@ -1167,6 +1167,47 @@ def export_proposal_excel(
     c.fill = PatternFill("solid", fgColor="DBEAFE")
     c.alignment = Alignment(horizontal="center")
 
+    # Mirrors frontend FEATURE_QUESTIONS config: feature_key → [(question_id, question_text)]
+    FEATURE_QUESTION_DEFS = {
+        "feat_viz": [
+            ("viz_dashboards_required", "Are dashboards required?"),
+            ("viz_dashboard_count",     "How many dashboards are required?"),
+            ("viz_drill_down",          "Is multi-level drill-down required? (Group → Division → Region → Entity)"),
+            ("viz_chart_types",         "What type of charts are required? (Trend lines, comparisons, heatmaps, funnel views, etc.)"),
+            ("viz_date_ranges",         "Are configurable date ranges and period-over-period comparisons required? (MoM, YoY, etc.)"),
+        ],
+        "feat_alerts": [
+            ("alerts_threshold",         "Threshold-based alerts required? (e.g., price deviation, KPI breach)"),
+            ("alerts_anomaly",           "Anomaly flagging required?"),
+            ("alerts_exception_reports", "Auto-generated exception reports required?"),
+        ],
+        "feat_access": [
+            ("access_rbac",          "Role-based access control (RBAC) — admin, manager, user, view-only tiers?"),
+            ("access_org_hierarchy", "Multi-level org hierarchy support (branch/region/division/entity)?"),
+            ("access_sso",           "SSO / Google-Microsoft login, or email+OTP?"),
+            ("access_provisioning",  "User provisioning/deprovisioning and password reset flows?"),
+        ],
+        "feat_rules": [
+            ("rules_formulas",   "Admin-configurable formulas/weightages (e.g., KPI scoring)?"),
+            ("rules_versioning", "Rule versioning (historical calculations don't break on rule change)?"),
+            ("rules_scenario",   "Scenario/what-if testing before rule rollout?"),
+        ],
+        "feat_mobile": [
+            ("mobile_required", "Is a mobile app required? (Yes / No)"),
+            ("mobile_scope",    "If yes — dashboard view only, or full app logic?"),
+        ],
+        "feat_master": [
+            ("master_configurable", "Admin-configurable master data (departments, categories, products, locations)?"),
+            ("master_dropdowns",    "Configurable dropdowns/lookups instead of hardcoded values?"),
+            ("master_bulk_import",  "Bulk import/export (usually Excel-based)?"),
+        ],
+        "feat_audit": [
+            ("audit_logging",         "Who-changed-what-when logging required?"),
+            ("audit_version_history", "Version history on key records?"),
+            ("audit_data_retention",  "Data retention/archival rules?"),
+        ],
+    }
+
     FEATURE_DEFS = [
         ("feat_viz",    "Data Visualization",            "feat_viz_types"),
         ("feat_alerts", "Alerts & Notifications",        "feat_alerts_detail"),
@@ -1180,19 +1221,44 @@ def export_proposal_excel(
     _h(ws5, 2, 2, "Required?", fill=HDR_FILL, font=HDR_FONT)
     _h(ws5, 2, 3, "Details / Notes", fill=HDR_FILL, font=HDR_FONT)
 
+    # Pull saved answers dict (question_id → answer text)
+    saved_answers = {}
+    if feats and isinstance(feats.answers, dict):
+        saved_answers = feats.answers
+
     for ri, (toggle, label, detail_field) in enumerate(FEATURE_DEFS, 3):
         enabled = getattr(feats, toggle, False) if feats else False
         detail  = getattr(feats, detail_field, "") or "" if feats else ""
         if detail_field == "feat_viz_types" and isinstance(detail, str) and detail.startswith("["):
             try: detail = ", ".join(json.loads(detail))
             except: pass
+
+        # Build combined notes: optional legacy detail + structured Q&A
+        parts = []
+        if detail:
+            parts.append(detail)
+
+        qa_lines = []
+        for qid, qtext in FEATURE_QUESTION_DEFS.get(toggle, []):
+            ans = saved_answers.get(qid, "") or ""
+            qa_lines.append(f"Q: {qtext}\nA: {ans if ans else '—'}")
+        if qa_lines:
+            parts.append("\n\n".join(qa_lines))
+
+        combined_notes = "\n\n".join(parts)
+
         _h(ws5, ri, 1, label)
         c_req = ws5.cell(row=ri, column=2, value="Yes" if enabled else "No")
         c_req.font = Font(color="1E7A4A" if enabled else "888888", bold=enabled)
         c_req.border = border
-        _h(ws5, ri, 3, detail, wrap=True)
+        c_notes = ws5.cell(row=ri, column=3, value=combined_notes)
+        c_notes.alignment = Alignment(wrap_text=True, vertical="top")
+        c_notes.border = border
+        # Auto-height: ~15pt per line of text
+        line_count = combined_notes.count("\n") + 1
+        ws5.row_dimensions[ri].height = max(40, 15 * line_count)
 
-    for ci, w in enumerate([35, 12, 50], 1):
+    for ci, w in enumerate([35, 12, 70], 1):
         _w(ws5, ci, w)
 
     # ── Stream out ─────────────────────────────────────────────────────────
