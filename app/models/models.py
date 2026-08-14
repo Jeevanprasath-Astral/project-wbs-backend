@@ -662,6 +662,8 @@ class ProposalEstimate(Base):
     updated_at       = Column(DateTime(timezone=True), onupdate=func.now())
     submitted_at     = Column(DateTime(timezone=True), nullable=True)
     approved_at      = Column(DateTime(timezone=True), nullable=True)
+    bd_status        = Column(String(100), nullable=True)   # Business Development stage
+    bd_status_date   = Column(Date, nullable=True)          # Date of that BD stage
     creator          = relationship("User", foreign_keys=[created_by])
     approver         = relationship("User", foreign_keys=[approved_by])
     sections         = relationship("ProposalSection",  back_populates="proposal",

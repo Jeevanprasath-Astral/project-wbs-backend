@@ -97,6 +97,8 @@ def _ser_proposal(p: ProposalEstimate) -> dict:
         "updated_at":       p.updated_at.isoformat() if p.updated_at else None,
         "submitted_at":     p.submitted_at.isoformat() if p.submitted_at else None,
         "approved_at":      p.approved_at.isoformat() if p.approved_at else None,
+        "bd_status":        p.bd_status,
+        "bd_status_date":   p.bd_status_date.isoformat() if p.bd_status_date else None,
     }
 
 
@@ -178,6 +180,8 @@ class ProposalUpdate(BaseModel):
     client_name:      Optional[str] = None
     project_name:     Optional[str] = None
     project_category: Optional[str] = None
+    bd_status:        Optional[str] = None
+    bd_status_date:   Optional[str] = None  # ISO date string "YYYY-MM-DD" or ""
 
 
 class SectionUpsert(BaseModel):
@@ -265,8 +269,9 @@ def list_team_members(
 
 @router.get("/proposal-estimates")
 def list_proposals(
-    status:   Optional[str] = None,
-    category: Optional[str] = None,
+    status:    Optional[str] = None,
+    category:  Optional[str] = None,
+    bd_status: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -281,6 +286,8 @@ def list_proposals(
         q = q.filter(ProposalEstimate.status == status)
     if category:
         q = q.filter(ProposalEstimate.project_category == category)
+    if bd_status:
+        q = q.filter(ProposalEstimate.bd_status == bd_status)
     proposals = q.order_by(ProposalEstimate.created_at.desc()).all()
     return [_ser_proposal(p) for p in proposals]
 
@@ -342,6 +349,17 @@ def update_proposal(
         p.project_name = payload.project_name
     if payload.project_category is not None:
         p.project_category = payload.project_category
+    if payload.bd_status is not None:
+        p.bd_status = payload.bd_status or None
+    if payload.bd_status_date is not None:
+        if payload.bd_status_date == "":
+            p.bd_status_date = None
+        else:
+            from datetime import date as _date
+            try:
+                p.bd_status_date = _date.fromisoformat(payload.bd_status_date)
+            except ValueError:
+                pass
     db.commit()
     db.refresh(p)
     return _ser_proposal(p)

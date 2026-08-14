@@ -484,6 +484,10 @@ def _run_lightweight_migrations():
                ELSE COALESCE(per.quantity, 0)
            END
            WHERE quantity_hours = 0 AND COALESCE(per.quantity, 0) > 0""",
+
+        # ── Proposal Estimates Phase 5: Business Development Status ───────────
+        "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS bd_status VARCHAR(100)",
+        "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS bd_status_date DATE",
     ]
     for stmt in statements:
         try:
