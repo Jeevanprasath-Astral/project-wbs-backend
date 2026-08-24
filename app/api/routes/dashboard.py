@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func
+from sqlalchemy import func, and_
 from typing import List
 from datetime import datetime, timedelta
 from app.db.database import get_db
@@ -321,41 +321,77 @@ def mark_read(
     return {"status": "ok"}
 
 
-# ── Audit ─────────────────────────────────────────────────────────────────────
-_CREATE_ACTIONS = {"add_milestone", "create_milestone", "create_task", "add_task",
-                    "add_subtask", "add_activity", "assign_task", "create"}
-
-@router.get("/projects/{project_id}/audit", response_model=List[AuditOut])
-def list_audit(
+@router.get("/projects/{project_id}/notifications/count")
+def notification_count(
     project_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """Return just the unread count — used by the sidebar badge poll
+    instead of fetching all notification rows (Fix 5: lighter query)."""
+    unread = db.query(func.count(Notification.id)).filter_by(
+        project_id=project_id, read=False
+    ).scalar() or 0
+    return {"unread": unread}
+
+
+# ── Audit ─────────────────────────────────────────────────────────────────────
+_CREATE_ACTIONS = {"add_milestone", "create_milestone", "create_task", "add_task",
+                    "add_subtask", "add_activity", "assign_task", "create"}
+
+@router.get("/projects/{project_id}/audit")
+def list_audit(
+    project_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Fix 7: paginated — only fetch `limit` rows at a time (default 50).
+    total = db.query(func.count(AuditLog.id)).filter_by(project_id=project_id).scalar() or 0
+
     rows = db.query(AuditLog).filter_by(
         project_id=project_id
-    ).order_by(AuditLog.created_at.desc()).all()
+    ).order_by(AuditLog.created_at.desc()).limit(limit).offset(offset).all()
 
-    # Requirement 4: split Created By / Modified By. "Created By" = the actor
-    # of the earliest create-type entry for the same entity_type+entity_id;
-    # "Modified By" = this row's own actor (most recent change).
-    creator_cache = {}
+    # Fix 4: batch-fetch earliest creator per (entity_type, entity_id) in ONE
+    # GROUP BY query instead of one subquery per entity row (eliminated N+1).
+    creator_cache: dict = {}
+    if rows:
+        sub = (
+            db.query(
+                AuditLog.entity_type,
+                AuditLog.entity_id,
+                func.min(AuditLog.created_at).label('min_ts'),
+            )
+            .filter(
+                AuditLog.project_id == project_id,
+                AuditLog.entity_type != None,
+                AuditLog.entity_id != None,
+            )
+            .group_by(AuditLog.entity_type, AuditLog.entity_id)
+            .subquery()
+        )
+        creator_rows = (
+            db.query(AuditLog.entity_type, AuditLog.entity_id, AuditLog.actor)
+            .join(sub, and_(
+                AuditLog.entity_type == sub.c.entity_type,
+                AuditLog.entity_id == sub.c.entity_id,
+                AuditLog.created_at == sub.c.min_ts,
+            ))
+            .filter(AuditLog.project_id == project_id)
+            .all()
+        )
+        creator_cache = {(r.entity_type, r.entity_id): r.actor for r in creator_rows}
+
     out = []
     for a in rows:
         key = (a.entity_type, a.entity_id)
-        created_by = a.actor
-        if a.entity_type and a.entity_id is not None:
-            if key not in creator_cache:
-                earliest = db.query(AuditLog).filter(
-                    AuditLog.project_id == project_id,
-                    AuditLog.entity_type == a.entity_type,
-                    AuditLog.entity_id == a.entity_id,
-                ).order_by(AuditLog.created_at.asc()).first()
-                creator_cache[key] = earliest.actor if earliest else a.actor
-            created_by = creator_cache[key]
+        created_by = creator_cache.get(key, a.actor)
         out.append({
             "id": a.id, "actor": a.actor, "entity_type": a.entity_type,
             "entity_id": a.entity_id, "action": a.action, "description": a.description,
             "old_value": a.old_value, "new_value": a.new_value, "created_at": a.created_at,
             "created_by": created_by, "modified_by": a.actor,
         })
-    return out
+    return {"rows": out, "total": total}

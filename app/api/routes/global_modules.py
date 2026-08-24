@@ -25,13 +25,13 @@ router = APIRouter(prefix="/global", tags=["Global Modules"])
 GENERAL_TASK_LABEL = "📋 General Task"
 
 
-def _build_global_assignment(a: TaskAssignment, db: Session, project_map=None, user_map=None):
+def _build_global_assignment(a: TaskAssignment, db: Session, project_map=None, user_map=None, task_map=None):
     """Build the API-shaped dict for one assignment row.
 
-    Perf: list endpoints pass in pre-fetched `project_map`/`user_map` (id -> obj)
-    so we avoid 2-3 extra SELECTs per row (N+1). Single-row call sites (create/
-    update) omit the maps and fall back to a direct lookup since there's only
-    one row to build.
+    Perf: list endpoints pass in pre-fetched `project_map`/`user_map`/`task_map`
+    (id -> obj) so we avoid 3-4 extra SELECTs per row (N+1). Single-row call
+    sites (create/update) omit the maps and fall back to a direct lookup since
+    there's only one row to build.
     """
     if project_map is not None:
         project = project_map.get(a.project_id) if a.project_id else None
@@ -48,7 +48,11 @@ def _build_global_assignment(a: TaskAssignment, db: Session, project_map=None, u
     now = datetime.utcnow()
     is_overdue = (a.due_date and a.due_date < now and a.status != "Completed")
     days_left = (a.due_date - now).days if a.due_date else None
-    task = db.query(CustomTask).filter_by(id=a.custom_task_id).first() if a.custom_task_id else None
+    # Fix 6: use pre-fetched task_map when available to eliminate N+1
+    if task_map is not None:
+        task = task_map.get(a.custom_task_id) if a.custom_task_id else None
+    else:
+        task = db.query(CustomTask).filter_by(id=a.custom_task_id).first() if a.custom_task_id else None
     return {
         "id": a.id,
         "project_id": a.project_id,
@@ -120,11 +124,13 @@ def global_assignments(
 
     # Filter out orphaned assignments — where custom_task_id is set but the
     # CustomTask no longer exists (deleted task with no FK cascade).
+    # Fix 6: also capture the task objects here for the task_map (same query).
     custom_task_ids = {a.custom_task_id for a in assignments if a.custom_task_id}
+    task_map: dict = {}
     if custom_task_ids:
-        living_task_ids = {
-            t.id for t in db.query(CustomTask).filter(CustomTask.id.in_(custom_task_ids)).all()
-        }
+        living_tasks = db.query(CustomTask).filter(CustomTask.id.in_(custom_task_ids)).all()
+        task_map = {t.id: t for t in living_tasks}
+        living_task_ids = {t.id for t in living_tasks}
         assignments = [
             a for a in assignments
             if a.custom_task_id is None or a.custom_task_id in living_task_ids
@@ -137,7 +143,7 @@ def global_assignments(
     project_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(project_ids)).all()} if project_ids else {}
     user_map = {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
 
-    return [_build_global_assignment(a, db, project_map, user_map) for a in assignments]
+    return [_build_global_assignment(a, db, project_map, user_map, task_map) for a in assignments]
 
 
 @router.get("/assignments/summary")
@@ -708,6 +714,37 @@ def global_users_list(
 ):
     users = db.query(User).filter(User.is_active == True).all()
     return [{"id": u.id, "name": u.name, "role": u.role, "email": u.email} for u in users]
+
+
+# ── Global Dashboard Summary — merges 4 endpoints into 1 round-trip ──────────
+@router.get("/dashboard-summary")
+def global_dashboard_summary(
+    team: Optional[str] = None,
+    project_id: Optional[int] = None,
+    employee_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Fix 8: single endpoint combining workload + project_status + projects + users
+    so the Global Dashboard fires 3 API calls instead of 6."""
+    workload_data = global_workload(
+        team=team, project_id=project_id, employee_id=employee_id,
+        date_from=date_from, date_to=date_to, db=db, current_user=current_user
+    )
+    status_data = global_project_status(
+        project_id=project_id, team=team, employee_id=employee_id,
+        db=db, current_user=current_user
+    )
+    projects = global_projects_list(db=db, current_user=current_user)
+    users = global_users_list(db=db, current_user=current_user)
+    return {
+        "workload":       workload_data,
+        "project_status": status_data,
+        "projects":       projects,
+        "users":          users,
+    }
 
 
 # ── Dashboard Project Status (req 7a) ─────────────────────────────────────────
