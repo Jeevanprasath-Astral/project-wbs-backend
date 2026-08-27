@@ -608,6 +608,59 @@ def _fix_task_names():
 # that has already run. Calling it on every cold start contributed to the
 # 512 MB OOM crash on Render free tier.
 
+
+def _fix_null_task_nums():
+    """
+    Data fix: assign sequential num values (1, 2, 3, ...) to any custom_tasks
+    row where num IS NULL or num = 0 (caused by the M05-M10 subtask-promotion
+    path).  Groups by milestone_id, orders by id (creation order).
+    Idempotent — skipped instantly when no invalid nums remain.
+    """
+    from sqlalchemy import text as _t
+    from collections import defaultdict
+
+    try:
+        with engine.connect() as conn:
+            invalid_count = conn.execute(_t(
+                "SELECT COUNT(*) FROM custom_tasks WHERE num IS NULL OR num = 0"
+            )).scalar()
+
+        if invalid_count == 0:
+            return  # nothing to do — fast exit on every normal startup
+
+        logging.info(f"_fix_null_task_nums: found {invalid_count} task(s) with num=NULL or num=0, fixing...")
+
+        with engine.begin() as conn:
+            rows = conn.execute(_t(
+                "SELECT id, milestone_id FROM custom_tasks "
+                "WHERE num IS NULL OR num = 0 ORDER BY milestone_id, id"
+            )).fetchall()
+
+            by_milestone = defaultdict(list)
+            for row in rows:
+                by_milestone[row.milestone_id].append(row.id)
+
+            updated = 0
+            for milestone_id, task_ids in by_milestone.items():
+                # Find max num already correctly assigned in this milestone
+                max_existing = conn.execute(_t(
+                    "SELECT COALESCE(MAX(num), 0) FROM custom_tasks "
+                    "WHERE milestone_id = :mid AND num IS NOT NULL AND num > 0"
+                ), {"mid": milestone_id}).scalar()
+
+                for i, task_id in enumerate(task_ids, start=1):
+                    conn.execute(_t(
+                        "UPDATE custom_tasks SET num = :num WHERE id = :id"
+                    ), {"num": max_existing + i, "id": task_id})
+                    updated += 1
+
+        logging.info(f"_fix_null_task_nums: assigned sequential nums to {updated} task(s).")
+    except Exception as e:
+        logging.warning(f"_fix_null_task_nums failed: {e}")
+
+_fix_null_task_nums()
+
+
 def _update_user_accounts():
     """Set real names, office emails and hashed passwords for the 5 role-based
     accounts.  Matches by OLD email OR new email so the function is idempotent
