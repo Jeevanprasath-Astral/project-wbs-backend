@@ -488,6 +488,8 @@ def _run_lightweight_migrations():
         # ── Proposal Estimates Phase 5: Business Development Status ───────────
         "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS bd_status VARCHAR(100)",
         "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS bd_status_date DATE",
+        # ── Task num fix: reset any num=0 to NULL so _fix_null_task_nums picks them up ──
+        "UPDATE custom_tasks SET num = NULL WHERE num = 0",
     ]
     for stmt in statements:
         try:
