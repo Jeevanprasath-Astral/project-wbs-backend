@@ -970,6 +970,8 @@ def add_from_template(
     # Milestones 1-4 keep the original Tasks; Subtasks fold as Form sections.
     from main import _SUBTASK_TO_NEW_TASK
 
+    _promoted_task_counter = 0  # sequential num for M05-M10 promoted tasks
+
     for i, t in enumerate(sorted(standard.tasks, key=lambda x: x.num or 0)):
         t_num = t.num or (i + 1)
         if selected_task_nums is not None and t_num not in selected_task_nums:
@@ -989,8 +991,9 @@ def add_from_template(
                 if new_name is None:
                     new_name = s.name  # fallback: use subtask name as task name
                 if new_name not in new_task_map:
+                    _promoted_task_counter += 1
                     nt = CustomTask(milestone_id=cm.id, project_id=project_id,
-                                    num=None, name=new_name,
+                                    num=_promoted_task_counter, name=new_name,
                                     responsibility=t.responsibility, status="Not Started")
                     db.add(nt); db.flush()
                     new_task_map[new_name] = nt
@@ -1076,6 +1079,9 @@ def add_task_from_template(
 
     if need_new_tasks:
         # M5-M10: Subtasks become new Tasks with FormFields
+        # Determine starting num after any already-existing tasks in this milestone
+        _existing_max = max((t.num or 0 for t in cm.tasks), default=0)
+        _new_task_counter = _existing_max
         new_task_map: dict[str, CustomTask] = {}
         for j, s in enumerate(sorted(std_task.subtasks, key=lambda x: x.num or 0)):
             s_num = s.num or (j + 1)
@@ -1083,7 +1089,9 @@ def add_task_from_template(
                 continue
             new_name = _SUBTASK_TO_NEW_TASK.get((ms_num, t_num, s_num)) or s.name
             if new_name not in new_task_map:
-                nt = CustomTask(milestone_id=cm.id, project_id=project_id, num=None,
+                _new_task_counter += 1
+                nt = CustomTask(milestone_id=cm.id, project_id=project_id,
+                                num=_new_task_counter,
                                 name=new_name, responsibility=std_task.responsibility,
                                 status="Not Started")
                 db.add(nt); db.flush()
