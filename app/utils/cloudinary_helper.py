@@ -62,3 +62,19 @@ def build_url(public_id: str) -> str:
     _setup()
     url, _ = cloudinary.utils.cloudinary_url(public_id, resource_type="raw", secure=True)
     return url
+
+
+def build_download_url(public_id: str, filename: str = None) -> str:
+    """Build a Cloudinary URL with fl_attachment so the browser downloads the
+    file instead of opening it in a new tab (works around cross-origin download
+    attribute restrictions)."""
+    _setup()
+    # Sanitise filename for use in the Cloudinary flag parameter
+    safe_name = (filename or public_id.split("/")[-1]).replace(" ", "_")
+    url, _ = cloudinary.utils.cloudinary_url(
+        public_id,
+        resource_type="raw",
+        secure=True,
+        flags=f"attachment:{safe_name}",
+    )
+    return url

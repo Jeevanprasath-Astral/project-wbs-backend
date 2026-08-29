@@ -490,6 +490,11 @@ def _run_lightweight_migrations():
         "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS bd_status_date DATE",
         # ── Task num fix: reset any num=0 to NULL so _fix_null_task_nums picks them up ──
         "UPDATE custom_tasks SET num = NULL WHERE num = 0",
+        # Proposal Number — sequential FY number auto-assigned when BD stage = "Proposal".
+        # Format: YYYY-YYYY+1/NNN  e.g. 2026-2027/001
+        "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS proposal_number VARCHAR(30) UNIQUE",
+        # BD Stage rename: "Feature Follow-up" → "Future Follow-up"
+        "UPDATE proposal_estimates SET bd_status = 'Future Follow-up' WHERE bd_status = 'Feature Follow-up'",
     ]
     for stmt in statements:
         try:

@@ -664,6 +664,7 @@ class ProposalEstimate(Base):
     approved_at      = Column(DateTime(timezone=True), nullable=True)
     bd_status        = Column(String(100), nullable=True)   # Business Development stage
     bd_status_date   = Column(Date, nullable=True)          # Date of that BD stage
+    proposal_number  = Column(String(30), nullable=True, unique=True)  # Auto-generated FY number e.g. 2026-2027/001
     creator          = relationship("User", foreign_keys=[created_by])
     approver         = relationship("User", foreign_keys=[approved_by])
     sections         = relationship("ProposalSection",  back_populates="proposal",

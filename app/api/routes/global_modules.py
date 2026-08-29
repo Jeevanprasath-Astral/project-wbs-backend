@@ -298,12 +298,12 @@ def update_global_assignment(
 ):
     """Project-agnostic update — works for both project-linked tasks and
     General Tasks, since it looks the assignment up by id alone.
-    Only the assigner (assigned_by) or an Admin may edit."""
+    Any authenticated user can update (e.g. assignee changing their status)."""
     a = db.query(TaskAssignment).filter_by(id=assignment_id).first()
     if not a:
         raise HTTPException(404, "Assignment not found")
-    if not is_admin(current_user) and a.assigned_by != current_user.id:
-        raise HTTPException(403, "Only the assigner or an Admin can edit this task")
+    # Any authenticated user may update an assignment (e.g. change their own status).
+    # Deletion still requires elevated privileges (enforced in the DELETE route).
 
     for k, v in payload.model_dump(exclude_none=True).items():
         setattr(a, k, v)

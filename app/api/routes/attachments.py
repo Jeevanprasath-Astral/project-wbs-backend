@@ -13,11 +13,12 @@ import uuid
 from app.db.database import get_db
 from app.models.models import Attachment, User
 from app.core.deps import get_current_user
-from app.utils.cloudinary_helper import upload_file, delete_file, build_url
+from fastapi.responses import RedirectResponse
+from app.utils.cloudinary_helper import upload_file, delete_file, build_url, build_download_url
 
 router = APIRouter(prefix="/attachments", tags=["Attachments"])
 
-VALID_ENTITY_TYPES = {"milestone", "task", "subtask", "activity", "report"}
+VALID_ENTITY_TYPES = {"milestone", "task", "subtask", "activity", "report", "billing_entry"}
 
 
 def _build(a: Attachment):
@@ -33,6 +34,7 @@ def _build(a: Attachment):
         "uploader_name": a.uploader.name if a.uploader else None,
         "created_at": a.created_at,
         "url": build_url(a.stored_filename) if a.stored_filename else None,
+        "download_url": build_download_url(a.stored_filename, a.original_filename) if a.stored_filename else None,
     }
 
 
@@ -81,6 +83,21 @@ async def upload_attachment(
     db.commit()
     db.refresh(a)
     return _build(a)
+
+
+@router.get("/{attachment_id}/download")
+def download_attachment(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Redirect to a Cloudinary URL with fl_attachment so the browser always
+    prompts a file save dialog instead of opening the file inline."""
+    a = db.query(Attachment).filter_by(id=attachment_id).first()
+    if not a:
+        raise HTTPException(404, "Attachment not found")
+    url = build_download_url(a.stored_filename, a.original_filename)
+    return RedirectResponse(url=url)
 
 
 @router.delete("/{attachment_id}")

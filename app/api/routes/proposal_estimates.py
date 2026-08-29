@@ -78,6 +78,28 @@ def _require_delete(proposal: ProposalEstimate, user: User):
     raise HTTPException(403, "You do not have permission to delete this proposal")
 
 
+# ─── Proposal Number helpers ──────────────────────────────────────────────────
+
+def _get_financial_year() -> tuple:
+    """Return (fy_start, fy_end) for the current Indian financial year (Apr–Mar)."""
+    from datetime import date
+    today = date.today()
+    fy_start = today.year if today.month >= 4 else today.year - 1
+    return fy_start, fy_start + 1
+
+
+def _generate_proposal_number(db) -> str:
+    """Return the next sequential proposal number for the current financial year.
+    Format: YYYY-YYYY+1/NNN  e.g. 2026-2027/001
+    The UNIQUE constraint on the column prevents duplicates on concurrent requests."""
+    fy_start, fy_end = _get_financial_year()
+    fy_prefix = f"{fy_start}-{fy_end}"
+    existing_count = db.query(ProposalEstimate).filter(
+        ProposalEstimate.proposal_number.like(f"{fy_prefix}/%")
+    ).count()
+    return f"{fy_prefix}/{existing_count + 1:03d}"
+
+
 # ─── Serializers ──────────────────────────────────────────────────────────────
 
 def _ser_proposal(p: ProposalEstimate) -> dict:
@@ -99,6 +121,8 @@ def _ser_proposal(p: ProposalEstimate) -> dict:
         "approved_at":      p.approved_at.isoformat() if p.approved_at else None,
         "bd_status":        p.bd_status,
         "bd_status_date":   p.bd_status_date.isoformat() if p.bd_status_date else None,
+        "proposal_number":  p.proposal_number,
+        "estimation_total_cost": sum(r.total_cost or 0 for r in p.estimation_rows) or None,
     }
 
 
@@ -280,6 +304,7 @@ def list_proposals(
         .options(
             selectinload(ProposalEstimate.creator),
             selectinload(ProposalEstimate.approver),
+            selectinload(ProposalEstimate.estimation_rows),
         )
     )
     if status:
@@ -341,8 +366,8 @@ def update_proposal(
     p = db.query(ProposalEstimate).filter_by(id=proposal_id).first()
     if not p:
         raise HTTPException(404, "Proposal not found")
-    if p.status in ("Approved", "Archived"):
-        raise HTTPException(400, "Cannot edit an Approved or Archived proposal")
+    # Editing is allowed regardless of status so CAN_EDIT_ROLES can revise
+    # Approved / Archived proposals (e.g. scope corrections, V2 updates).
     if payload.client_name is not None:
         p.client_name = payload.client_name
     if payload.project_name is not None:
@@ -351,6 +376,9 @@ def update_proposal(
         p.project_category = payload.project_category
     if payload.bd_status is not None:
         p.bd_status = payload.bd_status or None
+        # Auto-assign a Proposal Number the first time BD Stage is set to "Proposal"
+        if p.bd_status == "Proposal" and not p.proposal_number:
+            p.proposal_number = _generate_proposal_number(db)
     if payload.bd_status_date is not None:
         if payload.bd_status_date == "":
             p.bd_status_date = None
@@ -1008,6 +1036,35 @@ def archive_proposal_v2(
     p.status = "Archived"
     _log_audit(db, proposal_id, "archived", current_user.id,
                from_status=old_status, to_status="Archived")
+    db.commit()
+    db.refresh(p)
+    return _ser_proposal(p)
+
+
+# ── Admin: force-status override ──────────────────────────────────────────────
+_VALID_STATUSES = {"Draft", "Submitted", "Approved", "Rejected", "Archived"}
+
+@router.patch("/proposal-estimates/{proposal_id}/force-status")
+def force_proposal_status(
+    proposal_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Admin-only: directly set any proposal status (e.g. Archived → Approved)."""
+    if not is_admin(current_user):
+        raise HTTPException(403, "Only Admin can override proposal status")
+    new_status = (payload.get("status") or "").strip()
+    if new_status not in _VALID_STATUSES:
+        raise HTTPException(400, f"status must be one of: {', '.join(sorted(_VALID_STATUSES))}")
+    p = db.query(ProposalEstimate).filter_by(id=proposal_id).first()
+    if not p:
+        raise HTTPException(404, "Proposal not found")
+    old_status = p.status
+    p.status = new_status
+    _log_audit(db, proposal_id, "force_status", current_user.id,
+               from_status=old_status, to_status=new_status,
+               note=f"Admin override by {current_user.name}")
     db.commit()
     db.refresh(p)
     return _ser_proposal(p)
