@@ -1051,9 +1051,9 @@ def force_proposal_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Admin-only: directly set any proposal status (e.g. Archived → Approved)."""
-    if not is_admin(current_user):
-        raise HTTPException(403, "Only Admin can override proposal status")
+    """Admin / Project Manager: directly set any proposal status (e.g. Archived → Approved)."""
+    if current_user.role not in {"Admin", "Project Manager"}:
+        raise HTTPException(403, "Only Admin or Project Manager can override proposal status")
     new_status = (payload.get("status") or "").strip()
     if new_status not in _VALID_STATUSES:
         raise HTTPException(400, f"status must be one of: {', '.join(sorted(_VALID_STATUSES))}")
