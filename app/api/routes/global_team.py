@@ -26,6 +26,7 @@ ROLE_PERMISSIONS = {
     # Legacy roles — same permissions as Associate
     "Functional Consultant": ["create_requirements","manage_milestones","assign_tasks","set_timelines","view_reports","view_dashboard"],
     "Technical Team": ["manage_dev_tasks","update_status","view_reports","view_dashboard"],
+    "BD": ["create_requirements","assign_tasks","set_timelines","view_reports","view_dashboard","manage_proposals"],
     "HR": ["add_members","manage_teams","manage_holidays","approve_leave","view_reports","view_dashboard"],
     "Client": ["view_dashboard","view_reports"],
 }

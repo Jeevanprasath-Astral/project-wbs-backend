@@ -42,12 +42,15 @@ from app.models.models import (
 )
 from app.api.routes.auth import get_current_user
 from app.core.permissions import is_admin
+from app.services.email_service import send_email
+import logging as _logging
+_logger = _logging.getLogger(__name__)
 
 router = APIRouter(tags=["proposal-estimates"])
 
 # ─── Permission helpers ────────────────────────────────────────────────────────
 
-_CAN_EDIT_ROLES  = {"Admin", "Project Manager", "FC Lead", "TC Lead"}
+_CAN_EDIT_ROLES  = {"Admin", "Project Manager", "FC Lead", "TC Lead", "BD"}
 _CAN_APPROVE_ROLES = {"Admin", "Project Manager"}
 
 
@@ -70,7 +73,9 @@ def _require_approve(user: User):
 
 
 def _require_delete(proposal: ProposalEstimate, user: User):
-    """Admin/PM can delete any; FC Lead/TC Lead can delete proposals they created."""
+    """Admin/PM can delete any; FC Lead/TC Lead can delete proposals they created. BD cannot delete."""
+    if user.role == "BD":
+        raise HTTPException(403, "BD users cannot delete proposals")
     if is_admin(user) or user.role == "Project Manager":
         return
     if user.role in {"FC Lead", "TC Lead"} and proposal.created_by == user.id:
@@ -122,6 +127,7 @@ def _ser_proposal(p: ProposalEstimate) -> dict:
         "bd_status":        p.bd_status,
         "bd_status_date":   p.bd_status_date.isoformat() if p.bd_status_date else None,
         "proposal_number":  p.proposal_number,
+        "proposal_value":   p.proposal_value,
         "estimation_total_cost": sum(r.total_cost or 0 for r in p.estimation_rows) or None,
     }
 
@@ -206,6 +212,7 @@ class ProposalUpdate(BaseModel):
     project_category: Optional[str] = None
     bd_status:        Optional[str] = None
     bd_status_date:   Optional[str] = None  # ISO date string "YYYY-MM-DD" or ""
+    proposal_value:   Optional[float] = None  # Manual BD-entered proposal value (₹)
 
 
 class SectionUpsert(BaseModel):
@@ -340,6 +347,28 @@ def create_proposal(
         db.add(ProposalSection(proposal_id=p.id, section_type=stype, content=""))
     db.commit()
     db.refresh(p)
+    # BD users: notify all Project Managers by email
+    if current_user.role == "BD":
+        pms = db.query(User).filter(User.role == "Project Manager").all()
+        for pm in pms:
+            if pm.email:
+                try:
+                    send_email(
+                        to=pm.email,
+                        subject=f"[AXON] New Proposal Created by BD: {p.client_name}",
+                        body=f"""
+                        <p>Hi {pm.name},</p>
+                        <p><strong>{current_user.name}</strong> (BD) has created a new proposal:</p>
+                        <ul>
+                          <li><strong>Client:</strong> {p.client_name}</li>
+                          <li><strong>Project:</strong> {p.project_name or '—'}</li>
+                          <li><strong>Category:</strong> {p.project_category or '—'}</li>
+                        </ul>
+                        <p>Please review it in AXON.</p>
+                        """,
+                    )
+                except Exception as e:
+                    _logger.warning(f"BD proposal PM notification failed for {pm.email}: {e}")
     return _ser_proposal(p)
 
 
@@ -388,6 +417,8 @@ def update_proposal(
                 p.bd_status_date = _date.fromisoformat(payload.bd_status_date)
             except ValueError:
                 pass
+    if payload.proposal_value is not None:
+        p.proposal_value = payload.proposal_value
     db.commit()
     db.refresh(p)
     return _ser_proposal(p)

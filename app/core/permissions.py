@@ -2,9 +2,11 @@
 
 Role hierarchy (highest to lowest):
   Admin                  - full access to everything, including Financial Settings.
-  Project Manager        - elevated access; can create projects; NO Financial Settings.
-  FC Lead                - elevated access; CANNOT create projects; NO Financial Settings.
-  TC Lead                - elevated access; CANNOT create projects; NO Financial Settings.
+  Project Manager        - elevated access; can create projects; has Financial Settings access.
+  FC Lead                - elevated access; CANNOT create projects; has Financial Settings access.
+  TC Lead                - elevated access; CANNOT create projects; has Financial Settings access.
+  BD                     - Business Development; DA-level view + task assignments + proposal
+                           create/edit (no delete); PM notified on proposal creation.
   Associate Data Analyst - all-module VIEW access + Cost Management write + Financial
                            Settings; CANNOT assign or delete tasks.
   Associate              - standard access (replaces Functional Consultant / Technical Team).
@@ -30,17 +32,19 @@ swap conditions with a minimal diff.
 """
 
 ELEVATED_ROLES         = {"Admin", "Project Manager", "FC Lead", "TC Lead"}
-DA_ROLES               = {"Associate Data Analyst"}
+DA_ROLES               = {"Associate Data Analyst", "BD"}
 PROJECT_CREATOR_ROLES  = {"Admin", "Project Manager", "FC Lead"}
 TEAM_MANAGER_ROLES     = {"Admin", "HR", "Project Manager"}
 TIMESHEET_MANAGER_ROLES = {"Admin", "HR", "Project Manager"}
-FINANCIAL_SETTINGS_ROLES = {"Admin", "HR", "Project Manager", "Associate Data Analyst"}
+FINANCIAL_SETTINGS_ROLES = {"Admin", "HR", "Project Manager", "FC Lead", "TC Lead", "Associate Data Analyst"}
+# BD role — can create/edit proposals and assign tasks; gets DA-level view access
+BD_ROLES               = {"BD"}
 
 # All role strings the app knows about — used by the Team page's role
 # dropdown and any place that needs to enumerate valid roles.
 ALL_ROLES = [
     "Admin", "Project Manager", "FC Lead", "TC Lead",
-    "Associate Data Analyst", "Associate", "HR", "Client",
+    "BD", "Associate Data Analyst", "Associate", "HR", "Client",
 ]
 
 # Legacy roles kept for backwards compatibility with existing user data
@@ -59,13 +63,18 @@ def is_elevated(user) -> bool:
 
 
 def is_data_analyst(user) -> bool:
-    """Associate Data Analyst role check."""
+    """Associate Data Analyst or BD role check."""
     return getattr(user, "role", None) in DA_ROLES
+
+
+def is_bd(user) -> bool:
+    """BD (Business Development) role check."""
+    return getattr(user, "role", None) in BD_ROLES
 
 
 def can_view_elevated(user) -> bool:
     """See all users' data (work hours, assignments, audit log, reports).
-    Elevated roles + Associate Data Analyst."""
+    Elevated roles + Associate Data Analyst + BD."""
     return getattr(user, "role", None) in ELEVATED_ROLES | DA_ROLES
 
 

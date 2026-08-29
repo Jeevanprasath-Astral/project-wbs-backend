@@ -493,6 +493,7 @@ def _run_lightweight_migrations():
         # Proposal Number — sequential FY number auto-assigned when BD stage = "Proposal".
         # Format: YYYY-YYYY+1/NNN  e.g. 2026-2027/001
         "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS proposal_number VARCHAR(30) UNIQUE",
+        "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS proposal_value FLOAT",
         # BD Stage rename: "Feature Follow-up" → "Future Follow-up"
         "UPDATE proposal_estimates SET bd_status = 'Future Follow-up' WHERE bd_status = 'Feature Follow-up'",
     ]

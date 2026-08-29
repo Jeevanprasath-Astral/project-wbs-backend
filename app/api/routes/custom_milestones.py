@@ -1261,7 +1261,8 @@ def update_milestone(
         )
     db.flush()
     if ms.assignee and ms.assignee != old_assignee:
-        _notify_assignee(db, project_id, "Milestone", ms.name, ms.assignee, ms.planned_end)
+        for _name in [n.strip() for n in ms.assignee.split(',') if n.strip()]:
+            _notify_assignee(db, project_id, "Milestone", ms.name, _name, ms.planned_end)
     log_action(db, actor=current_user.name, action="update_milestone",
                description=f"Milestone {ms.num} '{ms.name}' updated",
                project_id=project_id, entity_type="custom_milestone", entity_id=ms.id,
