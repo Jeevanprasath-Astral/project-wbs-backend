@@ -395,30 +395,33 @@ def _build_ctx(ms: "CustomMilestone", ctx: dict, compact: bool = False):
 
 def _notify_task_assignment(db: Session, project_id: int, task: CustomTask, milestone_name: str):
     """Requirement: once a Task is assigned, auto-generate an email AND a
-    Notifications-tab entry for the assignee."""
-    user = _resolve_user_by_name(db, task.assignee)
+    Notifications-tab entry for each assignee (supports comma-separated multi-assignee)."""
     project = db.query(Project).filter_by(id=project_id).first()
     project_name = project.name if project else "—"
-    message = f"Task '{task.name}' (Milestone: {milestone_name}) assigned to {task.assignee}."
-    email_to = user.email if user else None
-    email_subject = f"[{project_name}] Task assigned to you — {task.name}"
     due = task.planned_end.strftime("%Y-%m-%d") if task.planned_end else None
-    email_body = f"""
-    <p>Hi {user.name if user else task.assignee},</p>
+    # Support comma-separated multi-assignee (e.g. "Alice, Bob")
+    names = [n.strip() for n in (task.assignee or "").split(",") if n.strip()]
+    for assignee_name in names:
+        user = _resolve_user_by_name(db, assignee_name)
+        message = f"Task '{task.name}' (Milestone: {milestone_name}) assigned to {assignee_name}."
+        email_to = user.email if user else None
+        email_subject = f"[{project_name}] Task assigned to you — {task.name}"
+        email_body = f"""
+    <p>Hi {user.name if user else assignee_name},</p>
     <p>A new task has been assigned to you in <strong>{project_name}</strong> (Milestone: {milestone_name}):</p>
     <p><strong>Task:</strong> {task.name}</p>
     {f'<p><strong>Planned End Date:</strong> {due}</p>' if due else ''}
     <p>Please log in to review and start working on this task.</p>
     <p>Regards,<br>Project WBS System</p>
     """
-    create_notification(
-        db, project_id, "assignment", message,
-        user_id=user.id if user else None,
-        email_to=email_to,
-        send_now=bool(email_to),
-        email_subject=email_subject,
-        email_body=email_body,
-    )
+        create_notification(
+            db, project_id, "assignment", message,
+            user_id=user.id if user else None,
+            email_to=email_to,
+            send_now=bool(email_to),
+            email_subject=email_subject,
+            email_body=email_body,
+        )
 
 
 def _notify_assignee(db: Session, project_id: int, entity_type: str, entity_name: str, assignee_name: str, due_date=None):

@@ -54,9 +54,24 @@ def register(payload: UserCreate, db: Session = Depends(get_db),
     db.refresh(user)
     return user
 
-@router.get("/me", response_model=UserOut)
-def me(current_user: User = Depends(get_current_user)):
-    return current_user
+@router.get("/me")
+def me(current_user: User = Depends(get_current_user),
+       db: Session = Depends(get_db)):
+    """Return user profile + live role-permission map."""
+    try:
+        from app.api.routes.role_permissions import get_permissions_for_role
+        permissions = get_permissions_for_role(db, current_user.role)
+    except Exception:
+        permissions = None
+    return {
+        "id":          current_user.id,
+        "name":        current_user.name,
+        "email":       current_user.email,
+        "role":        current_user.role,
+        "is_active":   current_user.is_active,
+        "cost_rate":   getattr(current_user, "cost_rate", 0.0),
+        "permissions": permissions,
+    }
 
 @router.post("/forgot-password")
 def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):

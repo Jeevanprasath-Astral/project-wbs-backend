@@ -33,6 +33,7 @@ class UserOut(BaseModel):
     role: str
     is_active: bool
     cost_rate: Optional[float] = 0.0
+    permissions: Optional[dict] = None
     model_config = {"from_attributes": True}
 
 # ── Projects ──────────────────────────────────────────────────────────────────

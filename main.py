@@ -13,7 +13,8 @@ from app.api.routes import (auth, projects, milestones, responses,
                              team_utilization_report, cost_breakdown_report,
                              billing_statement_report, hours_tracker,
                              report_templates, attachments, billing_reports,
-                             da_project_reports, proposal_estimates)
+                             da_project_reports, proposal_estimates,
+                             role_permissions)
 from fastapi.staticfiles import StaticFiles
 from app.services.scheduler import start_scheduler, stop_scheduler
 
@@ -496,6 +497,21 @@ def _run_lightweight_migrations():
         "ALTER TABLE proposal_estimates ADD COLUMN IF NOT EXISTS proposal_value FLOAT",
         # BD Stage rename: "Feature Follow-up" → "Future Follow-up"
         "UPDATE proposal_estimates SET bd_status = 'Future Follow-up' WHERE bd_status = 'Feature Follow-up'",
+
+        # ── Role Access Control — permission matrix ───────────────────────────
+        """CREATE TABLE IF NOT EXISTS role_permissions (
+            id         SERIAL PRIMARY KEY,
+            role       VARCHAR(100) NOT NULL,
+            module     VARCHAR(100) NOT NULL,
+            can_view   BOOLEAN NOT NULL DEFAULT TRUE,
+            can_create BOOLEAN NOT NULL DEFAULT FALSE,
+            can_edit   BOOLEAN NOT NULL DEFAULT FALSE,
+            can_delete BOOLEAN NOT NULL DEFAULT FALSE,
+            updated_at TIMESTAMPTZ DEFAULT now(),
+            CONSTRAINT uq_role_module UNIQUE (role, module)
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_role_permissions_role   ON role_permissions(role)",
+        "CREATE INDEX IF NOT EXISTS ix_role_permissions_module ON role_permissions(module)",
     ]
     for stmt in statements:
         try:
@@ -824,7 +840,8 @@ for router in [auth, projects, milestones, responses, dashboard,
                team_utilization_report, cost_breakdown_report,
                billing_statement_report, hours_tracker,
                report_templates, attachments, billing_reports,
-               da_project_reports, proposal_estimates]:
+               da_project_reports, proposal_estimates,
+               role_permissions]:
     app.include_router(router.router, prefix="/api")
 
 # Extra routers from global_team module (custom roles + assignment categories)
@@ -1128,6 +1145,15 @@ def _migrate_form_fields(db):
 @app.on_event("startup")
 def startup():
     start_scheduler()
+    # Seed role permissions defaults (idempotent — only inserts missing rows)
+    try:
+        from app.db.database import SessionLocal
+        from app.api.routes.role_permissions import seed_defaults
+        db = SessionLocal()
+        seed_defaults(db)
+        db.close()
+    except Exception as e:
+        logging.warning(f"Role-permission seed failed: {e}")
     try:
         from app.db.database import SessionLocal
         from app.services.progress_service import fix_existing_progress

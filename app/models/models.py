@@ -791,3 +791,22 @@ class Attachment(Base):
     uploaded_by       = Column(Integer, ForeignKey("users.id"))
     created_at        = Column(DateTime(timezone=True), server_default=func.now())
     uploader          = relationship("User", foreign_keys=[uploaded_by])
+
+
+class RolePermission(Base):
+    """Configurable role-based access control matrix.
+    One row per (role, module) pair — e.g. role='BD', module='proposals'.
+    Seeded with defaults on first deploy; editable via Team Hub → Role Access UI."""
+    __tablename__ = "role_permissions"
+    id         = Column(Integer, primary_key=True, index=True)
+    role       = Column(String(100), nullable=False, index=True)
+    module     = Column(String(100), nullable=False, index=True)
+    can_view   = Column(Boolean, default=True,  nullable=False)
+    can_create = Column(Boolean, default=False, nullable=False)
+    can_edit   = Column(Boolean, default=False, nullable=False)
+    can_delete = Column(Boolean, default=False, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (
+        # Each role+module pair must be unique
+        __import__('sqlalchemy').UniqueConstraint('role', 'module', name='uq_role_module'),
+    )
