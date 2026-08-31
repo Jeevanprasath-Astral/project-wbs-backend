@@ -34,6 +34,10 @@ ALL_MODULES = [
     {"key": "team_hub",           "label": "🤝 Team Hub"},
     {"key": "projects",           "label": "🗂️ Projects"},
     {"key": "working_hours",      "label": "⏱️ Working Hours"},
+    {"key": "dashboard",          "label": "📊 Global Dashboard"},
+    {"key": "deadlines",          "label": "📅 Deadlines"},
+    {"key": "workload",           "label": "👥 Team Workload"},
+    {"key": "billing",            "label": "🧾 Billing"},
 ]
 
 # ── Default permissions seed (role → module → actions) ───────────────────────
@@ -160,6 +164,59 @@ DEFAULTS = [
     ("Technical Team",        "team_hub",            True,  False, False, False),
     ("Technical Team",        "projects",            True,  False, False, False),
     ("Technical Team",        "working_hours",       True,  True,  False, False),
+
+    # ── New modules: dashboard, deadlines, workload, billing ─────────────────
+    # dashboard (Global Dashboard — read-only for all except Admin)
+    ("Admin",                 "dashboard",           True,  True,  True,  True),
+    ("Project Manager",       "dashboard",           True,  False, False, False),
+    ("FC Lead",               "dashboard",           True,  False, False, False),
+    ("TC Lead",               "dashboard",           True,  False, False, False),
+    ("BD",                    "dashboard",           True,  False, False, False),
+    ("HR",                    "dashboard",           True,  False, False, False),
+    ("Associate Data Analyst","dashboard",           True,  False, False, False),
+    ("Associate",             "dashboard",           True,  False, False, False),
+    ("Client",                "dashboard",           False, False, False, False),
+    ("Functional Consultant", "dashboard",           True,  False, False, False),
+    ("Technical Team",        "dashboard",           True,  False, False, False),
+
+    # deadlines (Global Deadlines — leads can edit their own deadlines)
+    ("Admin",                 "deadlines",           True,  True,  True,  True),
+    ("Project Manager",       "deadlines",           True,  True,  True,  False),
+    ("FC Lead",               "deadlines",           True,  True,  True,  False),
+    ("TC Lead",               "deadlines",           True,  True,  True,  False),
+    ("BD",                    "deadlines",           True,  False, False, False),
+    ("HR",                    "deadlines",           True,  False, False, False),
+    ("Associate Data Analyst","deadlines",           True,  False, False, False),
+    ("Associate",             "deadlines",           True,  False, False, False),
+    ("Client",                "deadlines",           True,  False, False, False),
+    ("Functional Consultant", "deadlines",           True,  False, False, False),
+    ("Technical Team",        "deadlines",           True,  False, False, False),
+
+    # workload (Team Workload — managers can assign; others view only)
+    ("Admin",                 "workload",            True,  True,  True,  True),
+    ("Project Manager",       "workload",            True,  True,  True,  False),
+    ("FC Lead",               "workload",            True,  False, False, False),
+    ("TC Lead",               "workload",            True,  False, False, False),
+    ("BD",                    "workload",            True,  False, False, False),
+    ("HR",                    "workload",            True,  True,  False, False),
+    ("Associate Data Analyst","workload",            True,  False, False, False),
+    ("Associate",             "workload",            True,  False, False, False),
+    ("Client",                "workload",            False, False, False, False),
+    ("Functional Consultant", "workload",            True,  False, False, False),
+    ("Technical Team",        "workload",            True,  False, False, False),
+
+    # billing (Billing Statement / Monthly Billing / Billing Status)
+    ("Admin",                 "billing",             True,  True,  True,  True),
+    ("Project Manager",       "billing",             True,  True,  True,  False),
+    ("FC Lead",               "billing",             True,  True,  True,  False),
+    ("TC Lead",               "billing",             True,  True,  True,  False),
+    ("BD",                    "billing",             False, False, False, False),
+    ("HR",                    "billing",             True,  True,  True,  False),
+    ("Associate Data Analyst","billing",             True,  False, False, False),
+    ("Associate",             "billing",             False, False, False, False),
+    ("Client",                "billing",             False, False, False, False),
+    ("Functional Consultant", "billing",             False, False, False, False),
+    ("Technical Team",        "billing",             False, False, False, False),
 ]
 
 
