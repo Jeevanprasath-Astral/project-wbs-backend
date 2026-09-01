@@ -38,6 +38,7 @@ ALL_MODULES = [
     {"key": "deadlines",          "label": "📅 Deadlines"},
     {"key": "workload",           "label": "👥 Team Workload"},
     {"key": "billing",            "label": "🧾 Billing"},
+    {"key": "project_team",       "label": "🏗️ Project Team"},
 ]
 
 # ── Default permissions seed (role → module → actions) ───────────────────────
@@ -217,6 +218,19 @@ DEFAULTS = [
     ("Client",                "billing",             False, False, False, False),
     ("Functional Consultant", "billing",             False, False, False, False),
     ("Technical Team",        "billing",             False, False, False, False),
+
+    # project_team (Project-level Team page — view=sidebar visible, create=add, delete=remove)
+    ("Admin",                 "project_team",        True,  True,  True,  True),
+    ("Project Manager",       "project_team",        True,  True,  True,  True),
+    ("FC Lead",               "project_team",        True,  True,  False, True),
+    ("TC Lead",               "project_team",        True,  False, False, False),
+    ("BD",                    "project_team",        False, False, False, False),
+    ("HR",                    "project_team",        True,  True,  True,  True),
+    ("Associate Data Analyst","project_team",        False, False, False, False),
+    ("Associate",             "project_team",        False, False, False, False),
+    ("Client",                "project_team",        False, False, False, False),
+    ("Functional Consultant", "project_team",        False, False, False, False),
+    ("Technical Team",        "project_team",        False, False, False, False),
 ]
 
 
