@@ -135,7 +135,8 @@ def _milestone_actual_hours(db: Session, ms_id: int) -> float:
 
 
 def _milestone_budgeted_hours(db: Session, ms_id: int) -> float:
-    """Sum estimated_hours from subtasks + activities under this milestone."""
+    """Sum estimated_hours from subtasks + activities under this milestone.
+    Falls back to task-level estimated_hours when subtasks/activities have none."""
     task_ids = [t.id for t in db.query(CustomTask.id).filter_by(milestone_id=ms_id).all()]
     subtask_ids = [s.id for s in db.query(CustomSubtask.id).filter(
         CustomSubtask.task_id.in_(task_ids)).all()] if task_ids else []
@@ -144,7 +145,13 @@ def _milestone_budgeted_hours(db: Session, ms_id: int) -> float:
         CustomSubtask.id.in_(subtask_ids)).scalar() if subtask_ids else 0.0
     act_hrs = db.query(func.coalesce(func.sum(Activity.estimated_hours), 0.0)).filter(
         Activity.subtask_id.in_(subtask_ids)).scalar() if subtask_ids else 0.0
-    return round(float(sub_hrs or 0) + float(act_hrs or 0), 2)
+    total = round(float(sub_hrs or 0) + float(act_hrs or 0), 2)
+    # Fallback: no subtask/activity hours found → use task-level estimated_hours
+    if total == 0.0 and task_ids:
+        task_hrs = db.query(func.coalesce(func.sum(CustomTask.estimated_hours), 0.0)).filter(
+            CustomTask.id.in_(task_ids)).scalar()
+        total = round(float(task_hrs or 0), 2)
+    return total
 
 
 def _parse_date(s: Optional[str]):
