@@ -294,6 +294,105 @@ def timeline_report(
                         "timeline-report.xlsx", subtitle)
 
 
+# ── 3. JSON preview endpoints (same filters, returns list[dict] not xlsx) ────
+@router.get("/budgeted-vs-actual/data")
+def budgeted_vs_actual_data(
+    project_id:  Optional[int] = None,
+    assignee:    Optional[str] = None,
+    team:        Optional[str] = None,
+    status:      Optional[str] = None,
+    start_date:  Optional[str] = None,
+    end_date:    Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the same rows as the xlsx export but as JSON — used for the
+    in-page preview table so the user can see the data before exporting."""
+    start = _parse_date(start_date)
+    end   = _parse_date(end_date)
+
+    q = db.query(CustomMilestone)
+    if project_id:
+        q = q.filter(CustomMilestone.project_id == project_id)
+    if assignee:
+        q = q.filter(CustomMilestone.assignee.ilike(f"%{assignee}%"))
+    if status:
+        q = q.filter(CustomMilestone.status == status)
+    if start:
+        q = q.filter(CustomMilestone.actual_start >= start)
+    if end:
+        q = q.filter(CustomMilestone.actual_end <= end)
+
+    milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
+
+    if team:
+        milestones = [ms for ms in milestones if _assignee_team(db, ms.assignee) == team]
+
+    # Pre-fetch all projects in one query to avoid N+1
+    project_ids = list({ms.project_id for ms in milestones})
+    projects_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(project_ids)).all()} if project_ids else {}
+
+    rows = []
+    for ms in milestones:
+        proj = projects_map.get(ms.project_id)
+        team_name = _assignee_team(db, ms.assignee)
+        budgeted  = _milestone_budgeted_hours(db, ms.id)
+        actual    = _milestone_actual_hours(db, ms.id)
+        rows.append({
+            "individual_name":  ms.assignee or "—",
+            "project":          proj.name if proj else "—",
+            "team":             team_name or "—",
+            "start_date":       _fmt_dt(ms.actual_start),
+            "end_date":         _fmt_dt(ms.actual_end),
+            "budgeted_hours":   budgeted,
+            "actual_hours":     actual,
+            "status":           ms.status or "—",
+        })
+    return rows
+
+
+@router.get("/timeline/data")
+def timeline_data(
+    project_id:  Optional[int] = None,
+    status:      Optional[str] = None,
+    start_date:  Optional[str] = None,
+    end_date:    Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return Timeline report rows as JSON for in-page preview."""
+    start = _parse_date(start_date)
+    end   = _parse_date(end_date)
+
+    q = db.query(CustomMilestone)
+    if project_id:
+        q = q.filter(CustomMilestone.project_id == project_id)
+    if status:
+        q = q.filter(CustomMilestone.status == status)
+    if start:
+        q = q.filter(CustomMilestone.planned_end >= start)
+    if end:
+        q = q.filter(CustomMilestone.planned_end <= end)
+
+    milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
+
+    project_ids = list({ms.project_id for ms in milestones})
+    projects_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(project_ids)).all()} if project_ids else {}
+
+    rows = []
+    for ms in milestones:
+        proj = projects_map.get(ms.project_id)
+        rows.append({
+            "milestone":                 ms.name,
+            "project":                   proj.name if proj else "—",
+            "planned_end_date":          _fmt_dt(ms.planned_end),
+            "actual_end_date":           _fmt_dt(ms.actual_end),
+            "schedule_variance_reason":  ms.schedule_variance_reason or "",
+            "status":                    ms.status or "—",
+        })
+    return rows
+
+
 # ── Filter options (feed the frontend dropdowns) ─────────────────────────────
 @router.get("/filter-options")
 def filter_options(
