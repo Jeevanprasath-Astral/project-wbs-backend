@@ -14,8 +14,9 @@ Two Excel report exports spanning all projects (global scope):
 
 Both endpoints accept data-filter query params that narrow which milestones
 appear in the output (project_id, assignee, team_id, status, start_date,
-end_date). start_date/end_date filter on the milestone's actual_start/actual_end
-for the Budgeted report and on planned_end for the Timeline report.
+end_date). start_date/end_date filter on coalesce(actual_start, planned_start) /
+coalesce(actual_end, planned_end) for the Budgeted report so milestones with no
+actual dates still appear; the Timeline report filters on planned_end.
 
 Mirrors the openpyxl → BytesIO → StreamingResponse convention from
 timesheet_reports.py.
@@ -23,7 +24,7 @@ timesheet_reports.py.
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, case
 from typing import Optional
 from datetime import date as date_cls
 from io import BytesIO
@@ -185,10 +186,16 @@ def budgeted_vs_actual_report(
         q = q.filter(CustomMilestone.assignee.ilike(f"%{assignee}%"))
     if status:
         q = q.filter(CustomMilestone.status == status)
+    # Use planned dates as fallback when actual dates are NULL so milestones
+    # that have not yet started/ended are still included in the report.
     if start:
-        q = q.filter(CustomMilestone.actual_start >= start)
+        q = q.filter(
+            func.coalesce(CustomMilestone.actual_start, CustomMilestone.planned_start) >= start
+        )
     if end:
-        q = q.filter(CustomMilestone.actual_end <= end)
+        q = q.filter(
+            func.coalesce(CustomMilestone.actual_end, CustomMilestone.planned_end) <= end
+        )
 
     milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
 
@@ -318,10 +325,16 @@ def budgeted_vs_actual_data(
         q = q.filter(CustomMilestone.assignee.ilike(f"%{assignee}%"))
     if status:
         q = q.filter(CustomMilestone.status == status)
+    # Use planned dates as fallback when actual dates are NULL so milestones
+    # that have not yet started/ended are still included in the report.
     if start:
-        q = q.filter(CustomMilestone.actual_start >= start)
+        q = q.filter(
+            func.coalesce(CustomMilestone.actual_start, CustomMilestone.planned_start) >= start
+        )
     if end:
-        q = q.filter(CustomMilestone.actual_end <= end)
+        q = q.filter(
+            func.coalesce(CustomMilestone.actual_end, CustomMilestone.planned_end) <= end
+        )
 
     milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
 
