@@ -351,6 +351,58 @@ def team_utilization_export(
     )
 
 
+# ── JSON preview endpoint ─────────────────────────────────────────────────────
+@router.get("/data")
+def team_utilization_data(
+    start_date:  Optional[str] = None,
+    end_date:    Optional[str] = None,
+    role:        Optional[str] = None,
+    user_id:     Optional[int] = None,
+    project_id:  Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from datetime import date as date_cls
+
+    q = db.query(WorkHours).join(User, WorkHours.user_id == User.id)
+    if start_date:
+        q = q.filter(WorkHours.date >= date_cls.fromisoformat(start_date))
+    if end_date:
+        q = q.filter(WorkHours.date <= date_cls.fromisoformat(end_date))
+    if role:
+        q = q.filter(User.role == role)
+    if user_id:
+        q = q.filter(WorkHours.user_id == user_id)
+    if project_id:
+        q = q.filter(WorkHours.project_id == project_id)
+
+    wh_rows = q.all()
+    user_summary, _ = _aggregate(wh_rows, db)
+
+    sorted_users = sorted(user_summary.items(), key=lambda x: (x[1]["user"].name if x[1]["user"] else ""))
+
+    rows = []
+    for uid, d in sorted_users:
+        u     = d["user"]
+        tot   = d["total"]
+        bill  = d["billable"]
+        nbill = tot - bill
+        util  = _pct(bill, tot)
+        cost  = d["manpower_cost"]
+        nproj = len(d["project_ids"])
+        rows.append({
+            "name":           u.name if u else "—",
+            "role":           u.role if u else "—",
+            "total_hours":    _fmt(tot),
+            "billable_hours": _fmt(bill),
+            "non_billable":   _fmt(nbill),
+            "util_pct":       util if util != "" else None,
+            "manpower_cost":  _fmt(cost),
+            "project_count":  nproj,
+        })
+    return {"rows": rows}
+
+
 # ── Filter options ────────────────────────────────────────────────────────────
 @router.get("/filter-options")
 def filter_options(

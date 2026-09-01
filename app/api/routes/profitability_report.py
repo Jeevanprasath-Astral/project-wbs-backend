@@ -240,6 +240,44 @@ def profitability_report_export(
     )
 
 
+# ── JSON preview endpoint ─────────────────────────────────────────────────────
+@router.get("/data")
+def profitability_report_data(
+    project_id:  Optional[int] = None,
+    status:      Optional[str] = None,
+    start_date:  Optional[str] = None,
+    end_date:    Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    q = db.query(Project)
+    if project_id:
+        q = q.filter(Project.id == project_id)
+    if status:
+        q = q.filter(Project.status == status)
+    projects = q.order_by(Project.name).all()
+
+    rows = []
+    for p in projects:
+        m = _project_metrics(db, p)
+        rows.append({
+            "project":         p.name,
+            "status":          p.status or "—",
+            "billing":         m["billing"],
+            "total_hours":     m["total_hours"],
+            "billable_hours":  m["billable_hours"],
+            "util_pct":        m["util_pct"] if m["util_pct"] != "" else None,
+            "manpower_cost":   m["manpower_cost"],
+            "direct_expenses": m["direct_expenses"],
+            "indirect_cost":   m["indirect_cost"],
+            "total_cost":      m["total_cost"],
+            "net_profit":      m["net_profit"],
+            "margin_pct":      m["margin_pct"] if m["margin_pct"] != "" else None,
+            "recovery_pct":    m["recovery_pct"] if m["recovery_pct"] != "" else None,
+        })
+    return {"rows": rows}
+
+
 # ── Filter options ────────────────────────────────────────────────────────────
 @router.get("/filter-options")
 def filter_options(

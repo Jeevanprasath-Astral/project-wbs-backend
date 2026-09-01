@@ -294,6 +294,71 @@ def cost_breakdown_export(
     )
 
 
+# ── JSON preview endpoint ─────────────────────────────────────────────────────
+@router.get("/data")
+def cost_breakdown_data(
+    project_id: Optional[int] = None,
+    status:     Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date:   Optional[str] = None,
+    category:   Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from datetime import date as date_cls
+
+    pq = db.query(Project)
+    if project_id:
+        pq = pq.filter(Project.id == project_id)
+    if status:
+        pq = pq.filter(Project.status == status)
+    projects = pq.order_by(Project.name).all()
+    project_ids = [p.id for p in projects]
+
+    cq = db.query(ProjectCost).filter(ProjectCost.project_id.in_(project_ids))
+    if start_date:
+        cq = cq.filter(ProjectCost.date >= date_cls.fromisoformat(start_date))
+    if end_date:
+        cq = cq.filter(ProjectCost.date <= date_cls.fromisoformat(end_date))
+    if category:
+        cq = cq.filter(ProjectCost.category == category)
+    costs = cq.all()
+
+    proj_total_map = {}
+    proj_cat_map   = {}
+    for c in costs:
+        pid = c.project_id
+        cat = c.category or "Uncategorised"
+        proj_cat_map.setdefault(pid, {})
+        proj_cat_map[pid][cat] = proj_cat_map[pid].get(cat, 0.0) + float(c.cost or 0)
+        proj_total_map[pid]    = proj_total_map.get(pid, 0.0) + float(c.cost or 0)
+
+    rows = []
+    for p in projects:
+        total   = _fmt(proj_total_map.get(p.id, 0.0))
+        budget  = _fmt(p.budget or 0)
+        used_pct = _pct(total, budget)
+        rows.append({
+            "project":    p.name,
+            "status":     p.status or "—",
+            "budget":     budget if budget > 0 else None,
+            "total_cost": total,
+            "used_pct":   used_pct if used_pct != "" else None,
+            "remaining":  _fmt(budget - total) if budget > 0 else None,
+            "categories": [
+                {
+                    "category":  cat,
+                    "cost":      _fmt(cost),
+                    "share_pct": _pct(cost, proj_total_map.get(p.id, 0.0)),
+                }
+                for cat, cost in sorted(
+                    (proj_cat_map.get(p.id) or {}).items(), key=lambda x: -x[1]
+                )
+            ],
+        })
+    return {"rows": rows}
+
+
 # ── Filter options ────────────────────────────────────────────────────────────
 @router.get("/filter-options")
 def filter_options(

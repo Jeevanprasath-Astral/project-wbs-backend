@@ -326,6 +326,62 @@ def billing_statement_export(
     )
 
 
+# ── JSON preview endpoint ─────────────────────────────────────────────────────
+@router.get("/data")
+def billing_statement_data(
+    project_id:   Optional[int] = None,
+    start_date:   Optional[str] = None,
+    end_date:     Optional[str] = None,
+    billing_type: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from datetime import date as date_cls
+
+    q = db.query(ProjectBilling)
+    if project_id:
+        q = q.filter(ProjectBilling.project_id == project_id)
+    if start_date:
+        q = q.filter(ProjectBilling.actual_billing_date >= date_cls.fromisoformat(start_date))
+    if end_date:
+        q = q.filter(ProjectBilling.actual_billing_date <= date_cls.fromisoformat(end_date))
+    if billing_type:
+        q = q.filter(ProjectBilling.billing_type == billing_type)
+
+    entries = q.order_by(ProjectBilling.project_id, ProjectBilling.actual_billing_date).all()
+
+    proj_ids = list({e.project_id for e in entries})
+    proj_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(proj_ids)).all()}
+
+    milestone_cache = {}
+    for e in entries:
+        if e.milestone_id and e.milestone_id not in milestone_cache:
+            m = db.query(CustomMilestone.name).filter_by(id=e.milestone_id).first()
+            milestone_cache[e.milestone_id] = m.name if m else None
+
+    proj_entries = {}
+    for e in entries:
+        proj_entries.setdefault(e.project_id, []).append(e)
+
+    rows = []
+    for pid in sorted(proj_ids, key=lambda x: (proj_map.get(x) or Project()).name or ""):
+        p = proj_map.get(pid)
+        running = 0.0
+        for e in proj_entries.get(pid, []):
+            amt = float(e.actual_billing_amount if e.actual_billing_amount is not None else (e.planned_billing_amount or 0))
+            running += amt
+            rows.append({
+                "project":       p.name if p else "—",
+                "date":          str(e.actual_billing_date) if e.actual_billing_date else "—",
+                "billing_type":  e.billing_type or "—",
+                "amount":        _fmt(amt),
+                "running_total": _fmt(running),
+                "milestone":     milestone_cache.get(e.milestone_id) or "—",
+                "remarks":       e.remarks or "—",
+            })
+    return {"rows": rows}
+
+
 # ── Filter options ────────────────────────────────────────────────────────────
 @router.get("/filter-options")
 def filter_options(
