@@ -83,10 +83,11 @@ def _fmt_date(dt) -> str:
 @router.get("/projects/{project_id}/export/xlsx")
 def export_excel(project_id: int, milestone: int = None, db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
-    """Export using the Custom Milestone system (CustomMilestone → CustomTask →
-    CustomSubtask → Activity).  Status is read from CustomMilestone.status so
-    it always reflects the actual configured value rather than the legacy
-    ProjectMilestone default."""
+    """Export full Milestone Configuration data (CustomMilestone → CustomTask →
+    CustomSubtask → Activity).  Produces one 'Overview' sheet summarising all
+    active milestones, then one detailed sheet per milestone containing: a
+    milestone details block, a Tasks table, a Subtasks table (with responses
+    and actual consumed hours), and an Activities table."""
 
     project = db.query(Project).filter_by(id=project_id).first()
 
@@ -112,21 +113,21 @@ def export_excel(project_id: int, milestone: int = None, db: Session = Depends(g
                    for s  in t.subtasks
                    for a  in s.activities]
 
-    sub_actual: dict[int, float] = {}
+    sub_actual: dict = {}
     if all_sub_ids:
         rows = (db.query(WorkHours.custom_subtask_id, func.sum(WorkHours.hours_spent))
                   .filter(WorkHours.custom_subtask_id.in_(all_sub_ids))
                   .group_by(WorkHours.custom_subtask_id).all())
         sub_actual = {r[0]: round(float(r[1] or 0), 2) for r in rows}
 
-    act_actual: dict[int, float] = {}
+    act_actual: dict = {}
     if all_act_ids:
         rows = (db.query(WorkHours.activity_id, func.sum(WorkHours.hours_spent))
                   .filter(WorkHours.activity_id.in_(all_act_ids))
                   .group_by(WorkHours.activity_id).all())
         act_actual = {r[0]: round(float(r[1] or 0), 2) for r in rows}
 
-    # ── Workbook setup ────────────────────────────────────────────────────────
+    # ── Workbook helpers ──────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
@@ -135,154 +136,291 @@ def export_excel(project_id: int, milestone: int = None, db: Session = Depends(g
         s = Side(style="thin", color="CCCCCC")
         return Border(left=s, right=s, top=s, bottom=s)
 
-    HDR_FILL  = fill("1F3864")
-    TASK_FILL = fill("5B9BD5")
-    COL_FILL  = fill("BDD7EE")
-    EVEN_FILL = fill("EBF3FB")
-    ODD_FILL  = fill("FFFFFF")
-    DONE_FILL = fill("E2EFDA")
-    PROG_FILL = fill("FFF2CC")
-    OVER_FILL = fill("FCE4EC")
-    TODO_FILL = fill("F0F0F0")
-    ACT_FILL  = fill("F5F0FF")   # light purple tint for Activity rows
+    # Colour palette
+    MS_HDR_FILL   = fill("1F3864")   # dark navy  — milestone title bars
+    TASK_SEC_FILL = fill("3730A3")   # indigo     — Tasks section label
+    SUB_SEC_FILL  = fill("7C3AED")   # violet     — Subtasks section label
+    ACT_SEC_FILL  = fill("0D3E7A")   # dark blue  — Activities section label
+    COL_FILL      = fill("BDD7EE")   # light blue — column headers
+    INFO_FILL     = fill("D9E8F5")   # pale blue  — info / date rows
+    EVEN_FILL     = fill("EBF3FB")
+    ODD_FILL      = fill("FFFFFF")
+    DONE_FILL     = fill("E2EFDA")
+    PROG_FILL     = fill("FFF2CC")
+    OVER_FILL     = fill("FCE4EC")
+    TODO_FILL     = fill("F0F0F0")
 
     STATUS_FILLS = {
-        "Completed":   DONE_FILL, "In Progress": PROG_FILL,
-        "Overdue":     OVER_FILL, "Not Started": TODO_FILL,
+        "Completed": DONE_FILL, "In Progress": PROG_FILL,
+        "Overdue":   OVER_FILL, "Not Started": TODO_FILL,
     }
     STATUS_COLORS = {
-        "Completed":   "375623", "In Progress": "7F6000",
-        "Overdue":     "A32D2D", "Not Started": "666666",
+        "Completed": "375623", "In Progress": "7F6000",
+        "Overdue":   "A32D2D", "Not Started": "666666",
     }
 
-    # New 9-column layout
-    COL_HEADERS = [
-        "Subtask / Question",   # A
-        "Response / Input",     # B
-        "Assignee (Multi)",     # C
-        "Status",               # D
-        "Planned Start",        # E
-        "Planned End",          # F
-        "Planned Total Days",   # G
-        "Estimated Hours",      # H
-        "Actual Consumed Hours",# I
-    ]
-    COL_WIDTHS = [42, 30, 28, 16, 14, 14, 18, 18, 22]
-    LAST_COL   = "I"
-    N_COLS     = 9
+    # All sheets use 10 columns (A–J)
+    LAST_COL = "J"
+    N_COLS   = 10
 
+    def _c(ws, row, col, value, bold=False, italic=False, color="333333",
+           align="left", bg=None, wrap=False, size=9):
+        """Write a styled cell."""
+        cell = ws.cell(row, col, value if value not in (None, "") else "")
+        cell.font = Font(size=size, bold=bold, italic=italic, color=color, name="Calibri")
+        if bg:
+            cell.fill = bg
+        cell.border = bdr()
+        cell.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
+        return cell
+
+    def _merge_row(ws, row, value, font_color="FFFFFF", bg=None, size=9,
+                   bold=False, italic=False, height=17):
+        """Write a full-width merged row."""
+        ws.merge_cells(f"A{row}:{LAST_COL}{row}")
+        cell = ws[f"A{row}"]
+        cell.value = value
+        cell.font = Font(size=size, bold=bold, italic=italic, color=font_color, name="Calibri")
+        if bg:
+            cell.fill = bg
+        cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.row_dimensions[row].height = height
+        return row + 1
+
+    def _section_label(ws, row, label, sec_fill):
+        """Full-width section label with white bold text."""
+        return _merge_row(ws, row, label, font_color="FFFFFF", bg=sec_fill,
+                          size=10, bold=True, height=19)
+
+    def _col_headers(ws, row, headers, widths=None):
+        """Write column header row."""
+        for ci, h in enumerate(headers, 1):
+            hc = ws.cell(row, ci, h)
+            hc.font = Font(bold=True, color="1F3864", size=9, name="Calibri")
+            hc.fill = COL_FILL
+            hc.border = bdr()
+            hc.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[row].height = 17
+        return row + 1
+
+    def _empty_row(ws, row, msg="No data configured."):
+        ws.merge_cells(f"A{row}:{LAST_COL}{row}")
+        cell = ws[f"A{row}"]
+        cell.value = msg
+        cell.font = Font(italic=True, color="AAAAAA", size=9, name="Calibri")
+        cell.alignment = Alignment(horizontal="center")
+        ws.row_dimensions[row].height = 16
+        return row + 1
+
+    # ── Overview sheet ────────────────────────────────────────────────────────
+    ws_ov = wb.create_sheet("Overview")
+    OV_WIDTHS = [6, 28, 14, 22, 20, 13, 13, 13, 13, 38]
+    for col_letter, w in zip("ABCDEFGHIJ", OV_WIDTHS):
+        ws_ov.column_dimensions[col_letter].width = w
+
+    # Title
+    row = _merge_row(ws_ov, 1,
+        f"PROJECT MILESTONE OVERVIEW — {(project.name or '').upper()}",
+        font_color="FFFFFF", bg=MS_HDR_FILL, size=12, bold=True, height=26)
+
+    # Sub-info
+    row = _merge_row(ws_ov, row,
+        f"Client: {project.client or '—'}   |   Owner: {project.owner or '—'}   |   "
+        f"Exported by: {current_user.name}   |   Active milestones: {len(custom_milestones)}",
+        font_color="555555", bg=INFO_FILL, size=9, italic=True, height=15)
+
+    row += 1  # blank
+    OV_HEADERS = ["#", "Milestone Name", "Status", "Assignee", "Responsible",
+                  "Planned Start", "Planned End", "Actual Start", "Actual End", "Description"]
+    row = _col_headers(ws_ov, row, OV_HEADERS)
+
+    for ri, cm in enumerate(custom_milestones):
+        s_fill  = STATUS_FILLS.get(cm.status or "Not Started", TODO_FILL)
+        s_color = STATUS_COLORS.get(cm.status or "Not Started", "666666")
+        row_bg  = EVEN_FILL if ri % 2 == 0 else ODD_FILL
+        _c(ws_ov, row, 1,  f"M{cm.num:02d}", bold=True, align="center", bg=row_bg)
+        _c(ws_ov, row, 2,  cm.name or "",    bold=True, bg=row_bg)
+        _c(ws_ov, row, 3,  cm.status or "Not Started", bold=True,
+           color=s_color, align="center", bg=s_fill)
+        _c(ws_ov, row, 4,  cm.assignee   or "—", bg=row_bg)
+        _c(ws_ov, row, 5,  cm.responsible or "—", bg=row_bg)
+        _c(ws_ov, row, 6,  _fmt_date(cm.planned_start), align="center", bg=row_bg)
+        _c(ws_ov, row, 7,  _fmt_date(cm.planned_end),   align="center", bg=row_bg)
+        _c(ws_ov, row, 8,  _fmt_date(cm.actual_start),  align="center", bg=row_bg)
+        _c(ws_ov, row, 9,  _fmt_date(cm.actual_end),    align="center", bg=row_bg)
+        _c(ws_ov, row, 10, cm.description or "", wrap=True, bg=row_bg)
+        ws_ov.row_dimensions[row].height = 17
+        row += 1
+
+    # ── Per-milestone sheets ──────────────────────────────────────────────────
     for cm in custom_milestones:
-        ws = wb.create_sheet(f"M{cm.num:02d}-{cm.name[:18]}")
-        for col_letter, w in zip("ABCDEFGHI", COL_WIDTHS):
+        sheet_name = f"M{cm.num:02d}-{cm.name[:16]}"
+        ws = wb.create_sheet(sheet_name)
+
+        # Column widths for 10 columns
+        MS_COL_WIDTHS = [8, 28, 14, 22, 14, 13, 13, 13, 13, 13]
+        for col_letter, w in zip("ABCDEFGHIJ", MS_COL_WIDTHS):
             ws.column_dimensions[col_letter].width = w
 
-        # ── Title row (Status from CustomMilestone — actual configured value) ─
-        ws.merge_cells(f"A1:{LAST_COL}1")
-        c = ws["A1"]
-        c.value = (f"M{cm.num:02d} — {cm.name}"
-                   f"  |  Status: {cm.status or 'Not Started'}"
-                   f"  |  Assignee: {cm.assignee or '—'}")
-        c.font = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
-        c.fill = HDR_FILL
-        c.alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[1].height = 24
+        row = 1
 
-        # ── Project info row ──────────────────────────────────────────────────
-        ws.merge_cells(f"A2:{LAST_COL}2")
-        c2 = ws["A2"]
-        c2.value = (f"Project: {project.name if project else ''}  "
-                    f"|  Client: {project.client if project else ''}  "
-                    f"|  Exported by: {current_user.name}")
-        c2.font = Font(italic=True, color="555555", size=9, name="Calibri")
-        c2.fill = fill("D9E8F5")
-        c2.alignment = Alignment(horizontal="left")
-        ws.row_dimensions[2].height = 16
+        # ── Milestone title bar ───────────────────────────────────────────────
+        row = _merge_row(ws, row,
+            f"  M{cm.num:02d} — {cm.name.upper()}",
+            font_color="FFFFFF", bg=MS_HDR_FILL, size=12, bold=True, height=26)
 
-        row = 4
+        # Status / assignee sub-bar
+        row = _merge_row(ws, row,
+            f"  Status: {cm.status or 'Not Started'}   |   "
+            f"Assignee: {cm.assignee or '—'}   |   "
+            f"Responsible: {cm.responsible or '—'}",
+            font_color="CADCFC", bg=fill("2D3A6B"), size=9, italic=True, height=15)
+
+        # Dates / description bar
+        dates_val = (
+            f"  Planned: {_fmt_date(cm.planned_start) or '—'} → {_fmt_date(cm.planned_end) or '—'}"
+            f"   |   Actual: {_fmt_date(cm.actual_start) or '—'} → {_fmt_date(cm.actual_end) or '—'}"
+        )
+        if cm.description:
+            dates_val += f"   |   {cm.description}"
+        row = _merge_row(ws, row, dates_val,
+            font_color="555555", bg=INFO_FILL, size=9, italic=True, height=15)
+
+        # Project / export info bar
+        row = _merge_row(ws, row,
+            f"  Project: {project.name if project else '—'}   |   "
+            f"Client: {project.client if project else '—'}   |   "
+            f"Exported by: {current_user.name}",
+            font_color="888888", bg=fill("F8FBFF"), size=8, italic=True, height=14)
+
+        row += 1  # blank gap
+
         tasks_sorted = sorted(cm.tasks, key=lambda x: x.num or 0)
 
+        # ══ TASKS TABLE ═══════════════════════════════════════════════════════
+        row = _section_label(ws, row, "  📋  TASKS", TASK_SEC_FILL)
+        TASK_HDRS = ["Task #", "Task Name", "Status", "Assignee",
+                     "Planned Start", "Planned End", "Actual Start", "Actual End",
+                     "Est. Hours", "Responsibility"]
+        row = _col_headers(ws, row, TASK_HDRS)
+
+        if tasks_sorted:
+            for ti, task in enumerate(tasks_sorted):
+                t_status = task.status or "Not Started"
+                t_sfill  = STATUS_FILLS.get(t_status, TODO_FILL)
+                t_scolor = STATUS_COLORS.get(t_status, "666666")
+                row_bg   = EVEN_FILL if ti % 2 == 0 else ODD_FILL
+                _c(ws, row, 1,  f"T{task.num:02d}" if task.num else "—",
+                   bold=True, align="center", bg=row_bg)
+                _c(ws, row, 2,  task.name or "", bold=True, bg=row_bg, wrap=True)
+                _c(ws, row, 3,  t_status, bold=True,
+                   color=t_scolor, align="center", bg=t_sfill)
+                _c(ws, row, 4,  task.assignee or "—", bg=row_bg)
+                _c(ws, row, 5,  _fmt_date(task.planned_start), align="center", bg=row_bg)
+                _c(ws, row, 6,  _fmt_date(task.planned_end),   align="center", bg=row_bg)
+                _c(ws, row, 7,  _fmt_date(task.actual_start),  align="center", bg=row_bg)
+                _c(ws, row, 8,  _fmt_date(task.actual_end),    align="center", bg=row_bg)
+                _c(ws, row, 9,  task.estimated_hours or 0,     align="center", bg=row_bg)
+                _c(ws, row, 10, task.responsibility or "—", bg=row_bg)
+                ws.row_dimensions[row].height = 17
+                row += 1
+        else:
+            row = _empty_row(ws, row, "No tasks configured for this milestone.")
+
+        row += 1  # gap
+
+        # ══ SUBTASKS TABLE ════════════════════════════════════════════════════
+        row = _section_label(ws, row, "  🔹  SUBTASKS", SUB_SEC_FILL)
+        SUB_HDRS = ["Task", "Sub #", "Subtask Name", "Status", "Assignee",
+                    "Input Type", "Planned Start", "Planned End",
+                    "Est. Hours", "Actual Hours"]
+        row = _col_headers(ws, row, SUB_HDRS)
+
+        has_subtasks = False
+        sub_idx = 0
         for task in tasks_sorted:
-            # ── Task header ───────────────────────────────────────────────────
-            ws.merge_cells(f"A{row}:{LAST_COL}{row}")
-            tc = ws.cell(row, 1, f"  Task {(task.num or 0):02d} — {task.name.upper()}")
-            tc.font = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
-            tc.fill = TASK_FILL
-            ws.row_dimensions[row].height = 20
-            row += 1
-
-            # ── Column headers ────────────────────────────────────────────────
-            for col_idx, h in enumerate(COL_HEADERS, 1):
-                hc = ws.cell(row, col_idx, h)
-                hc.font = Font(bold=True, color="1F3864", size=9, name="Calibri")
-                hc.fill = COL_FILL
-                hc.border = bdr()
-                hc.alignment = Alignment(horizontal="center")
-            ws.row_dimensions[row].height = 17
-            row += 1
-
-            # ── Subtask rows ──────────────────────────────────────────────────
             subs_sorted = sorted(task.subtasks, key=lambda x: x.num or 0)
-            for idx, sub in enumerate(subs_sorted):
-                sub_status = sub.status or "Not Started"
-                s_fill  = STATUS_FILLS.get(sub_status, TODO_FILL)
-                s_color = STATUS_COLORS.get(sub_status, "666666")
-                bg = EVEN_FILL if idx % 2 == 0 else ODD_FILL
-                actual_hrs = sub_actual.get(sub.id, 0.0)
-                total_days = _days_between(sub.planned_start, sub.planned_end)
-
-                def _cell(c, v, bold=False, italic=False, color="333333", align="left", bg_=None):
-                    cell = ws.cell(row, c, v if v not in (None, "") else "")
-                    cell.font = Font(size=9, bold=bold, italic=italic, color=color, name="Calibri")
-                    cell.fill = bg_ or bg
-                    cell.border = bdr()
-                    cell.alignment = Alignment(horizontal=align, vertical="top", wrap_text=(c in (1, 2)))
-                    return cell
-
-                _cell(1, sub.name, bold=True)
-                resp_val = sub.response or ""
-                _cell(2, resp_val if resp_val else "— not filled —",
-                      italic=not bool(resp_val),
-                      color="0D47A1" if resp_val else "BBBBBB",
-                      bg_=bg if resp_val else fill("FFFDE7"))
-                _cell(3, sub.assignee or "—")
-                sc = _cell(4, sub_status, bold=True, color=s_color, align="center", bg_=s_fill)
-                _cell(5, _fmt_date(sub.planned_start), align="center")
-                _cell(6, _fmt_date(sub.planned_end),   align="center")
-                _cell(7, total_days, align="center")
-                _cell(8, sub.estimated_hours or 0, align="center")
-                _cell(9, actual_hrs,               align="center")
+            for sub in subs_sorted:
+                has_subtasks = True
+                s_status = sub.status or "Not Started"
+                s_sfill  = STATUS_FILLS.get(s_status, TODO_FILL)
+                s_scolor = STATUS_COLORS.get(s_status, "666666")
+                row_bg   = EVEN_FILL if sub_idx % 2 == 0 else ODD_FILL
+                act_hrs  = sub_actual.get(sub.id, 0.0)
+                _c(ws, row, 1,  task.name or "—", italic=True,
+                   color="555555", bg=row_bg)
+                _c(ws, row, 2,  f"S{sub.num:02d}" if sub.num else "—",
+                   bold=True, align="center", bg=row_bg)
+                _c(ws, row, 3,  sub.name or "", bold=True, bg=row_bg, wrap=True)
+                _c(ws, row, 4,  s_status, bold=True,
+                   color=s_scolor, align="center", bg=s_sfill)
+                _c(ws, row, 5,  sub.assignee   or "—", bg=row_bg)
+                _c(ws, row, 6,  sub.input_type or "—", align="center", bg=row_bg)
+                _c(ws, row, 7,  _fmt_date(sub.planned_start), align="center", bg=row_bg)
+                _c(ws, row, 8,  _fmt_date(sub.planned_end),   align="center", bg=row_bg)
+                _c(ws, row, 9,  sub.estimated_hours or 0, align="center", bg=row_bg)
+                _c(ws, row, 10, act_hrs,                  align="center", bg=row_bg)
                 ws.row_dimensions[row].height = 17
                 row += 1
 
-                # ── Activity rows (indented under their subtask) ──────────────
-                for act in sorted(sub.activities, key=lambda x: x.id):
-                    act_status = act.status or "Not Started"
-                    a_fill  = STATUS_FILLS.get(act_status, TODO_FILL)
-                    a_color = STATUS_COLORS.get(act_status, "666666")
-                    act_hrs    = act_actual.get(act.id, 0.0)
-                    act_days   = _days_between(act.planned_start, act.planned_end)
-
-                    def _acell(c, v, bold=False, italic=False, color="555555", align="left"):
-                        cell = ws.cell(row, c, v if v not in (None, "") else "")
-                        cell.font = Font(size=8, bold=bold, italic=italic, color=color, name="Calibri")
-                        cell.fill = ACT_FILL
-                        cell.border = bdr()
-                        cell.alignment = Alignment(horizontal=align, vertical="top")
-                        return cell
-
-                    _acell(1, f"  ↳ {act.name}")
-                    _acell(2, "")   # activities carry no free-text response
-                    _acell(3, act.assignee or "—")
-                    _acell(4, act_status, bold=True, color=a_color, align="center")
-                    _acell(5, _fmt_date(act.planned_start), align="center")
-                    _acell(6, _fmt_date(act.planned_end),   align="center")
-                    _acell(7, act_days,            align="center")
-                    _acell(8, act.estimated_hours or 0, align="center")
-                    _acell(9, act_hrs,             align="center")
-                    ws.row_dimensions[row].height = 15
+                # ── Response / input (if filled) shown as indented row ────────
+                if sub.response:
+                    resp_bg = fill("FFFDE7")
+                    ws.merge_cells(f"A{row}:B{row}")
+                    rc = ws[f"A{row}"]
+                    rc.value = f"    ↳ Response: {sub.response}"
+                    rc.font  = Font(size=8, italic=True, color="0D47A1", name="Calibri")
+                    rc.fill  = resp_bg
+                    rc.border = bdr()
+                    rc.alignment = Alignment(horizontal="left", wrap_text=True)
+                    for ci in range(3, N_COLS + 1):
+                        ec = ws.cell(row, ci)
+                        ec.fill = resp_bg; ec.border = bdr()
+                    ws.row_dimensions[row].height = 14
                     row += 1
 
-            row += 1  # blank gap between tasks
+                sub_idx += 1
+
+        if not has_subtasks:
+            row = _empty_row(ws, row, "No subtasks configured for this milestone.")
+
+        row += 1  # gap
+
+        # ══ ACTIVITIES TABLE ══════════════════════════════════════════════════
+        all_activities = [
+            (task, sub, act)
+            for task in tasks_sorted
+            for sub  in sorted(task.subtasks, key=lambda x: x.num or 0)
+            for act  in sorted(sub.activities, key=lambda x: x.id)
+        ]
+
+        if all_activities:
+            row = _section_label(ws, row, "  ⚡  ACTIVITIES", ACT_SEC_FILL)
+            ACT_HDRS = ["Task", "Subtask", "Activity Name", "Status", "Assignee",
+                        "Planned Start", "Planned End", "Actual Start",
+                        "Actual End", "Est. Hours"]
+            row = _col_headers(ws, row, ACT_HDRS)
+
+            for ai, (task, sub, act) in enumerate(all_activities):
+                a_status = act.status or "Not Started"
+                a_sfill  = STATUS_FILLS.get(a_status, TODO_FILL)
+                a_scolor = STATUS_COLORS.get(a_status, "666666")
+                row_bg   = EVEN_FILL if ai % 2 == 0 else ODD_FILL
+                _c(ws, row, 1,  task.name or "—", italic=True,
+                   color="555555", bg=row_bg)
+                _c(ws, row, 2,  sub.name  or "—", italic=True,
+                   color="555555", bg=row_bg)
+                _c(ws, row, 3,  act.name  or "", bold=True, bg=row_bg, wrap=True)
+                _c(ws, row, 4,  a_status, bold=True,
+                   color=a_scolor, align="center", bg=a_sfill)
+                _c(ws, row, 5,  act.assignee or "—", bg=row_bg)
+                _c(ws, row, 6,  _fmt_date(act.planned_start), align="center", bg=row_bg)
+                _c(ws, row, 7,  _fmt_date(act.planned_end),   align="center", bg=row_bg)
+                _c(ws, row, 8,  _fmt_date(act.actual_start),  align="center", bg=row_bg)
+                _c(ws, row, 9,  _fmt_date(act.actual_end),    align="center", bg=row_bg)
+                _c(ws, row, 10, act.estimated_hours or 0, align="center", bg=row_bg)
+                ws.row_dimensions[row].height = 17
+                row += 1
 
     output = BytesIO()
     wb.save(output)
