@@ -40,7 +40,7 @@ class WorkHoursCreate(BaseModel):
     assigned_hours: float = 0.0
     buffer_hours: float = 0.0
     buffer_category: Optional[str] = None
-    is_billable: Optional[bool] = True
+    is_billable: Optional[bool] = None   # None = not explicitly set; True = Billable; False = Non-Billable
     work_type: Optional[str] = None   # Billable | Non-Billable | No Work | Training | R&D
     notes: Optional[str] = None
     milestone_report_id: Optional[int] = None   # Req 8 — DA timesheet
@@ -116,8 +116,14 @@ def _build(w: WorkHours, db: Session):
         "assigned_hours": w.assigned_hours,
         "buffer_hours": w.buffer_hours or 0,
         "buffer_category": w.buffer_category,
-        "is_billable": w.is_billable if w.is_billable is not None else True,
-        "work_type": w.work_type or ("Billable" if (w.is_billable if w.is_billable is not None else True) else "Non-Billable"),
+        "is_billable": w.is_billable,
+        # Return the stored work_type directly. For legacy records with work_type=NULL
+        # but is_billable=True, derive it so the UI still displays them as Billable.
+        "work_type": w.work_type or (
+            "Billable" if w.is_billable is True
+            else "Non-Billable" if w.is_billable is False
+            else None
+        ),
         "actual_working_hours": _actual_hours(w),
         "notes": w.notes,
         "milestone_report_id": w.milestone_report_id,
@@ -393,8 +399,15 @@ def log_hours(
         assigned_hours=payload.assigned_hours,
         buffer_hours=payload.buffer_hours,
         buffer_category=payload.buffer_category,
-        is_billable=(payload.work_type == 'Billable') if payload.work_type else (payload.is_billable if payload.is_billable is not None else True),
-        work_type=payload.work_type or ('Billable' if (payload.is_billable if payload.is_billable is not None else True) else 'Non-Billable'),
+        # Derive is_billable and work_type from whichever field was explicitly provided.
+        # If neither is set, leave both as None (unclassified) — do NOT default to Billable,
+        # as that caused unintentional hours to appear as Billable in the Profitability Report.
+        is_billable=(payload.work_type == 'Billable') if payload.work_type else payload.is_billable,
+        work_type=payload.work_type or (
+            'Billable' if payload.is_billable is True
+            else 'Non-Billable' if payload.is_billable is False
+            else None
+        ),
         notes=payload.notes,
     )
     db.add(w); db.commit(); db.refresh(w)

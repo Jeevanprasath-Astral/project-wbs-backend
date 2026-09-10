@@ -16,6 +16,8 @@ from io import BytesIO
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+from sqlalchemy import or_
+
 from app.db.database import get_db
 from app.models.models import ProjectBilling, Project, CustomMilestone, User
 from app.core.deps import get_current_user
@@ -108,9 +110,19 @@ def billing_statement_export(
     if project_id:
         q = q.filter(ProjectBilling.project_id == project_id)
     if start_date:
-        q = q.filter(ProjectBilling.actual_billing_date >= date_cls.fromisoformat(start_date))
+        # Include entries whose actual billing date falls in the range OR
+        # entries that have no actual date yet (planned / not yet collected).
+        # Planned-only entries are always included so the report shows the full
+        # billing plan, not just what has already been collected.
+        q = q.filter(or_(
+            ProjectBilling.actual_billing_date >= date_cls.fromisoformat(start_date),
+            ProjectBilling.actual_billing_date.is_(None),
+        ))
     if end_date:
-        q = q.filter(ProjectBilling.actual_billing_date <= date_cls.fromisoformat(end_date))
+        q = q.filter(or_(
+            ProjectBilling.actual_billing_date <= date_cls.fromisoformat(end_date),
+            ProjectBilling.actual_billing_date.is_(None),
+        ))
     if billing_type:
         q = q.filter(ProjectBilling.billing_type == billing_type)
 
@@ -342,9 +354,15 @@ def billing_statement_data(
     if project_id:
         q = q.filter(ProjectBilling.project_id == project_id)
     if start_date:
-        q = q.filter(ProjectBilling.actual_billing_date >= date_cls.fromisoformat(start_date))
+        q = q.filter(or_(
+            ProjectBilling.actual_billing_date >= date_cls.fromisoformat(start_date),
+            ProjectBilling.actual_billing_date.is_(None),
+        ))
     if end_date:
-        q = q.filter(ProjectBilling.actual_billing_date <= date_cls.fromisoformat(end_date))
+        q = q.filter(or_(
+            ProjectBilling.actual_billing_date <= date_cls.fromisoformat(end_date),
+            ProjectBilling.actual_billing_date.is_(None),
+        ))
     if billing_type:
         q = q.filter(ProjectBilling.billing_type == billing_type)
 
@@ -359,6 +377,17 @@ def billing_statement_data(
             m = db.query(CustomMilestone.name).filter_by(id=e.milestone_id).first()
             milestone_cache[e.milestone_id] = m.name if m else None
 
+    # Build milestone planned_end cache for planned_date fallback
+    milestone_planned_end_cache = {}
+    for e in entries:
+        if e.milestone_id and e.milestone_id not in milestone_planned_end_cache:
+            m = db.query(CustomMilestone).filter_by(id=e.milestone_id).first()
+            if m and m not in milestone_cache:
+                milestone_cache[e.milestone_id] = m.name if m else None
+            milestone_planned_end_cache[e.milestone_id] = (
+                str(m.planned_end.date()) if m and m.planned_end else None
+            )
+
     proj_entries = {}
     for e in entries:
         proj_entries.setdefault(e.project_id, []).append(e)
@@ -370,14 +399,21 @@ def billing_statement_data(
         for e in proj_entries.get(pid, []):
             amt = float(e.actual_billing_amount if e.actual_billing_amount is not None else (e.planned_billing_amount or 0))
             running += amt
+            # actual_date: the date billing was collected; planned_date: milestone's planned_end
+            actual_dt  = str(e.actual_billing_date) if e.actual_billing_date else None
+            planned_dt = milestone_planned_end_cache.get(e.milestone_id) if e.milestone_id else None
             rows.append({
-                "project":       p.name if p else "—",
-                "date":          str(e.actual_billing_date) if e.actual_billing_date else "—",
-                "billing_type":  e.billing_type or "—",
-                "amount":        _fmt(amt),
-                "running_total": _fmt(running),
-                "milestone":     milestone_cache.get(e.milestone_id) or "—",
-                "remarks":       e.remarks or "—",
+                "project":        p.name if p else "—",
+                "date":           actual_dt or planned_dt or "—",   # show actual; fall back to planned
+                "actual_date":    actual_dt or "—",
+                "planned_date":   planned_dt or "—",
+                "billing_type":   e.billing_type or "—",
+                "amount":         _fmt(amt),
+                "planned_amount": _fmt(e.planned_billing_amount or 0),
+                "running_total":  _fmt(running),
+                "description":    e.description or "—",
+                "milestone":      milestone_cache.get(e.milestone_id) or "—",
+                "remarks":        e.remarks or "—",
             })
     return {"rows": rows}
 

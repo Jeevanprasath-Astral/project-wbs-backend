@@ -40,7 +40,13 @@ router = APIRouter(prefix="/project-reports", tags=["Project Reports"])
 
 
 # ── Shared xlsx builder (same style as timesheet_reports.py) ─────────────────
-def _build_xlsx(title: str, headers: list, rows: list, filename: str, subtitle: str = ""):
+def _build_xlsx(title: str, headers: list, rows: list, filename: str, subtitle: str = "",
+                diff_col: int = None):
+    """Build a styled xlsx file.
+
+    diff_col — 1-based column index for a Difference column.  Positive values
+    get a green fill, negative values get a red fill.
+    """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = title[:31] or "Report"
@@ -50,8 +56,10 @@ def _build_xlsx(title: str, headers: list, rows: list, filename: str, subtitle: 
         s = Side(style="thin", color="CCCCCC")
         return Border(left=s, right=s, top=s, bottom=s)
 
-    HDR_FILL = fill("1F3864"); COL_FILL = fill("BDD7EE")
-    EVEN_FILL = fill("EBF3FB"); ODD_FILL = fill("FFFFFF")
+    HDR_FILL  = fill("1F3864"); COL_FILL  = fill("BDD7EE")
+    EVEN_FILL = fill("EBF3FB"); ODD_FILL  = fill("FFFFFF")
+    POS_FILL  = fill("C6EFCE")   # green  — positive Difference
+    NEG_FILL  = fill("FFC7CE")   # red    — negative Difference
 
     ncols = len(headers)
     last_col_letter = chr(ord("A") + ncols - 1)
@@ -87,7 +95,15 @@ def _build_xlsx(title: str, headers: list, rows: list, filename: str, subtitle: 
         for col, val in enumerate(r, 1):
             cell = ws.cell(row, col, val if val not in (None, "") else "—")
             cell.font = Font(size=9, name="Calibri")
-            cell.fill = bg; cell.border = bdr()
+            cell.border = bdr()
+            # Difference column: override fill based on sign
+            if diff_col and col == diff_col and isinstance(val, (int, float)):
+                cell.fill = POS_FILL if val >= 0 else NEG_FILL
+                cell.font = Font(size=9, name="Calibri", bold=True,
+                                 color="375623" if val >= 0 else "9C0006")
+                cell.alignment = Alignment(horizontal="right")
+            else:
+                cell.fill = bg
         row += 1
 
     if not rows:
@@ -207,13 +223,14 @@ def budgeted_vs_actual_report(
         ]
 
     headers = ["Individual Name", "Project", "Team", "Start Date", "End Date",
-               "Budgeted Hours", "Actual Hours", "Status"]
+               "Budgeted Hours", "Actual Hours", "Difference", "Status"]
     rows = []
     for ms in milestones:
         project = db.query(Project).filter_by(id=ms.project_id).first()
         team_name = _assignee_team(db, ms.assignee)
         budgeted = _milestone_budgeted_hours(db, ms.id)
         actual   = _milestone_actual_hours(db, ms.id)
+        difference = round(budgeted - actual, 2)
         rows.append([
             ms.assignee or "—",
             project.name if project else "—",
@@ -222,6 +239,7 @@ def budgeted_vs_actual_report(
             _fmt_dt(ms.actual_end or ms.planned_end),
             budgeted,
             actual,
+            difference,
             ms.status or "—",
         ])
 
@@ -234,7 +252,7 @@ def budgeted_vs_actual_report(
     subtitle = " | ".join(subtitle_parts)
 
     return _build_xlsx("Budgeted vs Actual Hours Report", headers, rows,
-                        "budgeted-vs-actual-report.xlsx", subtitle)
+                        "budgeted-vs-actual-report.xlsx", subtitle, diff_col=8)
 
 
 def _assignee_team(db: Session, assignee: Optional[str]) -> str:
@@ -359,6 +377,7 @@ def budgeted_vs_actual_data(
             "end_date":         _fmt_dt(ms.actual_end or ms.planned_end),
             "budgeted_hours":   budgeted,
             "actual_hours":     actual,
+            "difference":       round(budgeted - actual, 2),
             "status":           ms.status or "—",
         })
     return rows

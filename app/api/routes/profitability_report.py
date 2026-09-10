@@ -24,6 +24,8 @@ from io import BytesIO
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+from sqlalchemy import or_, and_
+
 from app.db.database import get_db
 from app.models.models import Project, WorkHours, ProjectCost, User, ProjectBilling
 from app.core.deps import get_current_user
@@ -135,8 +137,16 @@ def _project_metrics(db: Session, project: Project):
     total_hours = db.query(func.coalesce(func.sum(WorkHours.hours_spent), 0.0))\
         .filter(WorkHours.project_id == pid).scalar() or 0.0
 
+    # Count as billable: explicit work_type='Billable' OR legacy records where
+    # work_type is NULL but is_billable=True (stored before work_type field existed).
     billable_hours = db.query(func.coalesce(func.sum(WorkHours.hours_spent), 0.0))\
-        .filter(WorkHours.project_id == pid, WorkHours.work_type == 'Billable').scalar() or 0.0
+        .filter(
+            WorkHours.project_id == pid,
+            or_(
+                WorkHours.work_type == 'Billable',
+                and_(WorkHours.work_type.is_(None), WorkHours.is_billable == True)
+            )
+        ).scalar() or 0.0
 
     # ── Manpower Cost = SUM(hours × user.cost_rate) ──────────────────────────
     # Join WorkHours → User to get each entry's rate, then aggregate.

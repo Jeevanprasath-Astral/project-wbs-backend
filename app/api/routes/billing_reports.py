@@ -87,10 +87,14 @@ def monthly_billing_tracker(
     filtered = []
     for e in entries:
         pbd = get_pbd(e)
-        if start_date and (pbd is None or pbd < date_cls.fromisoformat(start_date)):
-            continue
-        if end_date and (pbd is None or pbd > date_cls.fromisoformat(end_date)):
-            continue
+        # Entries with no planned date (no linked milestone) are always included
+        # in the "Unscheduled" group regardless of date filters — they should
+        # never be silently dropped just because a date range is selected.
+        if pbd is not None:
+            if start_date and pbd < date_cls.fromisoformat(start_date):
+                continue
+            if end_date and pbd > date_cls.fromisoformat(end_date):
+                continue
         filtered.append(e)
 
     # Group by (month_key, billing_type)
