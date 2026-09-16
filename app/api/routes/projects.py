@@ -43,9 +43,71 @@ def _init_project_milestones(db: Session, project: Project):
 
 @router.get("", response_model=List[ProjectOut])
 def list_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # All authenticated users see all projects.
-    # Role-based permissions within each project are enforced at the action level.
-    return db.query(Project).order_by(Project.created_at.desc()).all()
+    # All authenticated users see all projects — EXCEPT demo users, who are
+    # scoped to is_demo=True projects only so real client data stays hidden.
+    q = db.query(Project)
+    if getattr(current_user, 'is_demo', False):
+        q = q.filter(Project.is_demo == True)
+    projects = q.order_by(Project.created_at.desc()).all()
+
+    # ── Compute live progress from CustomMilestone task completion ──────────────
+    # Progress = average of each active milestone's completion %.
+    # Milestone % = completed_tasks / total_tasks * 100 (100 if status=Completed).
+    # This matches exactly what Milestone Config shows per-milestone.
+    project_ids = [p.id for p in projects]
+
+    # 1. Bulk-fetch all active CustomMilestones per project (one query)
+    active_cms = (
+        db.query(CustomMilestone.id, CustomMilestone.project_id, CustomMilestone.status)
+        .filter(
+            CustomMilestone.project_id.in_(project_ids),
+            CustomMilestone.is_active == True,
+        )
+        .all()
+    )
+    # Map: project_id → list of (milestone_id, status)
+    project_ms_map: dict[int, list[tuple]] = {}
+    all_cm_ids = []
+    for row in active_cms:
+        project_ms_map.setdefault(row.project_id, []).append((row.id, row.status))
+        all_cm_ids.append(row.id)
+
+    # 2. Bulk-fetch CustomTask statuses for all those milestones (one query)
+    task_status_map: dict[int, list[str]] = {}  # milestone_id → [task statuses]
+    if all_cm_ids:
+        from app.models.models import CustomTask as _CT
+        task_rows = (
+            db.query(_CT.milestone_id, _CT.status)
+            .filter(_CT.milestone_id.in_(all_cm_ids))
+            .all()
+        )
+        for row in task_rows:
+            task_status_map.setdefault(row.milestone_id, []).append(row.status or "Not Started")
+
+    # 3. Compute per-project progress from milestone task completion
+    def _ms_pct(ms_id: int, ms_status: str) -> float:
+        if ms_status == "Completed":
+            return 100.0
+        task_statuses = task_status_map.get(ms_id, [])
+        if not task_statuses:
+            return 0.0
+        done = sum(1 for s in task_statuses if s == "Completed")
+        return round((done / len(task_statuses)) * 100, 1)
+
+    # Return plain dicts so we can inject the computed progress without
+    # mutating the ORM object (which would trigger a dirty-write on commit).
+    result = []
+    for p in projects:
+        ms_list = project_ms_map.get(p.id, [])
+        if ms_list:
+            pcts = [_ms_pct(ms_id, ms_status) for ms_id, ms_status in ms_list]
+            computed = round(sum(pcts) / len(pcts), 1)
+        else:
+            computed = 0.0
+        d = {c.name: getattr(p, c.name) for c in p.__table__.columns}
+        d['progress'] = computed
+        result.append(d)
+    return result
 
 @router.post("", response_model=ProjectOut)
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -64,12 +126,155 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db), curren
     db.refresh(project)
     return project
 
+@router.get("/progress-batch")
+def get_projects_progress_batch(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return [{id, progress}] for ALL projects — 2 queries, no heavy joins.
+    Used by My Projects page to enrich the project list with live % values
+    without depending on the stored Project.progress column (always 0)."""
+    q = db.query(Project.id)
+    if getattr(current_user, 'is_demo', False):
+        q = q.filter(Project.is_demo == True)
+    projects = q.all()
+    project_ids = [p.id for p in projects]
+    if not project_ids:
+        return []
+
+    # 1. All active CustomMilestones (id, project_id, status) across all projects
+    active_cms = (
+        db.query(CustomMilestone.id, CustomMilestone.project_id, CustomMilestone.status)
+        .filter(
+            CustomMilestone.project_id.in_(project_ids),
+            CustomMilestone.is_active == True,
+        )
+        .all()
+    )
+    project_ms_map: dict = {}
+    all_cm_ids = []
+    for row in active_cms:
+        project_ms_map.setdefault(row.project_id, []).append((row.id, row.status))
+        all_cm_ids.append(row.id)
+
+    # 2. All CustomTask statuses for those milestones
+    task_status_map: dict = {}
+    if all_cm_ids:
+        task_rows = (
+            db.query(CustomTask.milestone_id, CustomTask.status)
+            .filter(CustomTask.milestone_id.in_(all_cm_ids))
+            .all()
+        )
+        for row in task_rows:
+            task_status_map.setdefault(row.milestone_id, []).append(
+                row.status or "Not Started"
+            )
+
+    def _ms_pct(ms_id: int, ms_status: str) -> float:
+        if ms_status == "Completed":
+            return 100.0
+        statuses = task_status_map.get(ms_id, [])
+        if not statuses:
+            return 0.0
+        done = sum(1 for s in statuses if s == "Completed")
+        return round((done / len(statuses)) * 100, 1)
+
+    result = []
+    for pid in project_ids:
+        ms_list = project_ms_map.get(pid, [])
+        if ms_list:
+            pcts = [_ms_pct(ms_id, ms_status) for ms_id, ms_status in ms_list]
+            proj_pct = round(sum(pcts) / len(pcts), 1)
+        else:
+            proj_pct = 0.0
+        result.append({"id": pid, "progress": proj_pct})
+    return result
+
+
+@router.get("/{project_id}/milestone-progress")
+def get_project_milestone_progress(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return {project_pct, milestones:[{num, status, pct}]} — 2 queries only.
+    Lightweight endpoint used by Dashboard, AppLayout (sidebar), and
+    any other component that needs live progress without the heavy
+    CustomMilestone endpoint (which joins subtasks/activities/form-fields)."""
+    active_cms = (
+        db.query(CustomMilestone.id, CustomMilestone.num, CustomMilestone.status)
+        .filter_by(project_id=project_id, is_active=True)
+        .order_by(CustomMilestone.num)
+        .all()
+    )
+    if not active_cms:
+        return {"project_pct": 0.0, "milestones": []}
+
+    cm_ids = [row.id for row in active_cms]
+    task_rows = (
+        db.query(CustomTask.milestone_id, CustomTask.status)
+        .filter(CustomTask.milestone_id.in_(cm_ids))
+        .all()
+    )
+    task_map: dict = {}
+    for row in task_rows:
+        task_map.setdefault(row.milestone_id, []).append(row.status or "Not Started")
+
+    def _pct(cm_id: int, cm_status: str) -> float:
+        if cm_status == "Completed":
+            return 100.0
+        statuses = task_map.get(cm_id, [])
+        if not statuses:
+            return 0.0
+        done = sum(1 for s in statuses if s == "Completed")
+        return round((done / len(statuses)) * 100, 1)
+
+    ms_out = [
+        {"num": row.num, "status": row.status, "pct": _pct(row.id, row.status)}
+        for row in active_cms
+    ]
+    project_pct = round(sum(m["pct"] for m in ms_out) / len(ms_out), 1) if ms_out else 0.0
+    return {"project_pct": project_pct, "milestones": ms_out}
+
+
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     p = db.query(Project).filter_by(id=project_id).first()
     if not p:
         raise HTTPException(404, "Project not found")
-    return p
+
+    # ── Compute live progress from CustomMilestone task completion ───────────
+    active_cms = (
+        db.query(CustomMilestone.id, CustomMilestone.status)
+        .filter(CustomMilestone.project_id == project_id, CustomMilestone.is_active == True)
+        .all()
+    )
+    if active_cms:
+        cm_ids = [row.id for row in active_cms]
+        task_rows = (
+            db.query(CustomTask.milestone_id, CustomTask.status)
+            .filter(CustomTask.milestone_id.in_(cm_ids))
+            .all()
+        )
+        task_map: dict = {}
+        for row in task_rows:
+            task_map.setdefault(row.milestone_id, []).append(row.status or "Not Started")
+
+        def _ms_pct(ms_id: int, ms_status: str) -> float:
+            if ms_status == "Completed":
+                return 100.0
+            statuses = task_map.get(ms_id, [])
+            if not statuses:
+                return 0.0
+            done = sum(1 for s in statuses if s == "Completed")
+            return round((done / len(statuses)) * 100, 1)
+
+        pcts = [_ms_pct(row.id, row.status) for row in active_cms]
+        computed_progress = round(sum(pcts) / len(pcts), 1)
+    else:
+        computed_progress = 0.0
+
+    # Return as a dict so we can override the stored (stale) progress value
+    d = {c.name: getattr(p, c.name) for c in p.__table__.columns}
+    d['progress'] = computed_progress
+    return d
 
 @router.patch("/{project_id}", response_model=ProjectOut)
 def update_project(project_id: int, payload: ProjectUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

@@ -62,6 +62,9 @@ class User(Base):
     # rate expressed per hour). Used to compute Manpower Cost = hours × rate.
     cost_rate     = Column(Float, nullable=True, default=0.0)
     is_active     = Column(Boolean, default=True)
+    # Demo mode — True for the shared demo@axon-wbs.app account.
+    # Demo users have read-only access scoped to is_demo projects only.
+    is_demo       = Column(Boolean, default=False)
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     projects      = relationship("ProjectMember", back_populates="user")
     team          = relationship("Team", back_populates="members")
@@ -94,6 +97,9 @@ class Project(Base):
     # client. Distinct from budget (internal cost ceiling). Used as the Revenue
     # figure: Net Profit = billing_amount - Total Cost.
     billing_amount         = Column(Float, nullable=True, default=0.0)
+    # Demo flag — True for the dedicated demo project shown at /demo.
+    # Demo users (is_demo=True) can only list/access projects with this flag set.
+    is_demo                = Column(Boolean, default=False)
     created_by             = Column(Integer, ForeignKey("users.id"))
     created_at             = Column(DateTime(timezone=True), server_default=func.now())
     updated_at             = Column(DateTime(timezone=True), onupdate=func.now())
@@ -666,6 +672,12 @@ class ProposalEstimate(Base):
     bd_status_date   = Column(Date, nullable=True)          # Date of that BD stage
     proposal_number  = Column(String(30), nullable=True, unique=True)  # Auto-generated FY number e.g. 2026-2027/001
     proposal_value   = Column(Float, nullable=True)                    # Manual BD-entered proposal value (₹)
+    # ── Client contact details ─────────────────────────────────────────────────
+    contact_name        = Column(String(300), nullable=True)   # Contact person's name
+    contact_designation = Column(String(200), nullable=True)   # Title / designation
+    contact_email       = Column(String(300), nullable=True)   # Contact email
+    contact_phone       = Column(String(50),  nullable=True)   # Phone / WhatsApp number
+    contact_notes       = Column(Text,        nullable=True)   # Free-text notes (e.g. preferred contact time)
     creator          = relationship("User", foreign_keys=[created_by])
     approver         = relationship("User", foreign_keys=[approved_by])
     sections         = relationship("ProposalSection",  back_populates="proposal",

@@ -132,10 +132,9 @@ def _fmt_dt(dt):
 
 
 def _milestone_actual_hours(db: Session, ms_id: int) -> float:
-    """Sum all work_hours that are part of this milestone's tree:
-    direct milestone hours + task hours (tasks under this milestone) +
-    subtask hours + activity hours. Uses subquery IDs to stay in one
-    pass per level rather than per-row Python loops."""
+    """Sum actual working hours (hours_spent − buffer_hours) across the full
+    milestone hierarchy — matches what Milestone Configuration shows as
+    'Total actual hrs'."""
     task_ids = [t.id for t in db.query(CustomTask.id).filter_by(milestone_id=ms_id).all()]
     subtask_ids = [s.id for s in db.query(CustomSubtask.id).filter(
         CustomSubtask.task_id.in_(task_ids)).all()] if task_ids else []
@@ -146,29 +145,18 @@ def _milestone_actual_hours(db: Session, ms_id: int) -> float:
     if task_ids:     conditions.append(WorkHours.custom_task_id.in_(task_ids))
     if subtask_ids:  conditions.append(WorkHours.custom_subtask_id.in_(subtask_ids))
     if activity_ids: conditions.append(WorkHours.activity_id.in_(activity_ids))
-    result = db.query(func.coalesce(func.sum(WorkHours.hours_spent), 0.0)).filter(
-        or_(*conditions)).scalar()
-    return round(float(result or 0), 2)
+    rows = db.query(WorkHours.hours_spent, WorkHours.buffer_hours).filter(
+        or_(*conditions)).all()
+    total = sum(max((h or 0.0) - (b or 0.0), 0.0) for h, b in rows)
+    return round(total, 2)
 
 
 def _milestone_budgeted_hours(db: Session, ms_id: int) -> float:
-    """Sum estimated_hours from subtasks + activities under this milestone.
-    Falls back to task-level estimated_hours when subtasks/activities have none."""
-    task_ids = [t.id for t in db.query(CustomTask.id).filter_by(milestone_id=ms_id).all()]
-    subtask_ids = [s.id for s in db.query(CustomSubtask.id).filter(
-        CustomSubtask.task_id.in_(task_ids)).all()] if task_ids else []
-
-    sub_hrs = db.query(func.coalesce(func.sum(CustomSubtask.estimated_hours), 0.0)).filter(
-        CustomSubtask.id.in_(subtask_ids)).scalar() if subtask_ids else 0.0
-    act_hrs = db.query(func.coalesce(func.sum(Activity.estimated_hours), 0.0)).filter(
-        Activity.subtask_id.in_(subtask_ids)).scalar() if subtask_ids else 0.0
-    total = round(float(sub_hrs or 0) + float(act_hrs or 0), 2)
-    # Fallback: no subtask/activity hours found → use task-level estimated_hours
-    if total == 0.0 and task_ids:
-        task_hrs = db.query(func.coalesce(func.sum(CustomTask.estimated_hours), 0.0)).filter(
-            CustomTask.id.in_(task_ids)).scalar()
-        total = round(float(task_hrs or 0), 2)
-    return total
+    """Sum CustomTask.estimated_hours for all tasks under this milestone.
+    Matches what Milestone Configuration shows as 'Total estimated hrs'."""
+    task_hrs = db.query(func.coalesce(func.sum(CustomTask.estimated_hours), 0.0))\
+        .filter(CustomTask.milestone_id == ms_id).scalar()
+    return round(float(task_hrs or 0), 2)
 
 
 def _parse_date(s: Optional[str]):
@@ -202,16 +190,11 @@ def budgeted_vs_actual_report(
         q = q.filter(CustomMilestone.assignee.ilike(f"%{assignee}%"))
     if status:
         q = q.filter(CustomMilestone.status == status)
-    # Use planned dates as fallback when actual dates are NULL so milestones
-    # that have not yet started/ended are still included in the report.
+    # Filter on planned dates (Start Date and End Date columns show planned dates)
     if start:
-        q = q.filter(
-            func.coalesce(CustomMilestone.actual_start, CustomMilestone.planned_start) >= start
-        )
+        q = q.filter(CustomMilestone.planned_start >= start)
     if end:
-        q = q.filter(
-            func.coalesce(CustomMilestone.actual_end, CustomMilestone.planned_end) <= end
-        )
+        q = q.filter(CustomMilestone.planned_end <= end)
 
     milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
 
@@ -235,8 +218,8 @@ def budgeted_vs_actual_report(
             ms.assignee or "—",
             project.name if project else "—",
             team_name or "—",
-            _fmt_dt(ms.actual_start or ms.planned_start),
-            _fmt_dt(ms.actual_end or ms.planned_end),
+            _fmt_dt(ms.planned_start),
+            _fmt_dt(ms.planned_end),
             budgeted,
             actual,
             difference,
@@ -343,16 +326,11 @@ def budgeted_vs_actual_data(
         q = q.filter(CustomMilestone.assignee.ilike(f"%{assignee}%"))
     if status:
         q = q.filter(CustomMilestone.status == status)
-    # Use planned dates as fallback when actual dates are NULL so milestones
-    # that have not yet started/ended are still included in the report.
+    # Filter on planned dates (Start Date and End Date columns show planned dates)
     if start:
-        q = q.filter(
-            func.coalesce(CustomMilestone.actual_start, CustomMilestone.planned_start) >= start
-        )
+        q = q.filter(CustomMilestone.planned_start >= start)
     if end:
-        q = q.filter(
-            func.coalesce(CustomMilestone.actual_end, CustomMilestone.planned_end) <= end
-        )
+        q = q.filter(CustomMilestone.planned_end <= end)
 
     milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
 
@@ -373,8 +351,8 @@ def budgeted_vs_actual_data(
             "individual_name":  ms.assignee or "—",
             "project":          proj.name if proj else "—",
             "team":             team_name or "—",
-            "start_date":       _fmt_dt(ms.actual_start or ms.planned_start),
-            "end_date":         _fmt_dt(ms.actual_end or ms.planned_end),
+            "start_date":       _fmt_dt(ms.planned_start),
+            "end_date":         _fmt_dt(ms.planned_end),
             "budgeted_hours":   budgeted,
             "actual_hours":     actual,
             "difference":       round(budgeted - actual, 2),

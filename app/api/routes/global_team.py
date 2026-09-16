@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func
 from typing import Optional, List
 from pydantic import BaseModel
 from app.db.database import get_db
@@ -135,7 +136,7 @@ def list_all_users(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    q = db.query(User)
+    q = db.query(User).options(joinedload(User.team))
     if role: q = q.filter(User.role == role)
     if is_active is not None: q = q.filter(User.is_active == is_active)
     if team_id is not None: q = q.filter(User.team_id == team_id)
@@ -148,7 +149,26 @@ def list_all_users(
         }
         q = q.filter(User.id.in_(member_user_ids)) if member_user_ids else q.filter(False)
     users = q.order_by(User.name).all()
-    return [_build_user(u, db) for u in users]
+
+    if not users:
+        return []
+
+    # Single pass — project/task counts removed from UI so no GROUP BY queries needed.
+    return [
+        {
+            "id":         u.id,
+            "name":       u.name,
+            "email":      u.email,
+            "role":       u.role,
+            "is_active":  u.is_active,
+            "created_at": u.created_at,
+            "team_id":    u.team_id,
+            "team_name":  u.team.name if u.team else None,
+            "cost_rate":  u.cost_rate or 0.0,
+            "permissions": ROLE_PERMISSIONS.get(u.role, []),
+        }
+        for u in users
+    ]
 
 @router.get("/stats")
 def team_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -435,9 +455,14 @@ def remove_user_permanently(
 @router.get("/{user_id}/projects")
 def user_projects(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     members = db.query(ProjectMember).filter_by(user_id=user_id).all()
+    if not members:
+        return []
+    # Perf: one bulk fetch instead of one query per membership row (N+1).
+    project_ids = [m.project_id for m in members]
+    proj_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(project_ids)).all()}
     result = []
     for m in members:
-        p = db.query(Project).filter_by(id=m.project_id).first()
+        p = proj_map.get(m.project_id)
         if p:
             result.append({"id": p.id, "name": p.name, "status": p.status, "progress": p.progress, "role": m.role})
     return result

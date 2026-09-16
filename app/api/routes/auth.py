@@ -13,6 +13,37 @@ import secrets
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
+@router.get("/demo-token")
+def demo_token(db: Session = Depends(get_db)):
+    """Public endpoint — no credentials required.
+    Returns a read-only JWT for the shared demo user and the ID of the
+    demo project so the frontend can navigate directly to it.
+    Token carries is_demo=True; the write-guard middleware in main.py
+    blocks all non-GET requests for this token transparently."""
+    from app.models.models import Project as _Project
+    demo_user = db.query(User).filter(User.email == "demo@axon-wbs.app").first()
+    if not demo_user:
+        raise HTTPException(
+            status_code=503,
+            detail="Demo environment not ready yet. Please contact the administrator.",
+        )
+    demo_project = db.query(_Project).filter(_Project.is_demo == True).first()
+    token = create_access_token(
+        {"sub": str(demo_user.id), "role": demo_user.role, "is_demo": True},
+        expires_delta=timedelta(hours=12),   # Long-lived so demos don't expire mid-session
+    )
+    return {
+        "token": token,
+        "user": {
+            "id":      demo_user.id,
+            "name":    "AXON Demo",
+            "email":   demo_user.email,
+            "role":    demo_user.role,
+            "is_demo": True,
+        },
+        "project_id": demo_project.id if demo_project else None,
+    }
+
 @router.post("/login", response_model=TokenResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     # Fetch ALL rows with this email (supports dual-role accounts sharing one email)

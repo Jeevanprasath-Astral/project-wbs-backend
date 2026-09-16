@@ -372,6 +372,20 @@ def _build_task_ctx(t: "CustomTask", ctx: dict, compact: bool = False):
     }
 
 
+def _compute_ms_progress(ms: "CustomMilestone") -> float:
+    """Milestone completion % based on task statuses.
+    - Signed-off (status=Completed) → always 100.
+    - Otherwise: completed_tasks / total_tasks * 100 (0 if no tasks).
+    """
+    if ms.status == "Completed":
+        return 100.0
+    tasks = ms.tasks or []
+    if not tasks:
+        return 0.0
+    completed = sum(1 for t in tasks if t.status == "Completed")
+    return round((completed / len(tasks)) * 100, 1)
+
+
 def _build_ctx(ms: "CustomMilestone", ctx: dict, compact: bool = False):
     est, act = _milestone_hours_ctx(ctx, ms)
     return {
@@ -388,6 +402,7 @@ def _build_ctx(ms: "CustomMilestone", ctx: dict, compact: bool = False):
         "revision_description": ms.revision_description,
         "estimated_hours": est, "actual_hours": act,
         "total_days": _total_days(ms.planned_start, ms.planned_end) or _total_days(ms.actual_start, ms.actual_end),
+        "progress": _compute_ms_progress(ms),
         "reports": [_build_milestone_report(r) for r in sorted(ms.reports, key=lambda x: x.id)],
         "tasks": [_build_task_ctx(t, ctx, compact=compact) for t in sorted(ms.tasks, key=lambda x: x.num or 0)],
     }
@@ -793,6 +808,7 @@ def _build(ms: CustomMilestone, db: Session = None):
         "revision_description": ms.revision_description,
         "estimated_hours": est, "actual_hours": act,
         "total_days": _total_days(ms.planned_start, ms.planned_end) or _total_days(ms.actual_start, ms.actual_end),
+        "progress": _compute_ms_progress(ms),
         "reports": [_build_milestone_report(r) for r in sorted(ms.reports, key=lambda x: x.id)],
         "tasks": [_build_task(t, db) for t in sorted(ms.tasks, key=lambda x: x.num or 0)],
     }

@@ -512,6 +512,12 @@ def _run_lightweight_migrations():
         )""",
         "CREATE INDEX IF NOT EXISTS ix_role_permissions_role   ON role_permissions(role)",
         "CREATE INDEX IF NOT EXISTS ix_role_permissions_module ON role_permissions(module)",
+
+        # ── Demo Mode — is_demo flags on users + projects ─────────────────────
+        # Gating column: demo users (is_demo=True) can only see demo projects.
+        # Write-guard middleware blocks all non-GET requests for demo JWTs.
+        "ALTER TABLE users    ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT FALSE",
     ]
     for stmt in statements:
         try:
@@ -825,6 +831,34 @@ def _create_da_user():
 _create_da_user()
 
 
+def _ensure_demo_user():
+    """Create the demo@axon-wbs.app user if it doesn't exist yet.
+    Called once on every cold start — idempotent (UPDATE is a no-op when
+    already set correctly, INSERT is skipped when the row exists)."""
+    from app.core.security import hash_password as _hp
+    from sqlalchemy import text as _sql
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(_sql(
+                "SELECT id FROM users WHERE email = 'demo@axon-wbs.app' LIMIT 1"
+            )).fetchone()
+            if row:
+                # Ensure is_demo flag is always true (idempotent re-run guard)
+                conn.execute(_sql(
+                    "UPDATE users SET is_demo = true WHERE email = 'demo@axon-wbs.app'"
+                ))
+            else:
+                conn.execute(_sql(
+                    """INSERT INTO users (name, email, password_hash, role, is_active, is_demo)
+                       VALUES ('AXON Demo', 'demo@axon-wbs.app', :ph, 'Admin', true, true)"""
+                ), {"ph": _hp("demo-no-login-axon-2026")})
+                logging.info("Demo user created: demo@axon-wbs.app")
+    except Exception as _de:
+        logging.warning(f"_ensure_demo_user failed: {_de}")
+
+_ensure_demo_user()
+
+
 app = FastAPI(title=settings.APP_NAME, description="Project WBS API", version="2.0.0")
 
 # GZip all responses >= 1 KB — cuts JSON payload by ~60-80% on slow networks
@@ -832,6 +866,28 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(CORSMiddleware,
     allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# ── Demo write-guard middleware ────────────────────────────────────────────────
+# Intercepts every non-GET request and blocks it when the JWT carries
+# is_demo=True.  No database hit — reads the JWT payload only.
+# This single middleware protects ALL routes uniformly without touching
+# individual endpoint files.
+from fastapi import Request
+from fastapi.responses import JSONResponse as _JSONResponse
+
+@app.middleware("http")
+async def demo_write_guard(request: Request, call_next):
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            from app.core.security import decode_token as _dt
+            payload = _dt(auth[7:])
+            if payload and payload.get("is_demo"):
+                return _JSONResponse(
+                    status_code=403,
+                    content={"detail": "demo-read-only"},
+                )
+    return await call_next(request)
 
 for router in [auth, projects, milestones, responses, dashboard,
                export, assignments, global_modules, global_team, work_hours,

@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
 from app.services.email_service import send_task_deletion_email
+from app.services.cache_service import cache
 import io
 
 router = APIRouter(prefix="/global", tags=["Global Modules"])
@@ -603,6 +604,12 @@ def global_workload(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    has_filters = any([team, project_id, employee_id, date_from, date_to])
+    if not has_filters:
+        cached = cache.get("global:workload")
+        if cached is not None:
+            return cached
+
     now = datetime.utcnow()
     d_from = datetime.fromisoformat(date_from) if date_from else now - timedelta(days=7)
     d_to   = datetime.fromisoformat(date_to)   if date_to   else now
@@ -618,17 +625,27 @@ def global_workload(
     result = []
     chart_data = []
 
-    for u in users:
-        # Get assignments for this user
-        a_query = db.query(TaskAssignment).filter(
-            TaskAssignment.assigned_to == u.id,
-            TaskAssignment.created_at >= d_from,
-            TaskAssignment.created_at <= d_to,
-        )
-        if project_id:
-            a_query = a_query.filter(TaskAssignment.project_id == project_id)
+    # Bulk-fetch ALL assignments for the filtered users in ONE query instead
+    # of one query per user (eliminates N+1 — previously caused Active Members
+    # to fire N separate DB round-trips where N = number of active users).
+    from collections import defaultdict
+    user_ids_set = {u.id for u in users}
+    bulk_a_query = db.query(TaskAssignment).filter(
+        TaskAssignment.assigned_to.in_(user_ids_set),
+        TaskAssignment.created_at >= d_from,
+        TaskAssignment.created_at <= d_to,
+    )
+    if project_id:
+        bulk_a_query = bulk_a_query.filter(TaskAssignment.project_id == project_id)
+    all_assignments = bulk_a_query.all()
 
-        assignments = a_query.all()
+    # Group by assignee in Python — zero extra queries
+    assignments_by_user: dict = defaultdict(list)
+    for a in all_assignments:
+        assignments_by_user[a.assigned_to].append(a)
+
+    for u in users:
+        assignments = assignments_by_user.get(u.id, [])
         total     = len(assignments)
         completed = sum(1 for a in assignments if a.status == "Completed")
         in_prog   = sum(1 for a in assignments if a.status == "In Progress")
@@ -688,12 +705,17 @@ def global_workload(
         "avg_completion":  round(sum(r["completion_pct"] for r in result) / len(result), 1) if result else 0,
     }
 
-    return {
+    workload_result = {
         "employees": result,
         "chart_data": chart_data,
         "summary": summary,
         "period": {"from": d_from.isoformat(), "to": d_to.isoformat()},
     }
+
+    if not has_filters:
+        cache.set("global:workload", workload_result, ttl=300)
+
+    return workload_result
 
 
 # ── Helper: all projects list ─────────────────────────────────────────────────
@@ -728,7 +750,16 @@ def global_dashboard_summary(
     current_user: User = Depends(get_current_user)
 ):
     """Fix 8: single endpoint combining workload + project_status + projects + users
-    so the Global Dashboard fires 3 API calls instead of 6."""
+    so the Global Dashboard fires 3 API calls instead of 6.
+    When called with no filters (the default page-load), result is served from
+    in-memory cache (5-min TTL) — zero DB queries on cache hit."""
+    has_filters = any([team, project_id, employee_id, date_from, date_to])
+
+    if not has_filters:
+        cached = cache.get("global:dashboard_summary")
+        if cached is not None:
+            return cached
+
     workload_data = global_workload(
         team=team, project_id=project_id, employee_id=employee_id,
         date_from=date_from, date_to=date_to, db=db, current_user=current_user
@@ -739,12 +770,17 @@ def global_dashboard_summary(
     )
     projects = global_projects_list(db=db, current_user=current_user)
     users = global_users_list(db=db, current_user=current_user)
-    return {
+    result = {
         "workload":       workload_data,
         "project_status": status_data,
         "projects":       projects,
         "users":          users,
     }
+
+    if not has_filters:
+        cache.set("global:dashboard_summary", result, ttl=300)
+
+    return result
 
 
 # ── Dashboard Project Status (req 7a) ─────────────────────────────────────────
@@ -760,6 +796,12 @@ def global_project_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    has_filters = any([project_id, team, employee_id])
+    if not has_filters:
+        cached = cache.get("global:project_status")
+        if cached is not None:
+            return cached
+
     projects_q = db.query(Project).order_by(Project.name)
     if project_id:
         projects_q = projects_q.filter(Project.id == project_id)
@@ -777,10 +819,36 @@ def global_project_status(
         team_names = {u.name for u in db.query(User).filter(User.role == team).all()}
         assignee_names = team_names if assignee_names is None else (assignee_names & team_names)
 
+    # Bulk-fetch ALL milestones and tasks for all projects in TWO queries
+    # instead of 2 queries per project (eliminates N+1 — previously caused
+    # By Project section to fire 2×P DB round-trips where P = project count).
+    from collections import defaultdict
+    proj_ids = [p.id for p in projects]
+
+    if proj_ids:
+        all_milestones = db.query(CustomMilestone).filter(
+            CustomMilestone.project_id.in_(proj_ids),
+            CustomMilestone.is_active == True,
+        ).all()
+        all_tasks = db.query(CustomTask).filter(
+            CustomTask.project_id.in_(proj_ids),
+        ).all()
+    else:
+        all_milestones = []
+        all_tasks = []
+
+    # Group in Python — zero extra queries
+    ms_by_project: dict = defaultdict(list)
+    for m in all_milestones:
+        ms_by_project[m.project_id].append(m)
+    tasks_by_project: dict = defaultdict(list)
+    for t in all_tasks:
+        tasks_by_project[t.project_id].append(t)
+
     result = []
     for p in projects:
-        milestones = db.query(CustomMilestone).filter_by(project_id=p.id, is_active=True).all()
-        tasks = db.query(CustomTask).filter_by(project_id=p.id).all()
+        milestones = ms_by_project.get(p.id, [])
+        tasks = tasks_by_project.get(p.id, [])
         if assignee_names is not None:
             milestones = [m for m in milestones if m.assignee in assignee_names]
             tasks = [t for t in tasks if t.assignee in assignee_names]
@@ -806,6 +874,9 @@ def global_project_status(
             # weighted average of milestone and task completion.
             "overall_progress_pct": round((ms_pct + task_pct) / 2, 1) if (ms_total or task_total) else 0.0,
         })
+    if not has_filters:
+        cache.set("global:project_status", result, ttl=300)
+
     return result
 
 

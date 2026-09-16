@@ -10,7 +10,7 @@ from app.schemas.schemas import MilestoneUpdate
 from app.core.deps import get_current_user
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
-from app.services.progress_service import recalculate_milestone_progress
+from app.services.progress_service import recalculate_milestone_progress, recalculate_project_progress
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["Milestones"])
 
@@ -188,6 +188,7 @@ def signoff_milestone(project_id: int, num: int, db: Session = Depends(get_db), 
     pm.signed_off_at = datetime.utcnow()
     pm.reviewer = current_user.name
     pm.status = "Completed"
+    pm.progress = 100.0
     create_notification(db, project_id, "completed",
                         f"Milestone {num:02d} '{pm.name}' signed off by {current_user.name}.")
     # Email all Admin users about the milestone sign-off
@@ -221,5 +222,7 @@ def signoff_milestone(project_id: int, num: int, db: Session = Depends(get_db), 
                project_id=project_id, entity_type="milestone",
                entity_id=pm.id, old_value="In Progress",
                new_value="Completed", user_id=current_user.id)
+    # Update project-level progress so the My Projects card reflects this sign-off immediately
+    recalculate_project_progress(db, project_id)
     db.commit()
     return {"status": "ok"}

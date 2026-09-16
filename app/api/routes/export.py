@@ -8,7 +8,7 @@ from app.db.database import get_db
 from app.models.models import (Project, ProjectMilestone, Milestone, Task,
                                 Subtask, Question, Response, SubtaskStatus, User,
                                 CustomMilestone, CustomTask, CustomSubtask,
-                                Activity, WorkHours)
+                                Activity, WorkHours, SubtaskQuestion)
 from app.core.deps import get_current_user
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -81,7 +81,7 @@ def _fmt_date(dt) -> str:
 
 # ── Excel Export ──────────────────────────────────────────────────────────────
 @router.get("/projects/{project_id}/export/xlsx")
-def export_excel(project_id: int, milestone: int = None, db: Session = Depends(get_db),
+def export_excel(project_id: int, milestones: str = None, db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
     """Export full Milestone Configuration data (CustomMilestone → CustomTask →
     CustomSubtask → Activity).  Produces one 'Overview' sheet summarising all
@@ -92,17 +92,32 @@ def export_excel(project_id: int, milestone: int = None, db: Session = Depends(g
     project = db.query(Project).filter_by(id=project_id).first()
 
     # Load active custom milestones with full hierarchy (eager load to avoid N+1)
+    # Include SubtaskQuestion so form answers are available without extra queries
     cm_q = (db.query(CustomMilestone)
               .filter_by(project_id=project_id, is_active=True)
               .options(
                   joinedload(CustomMilestone.tasks)
                   .joinedload(CustomTask.subtasks)
-                  .joinedload(CustomSubtask.activities)
+                  .joinedload(CustomSubtask.activities),
+                  joinedload(CustomMilestone.tasks)
+                  .joinedload(CustomTask.subtasks)
+                  .joinedload(CustomSubtask.questions),
               )
               .order_by(CustomMilestone.num))
-    if milestone:
-        cm_q = cm_q.filter(CustomMilestone.num == milestone)
+    if milestones:
+        ms_nums = [int(x.strip()) for x in milestones.split(',') if x.strip().isdigit()]
+        if ms_nums:
+            cm_q = cm_q.filter(CustomMilestone.num.in_(ms_nums))
     custom_milestones = cm_q.all()
+
+    # Load OLD template system data (Milestone→Task→Subtask→Question + Response/SubtaskStatus)
+    # so that form responses entered via the standard milestone template are also exported.
+    _, _, old_milestones, resp_by_question, resp_by_subtask, ss_by_subtask = _load_project_data(db, project_id)
+    # Build lookup: (milestone_num, task_num) → Task (old template)
+    old_task_lookup: dict = {}
+    for ms_num, old_ms in old_milestones.items():
+        for old_task in (old_ms.tasks if old_ms else []):
+            old_task_lookup[(ms_num, old_task.num)] = old_task
 
     # Bulk-fetch actual consumed hours per subtask and per activity
     all_sub_ids = [s.id for cm in custom_milestones
@@ -329,60 +344,119 @@ def export_excel(project_id: int, milestone: int = None, db: Session = Depends(g
 
         row += 1  # gap
 
-        # ══ SUBTASKS TABLE ════════════════════════════════════════════════════
-        row = _section_label(ws, row, "  🔹  SUBTASKS", SUB_SEC_FILL)
-        SUB_HDRS = ["Task", "Sub #", "Subtask Name", "Status", "Assignee",
-                    "Input Type", "Planned Start", "Planned End",
-                    "Est. Hours", "Actual Hours"]
-        row = _col_headers(ws, row, SUB_HDRS)
+        # ══ FORM DETAILS ══════════════════════════════════════════════════════
+        # Shows only filled form Q&A — no raw subtask rows.
+        # Layout: Task header (navy) → Form name header (light blue) → Q&A rows
+        row = _section_label(ws, row, "  📋  FORM DETAILS", SUB_SEC_FILL)
 
-        has_subtasks = False
-        sub_idx = 0
+        FORM_FILL     = fill("E8F4FD")   # light-blue  — question label cells
+        ANS_FILL      = fill("FFFDE7")   # pale-yellow — answer cells
+        TASK_HDR_FILL = fill("1F3864")   # dark navy   — task group header
+        FORM_HDR_FILL = fill("DCE6F1")   # soft blue-gray — form/section header
+
+        def _form_row(ws_s, r, q_label, ans_val):
+            """Question (A-D merged, light blue) + Answer (E-J merged, yellow)."""
+            ws_s.merge_cells(f"A{r}:D{r}")
+            qc = ws_s[f"A{r}"]
+            qc.value = f"    ↳ {q_label}"
+            qc.font  = Font(size=8, italic=True, color="0D47A1", name="Calibri")
+            qc.fill  = FORM_FILL; qc.border = bdr()
+            qc.alignment = Alignment(horizontal="left", wrap_text=True)
+            ws_s.merge_cells(f"E{r}:J{r}")
+            ac = ws_s[f"E{r}"]
+            ac.value = ans_val
+            ac.font  = Font(size=8, color="333333", name="Calibri")
+            ac.fill  = ANS_FILL; ac.border = bdr()
+            ac.alignment = Alignment(horizontal="left", wrap_text=True)
+            ws_s.row_dimensions[r].height = 14
+            return r + 1
+
+        def _task_hdr(ws_s, r, task_name):
+            """Full-width dark navy task group header."""
+            ws_s.merge_cells(f"A{r}:J{r}")
+            c = ws_s[f"A{r}"]
+            c.value = f"  📌  Task: {task_name}"
+            c.font  = Font(size=9, bold=True, color="FFFFFF", name="Calibri")
+            c.fill  = TASK_HDR_FILL; c.border = bdr()
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            ws_s.row_dimensions[r].height = 18
+            return r + 1
+
+        def _form_hdr(ws_s, r, form_name, status=None):
+            """Full-width form / section sub-header."""
+            ws_s.merge_cells(f"A{r}:J{r}")
+            c = ws_s[f"A{r}"]
+            status_str = f"   [{status}]" if status else ""
+            c.value = f"    📄  {form_name}{status_str}"
+            c.font  = Font(size=8, bold=True, color="1F3864", name="Calibri")
+            c.fill  = FORM_HDR_FILL; c.border = bdr()
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            ws_s.row_dimensions[r].height = 16
+            return r + 1
+
+        has_form_data = False
         for task in tasks_sorted:
-            subs_sorted = sorted(task.subtasks, key=lambda x: x.num or 0)
-            for sub in subs_sorted:
-                has_subtasks = True
-                s_status = sub.status or "Not Started"
-                s_sfill  = STATUS_FILLS.get(s_status, TODO_FILL)
-                s_scolor = STATUS_COLORS.get(s_status, "666666")
-                row_bg   = EVEN_FILL if sub_idx % 2 == 0 else ODD_FILL
-                act_hrs  = sub_actual.get(sub.id, 0.0)
-                _c(ws, row, 1,  task.name or "—", italic=True,
-                   color="555555", bg=row_bg)
-                _c(ws, row, 2,  f"S{sub.num:02d}" if sub.num else "—",
-                   bold=True, align="center", bg=row_bg)
-                _c(ws, row, 3,  sub.name or "", bold=True, bg=row_bg, wrap=True)
-                _c(ws, row, 4,  s_status, bold=True,
-                   color=s_scolor, align="center", bg=s_sfill)
-                _c(ws, row, 5,  sub.assignee   or "—", bg=row_bg)
-                _c(ws, row, 6,  sub.input_type or "—", align="center", bg=row_bg)
-                _c(ws, row, 7,  _fmt_date(sub.planned_start), align="center", bg=row_bg)
-                _c(ws, row, 8,  _fmt_date(sub.planned_end),   align="center", bg=row_bg)
-                _c(ws, row, 9,  sub.estimated_hours or 0, align="center", bg=row_bg)
-                _c(ws, row, 10, act_hrs,                  align="center", bg=row_bg)
-                ws.row_dimensions[row].height = 17
-                row += 1
+            task_has_data = False
 
-                # ── Response / input (if filled) shown as indented row ────────
-                if sub.response:
-                    resp_bg = fill("FFFDE7")
-                    ws.merge_cells(f"A{row}:B{row}")
-                    rc = ws[f"A{row}"]
-                    rc.value = f"    ↳ Response: {sub.response}"
-                    rc.font  = Font(size=8, italic=True, color="0D47A1", name="Calibri")
-                    rc.fill  = resp_bg
-                    rc.border = bdr()
-                    rc.alignment = Alignment(horizontal="left", wrap_text=True)
-                    for ci in range(3, N_COLS + 1):
-                        ec = ws.cell(row, ci)
-                        ec.fill = resp_bg; ec.border = bdr()
-                    ws.row_dimensions[row].height = 14
-                    row += 1
+            # ── NEW-SYSTEM: SubtaskQuestion answers ───────────────────────────
+            for sub in sorted(task.subtasks, key=lambda x: x.num or 0):
+                filled_qs = [
+                    q for q in sorted(sub.questions, key=lambda x: x.num or 0)
+                    if (q.response or "").strip()
+                ]
+                if not filled_qs:
+                    continue
+                if not task_has_data:
+                    row = _task_hdr(ws, row, task.name or "—")
+                    task_has_data = True
+                    has_form_data = True
+                row = _form_hdr(ws, row, sub.name or f"Subtask {sub.num}", sub.status)
+                for q in filled_qs:
+                    row = _form_row(ws, row,
+                                    f"Q{q.num}: {q.question_text or ''}",
+                                    q.response.strip())
 
-                sub_idx += 1
+            # ── OLD-SYSTEM: Milestone template form responses ─────────────────
+            old_task = old_task_lookup.get((cm.num, task.num))
+            old_subs = sorted(old_task.subtasks, key=lambda x: x.num or 0) if old_task else []
 
-        if not has_subtasks:
-            row = _empty_row(ws, row, "No subtasks configured for this milestone.")
+            for old_sub in old_subs:
+                if old_sub.is_format and old_sub.questions:
+                    filled = [
+                        (q, resp_by_question.get(q.id, ""))
+                        for q in sorted(old_sub.questions, key=lambda x: x.num or 0)
+                        if resp_by_question.get(q.id, "")
+                    ]
+                    if not filled:
+                        continue
+                    if not task_has_data:
+                        row = _task_hdr(ws, row, task.name or "—")
+                        task_has_data = True
+                        has_form_data = True
+                    ss = ss_by_subtask.get(old_sub.id)
+                    row = _form_hdr(ws, row,
+                                    old_sub.name or f"Form {old_sub.num}",
+                                    ss.status if ss else None)
+                    for q, val in filled:
+                        row = _form_row(ws, row,
+                                        f"Q{q.num}: {q.question_text or ''}",
+                                        val)
+                else:
+                    resp_val = (resp_by_subtask.get(old_sub.id) or "").strip()
+                    if not resp_val:
+                        continue
+                    if not task_has_data:
+                        row = _task_hdr(ws, row, task.name or "—")
+                        task_has_data = True
+                        has_form_data = True
+                    ss = ss_by_subtask.get(old_sub.id)
+                    row = _form_hdr(ws, row,
+                                    old_sub.name or f"Item {old_sub.num}",
+                                    ss.status if ss else None)
+                    row = _form_row(ws, row, "Response", resp_val)
+
+        if not has_form_data:
+            row = _empty_row(ws, row, "No form details have been filled for this milestone.")
 
         row += 1  # gap
 
@@ -432,7 +506,7 @@ def export_excel(project_id: int, milestone: int = None, db: Session = Depends(g
 
 # ── PDF Export ────────────────────────────────────────────────────────────────
 @router.get("/projects/{project_id}/export/pdf")
-def export_pdf(project_id: int, milestone: int = None, db: Session = Depends(get_db),
+def export_pdf(project_id: int, milestones: str = None, db: Session = Depends(get_db),
                current_user: User = Depends(get_current_user)):
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors
@@ -444,8 +518,10 @@ def export_pdf(project_id: int, milestone: int = None, db: Session = Depends(get
     from datetime import date
 
     project, pms, milestones, resp_by_q, resp_by_sub, ss_by_sub = _load_project_data(db, project_id)
-    if milestone:
-        pms = [pm for pm in pms if pm.num == milestone]
+    if milestones:
+        ms_nums = [int(x.strip()) for x in milestones.split(',') if x.strip().isdigit()]
+        if ms_nums:
+            pms = [pm for pm in pms if pm.num in ms_nums]
 
     # Build a num → CustomMilestone lookup so PDF headers show the actual status
     # rather than the ProjectMilestone default ("Not Started").
@@ -669,3 +745,211 @@ def export_pdf(project_id: int, milestone: int = None, db: Session = Depends(get
     return StreamingResponse(buffer,
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=project-wbs-{project_id}.pdf"})
+
+
+# ── Dashboard Summary Export ───────────────────────────────────────────────────
+@router.get("/projects/{project_id}/export/dashboard-xlsx")
+def export_dashboard_xlsx(project_id: int, db: Session = Depends(get_db),
+                           current_user: User = Depends(get_current_user)):
+    """Export a concise Excel summary of the Project Dashboard:
+    overall progress, milestone status table, task assignment counts,
+    and work-hour summary — matching exactly what the Dashboard page shows."""
+    from datetime import date as _date
+
+    project = db.query(Project).filter_by(id=project_id).first()
+
+    # Active custom milestones (progress computed from CustomTask statuses)
+    active_cms = (db.query(CustomMilestone)
+                    .filter_by(project_id=project_id, is_active=True)
+                    .options(joinedload(CustomMilestone.tasks))
+                    .order_by(CustomMilestone.num).all())
+
+    # Task assignment counts
+    from app.models.models import TaskAssignment
+    assignments = db.query(TaskAssignment).filter_by(project_id=project_id).all()
+
+    # Work hours summary
+    wh_rows = db.query(WorkHours).filter_by(project_id=project_id).all()
+    total_wh   = round(sum(float(r.hours_spent or 0) for r in wh_rows), 2)
+    billed_wh  = round(sum(float(r.hours_spent or 0) for r in wh_rows if r.is_billable), 2)
+
+    # Compute per-milestone progress
+    def _ms_pct(cm):
+        if cm.status == "Completed":
+            return 100.0
+        if not cm.tasks:
+            return 0.0
+        done = sum(1 for t in cm.tasks if t.status == "Completed")
+        return round(done / len(cm.tasks) * 100, 1)
+
+    ms_pcts = [_ms_pct(cm) for cm in active_cms]
+    proj_pct = round(sum(ms_pcts) / len(ms_pcts), 1) if ms_pcts else 0.0
+
+    # Milestone status counts
+    status_counts = {"Completed": 0, "In Progress": 0, "Overdue": 0, "Not Started": 0, "On Hold": 0}
+    for cm in active_cms:
+        s = cm.status or "Not Started"
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    # Assignment counts
+    asgn_total     = len(assignments)
+    asgn_prog      = sum(1 for a in assignments if a.status == "In Progress")
+    asgn_done      = sum(1 for a in assignments if a.status == "Completed")
+    asgn_overdue   = sum(1 for a in assignments if a.status == "Overdue")
+
+    # ── Build workbook ────────────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Dashboard Summary"
+
+    def fill(hex_c):
+        return PatternFill("solid", fgColor=hex_c)
+    def bdr():
+        s = Side(style="thin", color="CCCCCC")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    NAVY   = fill("1F3864")
+    HDRB   = fill("BDD7EE")
+    INFOB  = fill("D9E8F5")
+    EVEN   = fill("EBF3FB")
+    ODD    = fill("FFFFFF")
+    STATUS_FILLS = {
+        "Completed": fill("E2EFDA"), "In Progress": fill("FFF2CC"),
+        "Overdue":   fill("FCE4EC"), "Not Started": fill("F0F0F0"),
+        "On Hold":   fill("EDE7F6"),
+    }
+    STATUS_COLORS = {
+        "Completed": "375623", "In Progress": "7F6000",
+        "Overdue":   "A32D2D", "Not Started": "666666",
+        "On Hold":   "4A148C",
+    }
+
+    LAST = "H"
+    N    = 8
+    col_widths = [5, 26, 14, 16, 16, 13, 13, 12]
+    for letter, w in zip("ABCDEFGH", col_widths):
+        ws.column_dimensions[letter].width = w
+
+    def merge_row(r, val, fg="FFFFFF", bg=None, bold=False, italic=False, size=9, h=17):
+        ws.merge_cells(f"A{r}:{LAST}{r}")
+        c = ws[f"A{r}"]
+        c.value = val
+        c.font = Font(size=size, bold=bold, italic=italic, color=fg, name="Calibri")
+        if bg: c.fill = bg
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.row_dimensions[r].height = h
+        return r + 1
+
+    def cell(r, col, val, bold=False, italic=False, color="333333",
+             align="left", bg=None, wrap=False, size=9):
+        c = ws.cell(r, col, val if val not in (None, "") else "")
+        c.font = Font(size=size, bold=bold, italic=italic, color=color, name="Calibri")
+        if bg: c.fill = bg
+        c.border = bdr()
+        c.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
+        return c
+
+    def col_hdr(r, headers):
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(r, ci, h)
+            c.font = Font(bold=True, color="1F3864", size=9, name="Calibri")
+            c.fill = HDRB; c.border = bdr()
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[r].height = 17
+        return r + 1
+
+    row = 1
+
+    # Title
+    row = merge_row(row, f"PROJECT DASHBOARD — {(project.name or '').upper()}",
+                    fg="FFFFFF", bg=NAVY, bold=True, size=13, h=28)
+    row = merge_row(row,
+        f"Client: {project.client or '—'}   |   Owner: {project.owner or '—'}   |   "
+        f"Exported by: {current_user.name}   |   Date: {_date.today().strftime('%d %B %Y')}",
+        fg="555555", bg=INFOB, italic=True, size=8, h=14)
+    row += 1
+
+    # ── Overall progress bar (text representation) ────────────────────────────
+    row = merge_row(row, "  📊  OVERALL PROGRESS", fg="FFFFFF",
+                    bg=fill("3730A3"), bold=True, size=10, h=19)
+    ws.merge_cells(f"A{row}:{LAST}{row}")
+    pc = ws[f"A{row}"]
+    pc.value = f"  Overall Project Progress: {proj_pct}%   ({sum(1 for cm in active_cms if cm.status == 'Completed')} of {len(active_cms)} milestones completed)"
+    pc.font = Font(size=11, bold=True, color="1F3864", name="Calibri")
+    pc.fill = INFOB; pc.border = bdr()
+    pc.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[row].height = 20
+    row += 1
+    row += 1
+
+    # ── Milestone Status Summary ───────────────────────────────────────────────
+    row = merge_row(row, "  🏁  MILESTONE STATUS SUMMARY", fg="FFFFFF",
+                    bg=fill("3730A3"), bold=True, size=10, h=19)
+    row = col_hdr(row, ["#", "Milestone Name", "Status", "Assignee",
+                         "Planned Start", "Planned End", "Progress %", "Tasks Done"])
+
+    for i, cm in enumerate(active_cms):
+        pct    = ms_pcts[i]
+        done   = sum(1 for t in cm.tasks if t.status == "Completed")
+        total  = len(cm.tasks)
+        s      = cm.status or "Not Started"
+        sfill  = STATUS_FILLS.get(s, fill("F0F0F0"))
+        scolor = STATUS_COLORS.get(s, "666666")
+        bg     = EVEN if i % 2 == 0 else ODD
+        cell(row, 1, f"M{cm.num:02d}", bold=True, align="center", bg=bg)
+        cell(row, 2, cm.name or "", bold=True, bg=bg)
+        cell(row, 3, s, bold=True, color=scolor, align="center", bg=sfill)
+        cell(row, 4, cm.assignee or "—", bg=bg)
+        cell(row, 5, _fmt_date(cm.planned_start), align="center", bg=bg)
+        cell(row, 6, _fmt_date(cm.planned_end),   align="center", bg=bg)
+        cell(row, 7, f"{pct}%", bold=True, align="center", bg=bg,
+             color="375623" if pct == 100 else ("7F6000" if pct > 0 else "666666"))
+        cell(row, 8, f"{done} / {total}", align="center", bg=bg)
+        ws.row_dimensions[row].height = 17
+        row += 1
+
+    row += 1
+
+    # ── Task Assignments ──────────────────────────────────────────────────────
+    row = merge_row(row, "  📌  TASK ASSIGNMENTS", fg="FFFFFF",
+                    bg=fill("3730A3"), bold=True, size=10, h=19)
+    row = col_hdr(row, ["Metric", "Value", "", "", "", "", "", ""])
+    for label, val, color in [
+        ("Total Assignments",     asgn_total,   "333333"),
+        ("In Progress",           asgn_prog,    "7F6000"),
+        ("Completed",             asgn_done,    "375623"),
+        ("Overdue",               asgn_overdue, "A32D2D"),
+    ]:
+        cell(row, 1, label, bold=True, bg=ODD)
+        cell(row, 2, val,   bold=True, color=color, align="center", bg=ODD)
+        for ci in range(3, N + 1):
+            ws.cell(row, ci).border = bdr()
+        ws.row_dimensions[row].height = 16
+        row += 1
+
+    row += 1
+
+    # ── Work Hours Summary ────────────────────────────────────────────────────
+    row = merge_row(row, "  ⏱️  WORK HOURS SUMMARY", fg="FFFFFF",
+                    bg=fill("3730A3"), bold=True, size=10, h=19)
+    row = col_hdr(row, ["Metric", "Hours", "", "", "", "", "", ""])
+    for label, val in [
+        ("Total Hours Logged",  total_wh),
+        ("Billable Hours",      billed_wh),
+        ("Non-Billable Hours",  round(total_wh - billed_wh, 2)),
+    ]:
+        cell(row, 1, label, bold=True, bg=ODD)
+        cell(row, 2, val,   align="center", bg=ODD)
+        for ci in range(3, N + 1):
+            ws.cell(row, ci).border = bdr()
+        ws.row_dimensions[row].height = 16
+        row += 1
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    proj_name = (project.name or "project").replace(" ", "-").lower()
+    return StreamingResponse(output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 f"attachment; filename=dashboard-{proj_name}.xlsx"})

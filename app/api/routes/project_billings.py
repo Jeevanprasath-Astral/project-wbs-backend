@@ -65,8 +65,8 @@ class BillingUpdate(BaseModel):
 
 
 def _require_admin(user: User):
-    if user.role not in ("Admin", "HR", "Project Manager"):
-        raise HTTPException(403, "Admin, HR, or Project Manager only")
+    if user.role not in ("Admin", "HR", "Project Manager", "FC Lead"):
+        raise HTTPException(403, "Admin, HR, Project Manager, or FC Lead only")
 
 
 def _resolve_milestone(db: Session, milestone_id: Optional[int]):
@@ -126,6 +126,35 @@ def _write_audit(
 @router.get("/billing-types")
 def get_billing_types(current_user: User = Depends(get_current_user)):
     return BILLING_TYPES
+
+
+@router.get("/summaries")
+def get_billing_summaries(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Lightweight per-project billing totals for the collapsed summary row.
+    Returns [{project_id, count, total}] — total uses actual_billing_amount
+    when present, otherwise falls back to planned_billing_amount."""
+    from sqlalchemy import func, case
+    rows = (
+        db.query(
+            ProjectBilling.project_id,
+            func.count(ProjectBilling.id).label("count"),
+            func.sum(
+                case(
+                    (ProjectBilling.actual_billing_amount != None, ProjectBilling.actual_billing_amount),
+                    else_=ProjectBilling.planned_billing_amount,
+                )
+            ).label("total"),
+        )
+        .group_by(ProjectBilling.project_id)
+        .all()
+    )
+    return [
+        {"project_id": r.project_id, "count": r.count, "total": float(r.total or 0)}
+        for r in rows
+    ]
 
 
 @router.patch("/entry/{entry_id}")

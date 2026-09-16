@@ -445,13 +445,57 @@ def send_monthly_appreciation():
         db.close()
 
 
+def _prewarm_cache():
+    """Pre-compute the three heavy global endpoints every 5 minutes so users
+    get instant cache-hits instead of waiting for DB queries on page load.
+
+    Strategy:
+      1. Call global_workload  (no filters) → populates cache key "global:workload"
+      2. Call global_project_status (no filters) → populates "global:project_status"
+      3. Call global_dashboard_summary (no filters) → its internal workload/project_status
+         calls hit the caches we just filled; only the small projects+users lists go to DB.
+         Result stored under "global:dashboard_summary".
+
+    Import is deferred to call-time to avoid a circular-import at module load.
+    Any active user is used as the request-context stand-in — the no-filter
+    endpoints don't filter by role so any user produces the correct full result.
+    """
+    db: Session = SessionLocal()
+    try:
+        # Lazy import — avoids circular dependency at module level
+        from app.api.routes.global_modules import (
+            global_workload,
+            global_project_status,
+            global_dashboard_summary,
+        )
+        user = db.query(User).filter(User.is_active == True).first()
+        if not user:
+            logger.info("_prewarm_cache: no active users — skipping.")
+            return
+
+        global_workload(db=db, current_user=user)
+        global_project_status(db=db, current_user=user)
+        # dashboard calls workload + project_status internally; both hit cache now
+        global_dashboard_summary(db=db, current_user=user)
+
+        logger.info("_prewarm_cache: global workload, project_status, and dashboard_summary refreshed.")
+    except Exception as e:
+        logger.error("_prewarm_cache error: %s", e)
+    finally:
+        db.close()
+
+
 def start_scheduler():
     scheduler.add_job(check_overdue_and_reminders, "interval", hours=6, id="overdue_check")
     scheduler.add_job(_keepalive_ping, "interval", minutes=10, id="keepalive_ping")
+    scheduler.add_job(_prewarm_cache, "interval", minutes=5, id="prewarm_cache")
     # 1st of every month at 09:00 UTC — sends appreciation emails for previous month
     scheduler.add_job(send_monthly_appreciation, "cron", day=1, hour=9, minute=0, id="monthly_appreciation")
     scheduler.start()
-    logger.info("Scheduler started -- overdue check every 6 h, keepalive ping every 10 min, appreciation email 1st of month at 09:00.")
+    logger.info(
+        "Scheduler started -- overdue check every 6 h, keepalive ping every 10 min, "
+        "cache pre-warm every 5 min, appreciation email 1st of month at 09:00."
+    )
 
 def stop_scheduler():
     scheduler.shutdown()

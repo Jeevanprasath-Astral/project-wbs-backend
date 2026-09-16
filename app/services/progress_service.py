@@ -13,6 +13,11 @@ def recalculate_milestone_progress(db: Session, project_id: int, milestone_num: 
 
     subtask_ids = [s.id for t in ms.tasks for s in t.subtasks]
     if not subtask_ids:
+        # Milestone template has no subtasks — if it was manually signed off, honour that
+        if pm.status == "Completed" and pm.progress < 100.0:
+            pm.progress = 100.0
+            db.flush()
+            recalculate_project_progress(db, project_id)
         return
 
     total = len(subtask_ids)
@@ -44,7 +49,22 @@ def recalculate_milestone_progress(db: Session, project_id: int, milestone_num: 
     recalculate_project_progress(db, project_id)
 
 def recalculate_project_progress(db: Session, project_id: int):
-    milestones = db.query(ProjectMilestone).filter_by(project_id=project_id).all()
+    from app.models.models import CustomMilestone
+    # Only average milestones the project has actively selected.
+    # Inactive/unselected rows (all progress=0) must not dilute the average.
+    active_nums = {
+        cm.num for cm in db.query(CustomMilestone).filter_by(
+            project_id=project_id, is_active=True
+        ).all()
+    }
+    if active_nums:
+        milestones = db.query(ProjectMilestone).filter(
+            ProjectMilestone.project_id == project_id,
+            ProjectMilestone.num.in_(active_nums)
+        ).all()
+    else:
+        # No milestones selected yet — fall back to all standard rows
+        milestones = db.query(ProjectMilestone).filter_by(project_id=project_id).all()
     if not milestones:
         return
     # Cap each milestone at 100 before averaging

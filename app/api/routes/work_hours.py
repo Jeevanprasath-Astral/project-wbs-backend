@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, and_
 from typing import Optional
 from datetime import datetime, date, timedelta
@@ -130,6 +130,51 @@ def _build(w: WorkHours, db: Session):
         "created_at": w.created_at,
     }
 
+
+def _build_fast(w: WorkHours, user_map: dict, proj_map: dict, assign_map: dict, db: Session):
+    """N+1-free version of _build() for list endpoints.
+    Uses pre-fetched dicts instead of firing per-row DB queries.
+    Falls back to _resolve_level_name() only when task_name is None —
+    this is rare because task_name is stored at log time."""
+    user = user_map.get(w.user_id)
+    project = proj_map.get(w.project_id) if w.project_id else None
+    assignment = assign_map.get(w.assignment_id) if w.assignment_id else None
+    return {
+        "id": w.id,
+        "user_id": w.user_id,
+        "user_name": user.name if user else "—",
+        "user_role": user.role if user else "—",
+        "team_id": user.team_id if user else None,
+        "team_name": user.team.name if user and user.team else None,
+        "project_id": w.project_id,
+        "project_name": project.name if project else "📋 General Task",
+        "assignment_id": w.assignment_id,
+        "milestone_num": assignment.milestone_num if assignment else None,
+        "level": w.level,
+        "custom_milestone_id": w.custom_milestone_id,
+        "custom_task_id": w.custom_task_id,
+        "custom_subtask_id": w.custom_subtask_id,
+        "activity_id": w.activity_id,
+        "task_name": w.task_name or _resolve_level_name(w, db),
+        "date": str(w.date),
+        "start_time": w.start_time.isoformat() if w.start_time else None,
+        "end_time": w.end_time.isoformat() if w.end_time else None,
+        "hours_spent": w.hours_spent,
+        "assigned_hours": w.assigned_hours,
+        "buffer_hours": w.buffer_hours or 0,
+        "buffer_category": w.buffer_category,
+        "is_billable": w.is_billable,
+        "work_type": w.work_type or (
+            "Billable" if w.is_billable is True
+            else "Non-Billable" if w.is_billable is False
+            else None
+        ),
+        "actual_working_hours": _actual_hours(w),
+        "notes": w.notes,
+        "milestone_report_id": w.milestone_report_id,
+        "created_at": w.created_at,
+    }
+
 @router.get("")
 def list_work_hours(
     project_id: Optional[int] = None,
@@ -140,6 +185,8 @@ def list_work_hours(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     view: str = "daily",  # daily | weekly | monthly
+    limit: int = 50,      # max rows to return (pagination)
+    offset: int = 0,      # skip N rows (pagination)
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -156,11 +203,45 @@ def list_work_hours(
     if team_id:
         user_ids = [u.id for u in db.query(User).filter(User.team_id == team_id).all()]
         q = q.filter(WorkHours.user_id.in_(user_ids))
-    records = q.order_by(WorkHours.date.desc()).all()
+
+    q = q.order_by(WorkHours.date.desc())
+
     if milestone_num:
+        # milestone filter requires post-query filtering; fetch all then slice
+        all_records = q.all()
         assignment_ids = {a.id for a in db.query(TaskAssignment).filter(TaskAssignment.milestone_num == milestone_num).all()}
-        records = [w for w in records if w.assignment_id in assignment_ids]
-    return [_build(w, db) for w in records]
+        all_records = [w for w in all_records if w.assignment_id in assignment_ids]
+        total = len(all_records)
+        records = all_records[offset: offset + limit]
+    else:
+        total = q.count()
+        records = q.offset(offset).limit(limit).all()
+
+    # Perf: bulk-fetch all referenced users (with team joined), projects, and
+    # assignments in 3 queries instead of 3 per record (eliminates N+1).
+    lw_user_ids   = {w.user_id for w in records if w.user_id}
+    lw_proj_ids   = {w.project_id for w in records if w.project_id}
+    lw_assign_ids = {w.assignment_id for w in records if w.assignment_id}
+
+    lw_user_map: dict = (
+        {u.id: u for u in db.query(User).options(joinedload(User.team)).filter(User.id.in_(lw_user_ids)).all()}
+        if lw_user_ids else {}
+    )
+    lw_proj_map: dict = (
+        {p.id: p for p in db.query(Project).filter(Project.id.in_(lw_proj_ids)).all()}
+        if lw_proj_ids else {}
+    )
+    lw_assign_map: dict = (
+        {a.id: a for a in db.query(TaskAssignment).filter(TaskAssignment.id.in_(lw_assign_ids)).all()}
+        if lw_assign_ids else {}
+    )
+
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "records": [_build_fast(w, lw_user_map, lw_proj_map, lw_assign_map, db) for w in records],
+    }
 
 @router.get("/summary")
 def work_hours_summary(
@@ -198,10 +279,25 @@ def work_hours_summary(
         assignment_ids = {a.id for a in db.query(TaskAssignment).filter(TaskAssignment.milestone_num == milestone_num).all()}
         records = [w for w in records if w.assignment_id in assignment_ids]
 
+    # Perf: batch-fetch all referenced users (with team joined) and projects in
+    # 2 queries instead of 2-3 per record (eliminates N+1 — previously caused
+    # Work Hours Summary to fire hundreds of extra DB round-trips on the Global
+    # Dashboard when there are many work-hour rows in the date range).
+    wh_user_ids = {w.user_id for w in records if w.user_id}
+    wh_proj_ids = {w.project_id for w in records if w.project_id}
+    wh_user_map: dict = (
+        {u.id: u for u in db.query(User).options(joinedload(User.team)).filter(User.id.in_(wh_user_ids)).all()}
+        if wh_user_ids else {}
+    )
+    wh_proj_map: dict = (
+        {p.id: p for p in db.query(Project).filter(Project.id.in_(wh_proj_ids)).all()}
+        if wh_proj_ids else {}
+    )
+
     # By employee
     by_employee = {}
     for w in records:
-        u = db.query(User).filter_by(id=w.user_id).first()
+        u = wh_user_map.get(w.user_id)
         name = u.name if u else str(w.user_id)
         role = u.role if u else "—"
         if name not in by_employee:
@@ -215,7 +311,7 @@ def work_hours_summary(
     # By project
     by_project = {}
     for w in records:
-        p = db.query(Project).filter_by(id=w.project_id).first() if w.project_id else None
+        p = wh_proj_map.get(w.project_id) if w.project_id else None
         name = p.name if p else "📋 General Task"
         if name not in by_project:
             by_project[name] = {"name": name, "total_hours": 0, "actual_working_hours": 0, "records": 0}
@@ -223,7 +319,7 @@ def work_hours_summary(
         by_project[name]["actual_working_hours"] += _actual_hours(w)
         by_project[name]["records"] += 1
 
-    # By task
+    # By task — no DB queries needed (task_name is stored directly on WorkHours)
     by_task = {}
     for w in records:
         t = w.task_name or "Unknown"
@@ -232,10 +328,10 @@ def work_hours_summary(
         by_task[t]["total_hours"] += w.hours_spent or 0
         by_task[t]["actual_working_hours"] += _actual_hours(w)
 
-    # By team (Team Hub teams)
+    # By team (Team Hub teams) — reuse wh_user_map; team already joined above
     by_team = {}
     for w in records:
-        u = db.query(User).filter_by(id=w.user_id).first()
+        u = wh_user_map.get(w.user_id)
         tname = u.team.name if u and u.team else "Unassigned"
         if tname not in by_team:
             by_team[tname] = {"name": tname, "total_hours": 0, "actual_working_hours": 0, "buffer_hours": 0, "records": 0}

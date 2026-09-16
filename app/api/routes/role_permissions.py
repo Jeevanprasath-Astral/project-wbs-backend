@@ -89,11 +89,11 @@ DEFAULTS = [
     ("TC Lead",               "projects",            True,  True,  True,  False),
     ("TC Lead",               "working_hours",       True,  False, False, False),
 
-    ("BD",                    "proposals",           True,  True,  True,  False),
+    ("BD",                    "proposals",           True,  True,  True,  True),
     ("BD",                    "financial_settings",  False, False, False, False),
     ("BD",                    "global_assignments",  True,  True,  True,  False),
     ("BD",                    "milestones",          True,  True,  True,  False),
-    ("BD",                    "timesheet",           True,  True,  True,  False),
+    ("BD",                    "timesheet",           True,  True,  True,  True),
     ("BD",                    "reports",             True,  False, False, False),
     ("BD",                    "audit_log",           False, False, False, False),
     ("BD",                    "team_hub",            True,  False, False, False),
@@ -352,20 +352,33 @@ def reset_role_permissions(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Reset a role's permissions back to factory defaults (Admin only)."""
+    """Reset a role's permissions back to factory defaults (Admin only).
+    Updates existing rows AND inserts any missing module rows."""
     if current_user.role != "Admin":
         raise HTTPException(403, "Only Admin can reset role permissions")
     if role == "Admin":
         raise HTTPException(400, "Admin permissions cannot be reset")
 
     defaults_for_role = {
-        (r, m): (v, c, e, d) for r, m, v, c, e, d in DEFAULTS if r == role
+        m: (v, c, e, d) for r, m, v, c, e, d in DEFAULTS if r == role
     }
-    rows = db.query(RolePermission).filter(RolePermission.role == role).all()
-    for row in rows:
-        key = (role, row.module)
-        if key in defaults_for_role:
-            v, c, e, d = defaults_for_role[key]
+    if not defaults_for_role:
+        raise HTTPException(400, f"No default permissions defined for role '{role}'")
+
+    # Build a map of existing rows
+    existing = {row.module: row for row in db.query(RolePermission).filter(RolePermission.role == role).all()}
+
+    for module_key, (v, c, e, d) in defaults_for_role.items():
+        if module_key in existing:
+            # Update existing row
+            row = existing[module_key]
             row.can_view, row.can_create, row.can_edit, row.can_delete = v, c, e, d
+        else:
+            # Insert missing row
+            db.add(RolePermission(
+                role=role, module=module_key,
+                can_view=v, can_create=c, can_edit=e, can_delete=d,
+            ))
+
     db.commit()
     return {"message": f"Permissions for '{role}' reset to defaults."}

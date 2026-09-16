@@ -129,6 +129,12 @@ def _ser_proposal(p: ProposalEstimate) -> dict:
         "proposal_number":  p.proposal_number,
         "proposal_value":   p.proposal_value,
         "estimation_total_cost": sum(r.total_cost or 0 for r in p.estimation_rows) or None,
+        # Client contact details
+        "contact_name":        p.contact_name,
+        "contact_designation": p.contact_designation,
+        "contact_email":       p.contact_email,
+        "contact_phone":       p.contact_phone,
+        "contact_notes":       p.contact_notes,
     }
 
 
@@ -207,12 +213,18 @@ class ProposalCreate(BaseModel):
 
 
 class ProposalUpdate(BaseModel):
-    client_name:      Optional[str] = None
-    project_name:     Optional[str] = None
-    project_category: Optional[str] = None
-    bd_status:        Optional[str] = None
-    bd_status_date:   Optional[str] = None  # ISO date string "YYYY-MM-DD" or ""
-    proposal_value:   Optional[float] = None  # Manual BD-entered proposal value (₹)
+    client_name:         Optional[str]   = None
+    project_name:        Optional[str]   = None
+    project_category:    Optional[str]   = None
+    bd_status:           Optional[str]   = None
+    bd_status_date:      Optional[str]   = None  # ISO date string "YYYY-MM-DD" or ""
+    proposal_value:      Optional[float] = None  # Manual BD-entered proposal value (₹)
+    # Client contact details
+    contact_name:        Optional[str]   = None
+    contact_designation: Optional[str]   = None
+    contact_email:       Optional[str]   = None
+    contact_phone:       Optional[str]   = None
+    contact_notes:       Optional[str]   = None
 
 
 class SectionUpsert(BaseModel):
@@ -419,6 +431,12 @@ def update_proposal(
                 pass
     if payload.proposal_value is not None:
         p.proposal_value = payload.proposal_value
+    # Contact detail fields — store empty string as None so DB stays clean
+    if payload.contact_name        is not None: p.contact_name        = payload.contact_name        or None
+    if payload.contact_designation is not None: p.contact_designation = payload.contact_designation or None
+    if payload.contact_email       is not None: p.contact_email       = payload.contact_email       or None
+    if payload.contact_phone       is not None: p.contact_phone       = payload.contact_phone       or None
+    if payload.contact_notes       is not None: p.contact_notes       = payload.contact_notes       or None
     db.commit()
     db.refresh(p)
     return _ser_proposal(p)

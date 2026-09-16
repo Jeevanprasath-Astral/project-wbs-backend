@@ -5,9 +5,8 @@ from typing import List
 from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.models.models import (Project, ProjectMilestone, Notification, AuditLog,
-                                User, Subtask, Task, Milestone, SubtaskStatus,
-                                ProjectMember, Response, TaskAssignment,
-                                CustomTask, CustomSubtask, Activity)
+                                User, ProjectMember, TaskAssignment,
+                                CustomTask, Activity)
 from app.schemas.schemas import NotificationOut, AuditOut
 from app.core.deps import get_current_user
 
@@ -26,12 +25,11 @@ def get_dashboard(
             raise HTTPException(404, "Project not found")
 
         # Get only the milestones the user selected for this project
-        from app.models.models import CustomMilestone
-        selected_nums = {
-            cm.num for cm in db.query(CustomMilestone).filter_by(
-                project_id=project_id, is_active=True
-            ).all()
-        }
+        from app.models.models import CustomMilestone, CustomTask as _CT
+        active_cms = db.query(CustomMilestone).filter_by(
+            project_id=project_id, is_active=True
+        ).all()
+        selected_nums = {cm.num for cm in active_cms}
 
         all_pms = db.query(ProjectMilestone).filter_by(
             project_id=project_id
@@ -44,37 +42,62 @@ def get_dashboard(
         else:
             pms = []  # No milestones configured yet — show empty
 
+        # ── Live progress from CustomMilestone + CustomTask ───────────────────
+        # Build a map: milestone_num → live progress %
+        # This is the same formula used by Milestone Config and My Projects.
+        cm_by_num = {cm.num: cm for cm in active_cms}
+        cm_ids = [cm.id for cm in active_cms]
+        task_status_map: dict = {}
+        if cm_ids:
+            task_rows = (
+                db.query(_CT.milestone_id, _CT.status)
+                .filter(_CT.milestone_id.in_(cm_ids))
+                .all()
+            )
+            for row in task_rows:
+                task_status_map.setdefault(row.milestone_id, []).append(
+                    row.status or "Not Started"
+                )
+
+        def _ms_pct(ms_num: int) -> float:
+            cm = cm_by_num.get(ms_num)
+            if cm is None:
+                return 0.0
+            if cm.status == "Completed":
+                return 100.0
+            statuses = task_status_map.get(cm.id, [])
+            if not statuses:
+                return 0.0
+            done = sum(1 for s in statuses if s == "Completed")
+            return round((done / len(statuses)) * 100, 1)
+
         # ── Summary ───────────────────────────────────────────────────────────
         total     = len(pms)
         completed = sum(1 for m in pms if m.status == "Completed")
         in_prog   = sum(1 for m in pms if m.status == "In Progress")
         overdue   = sum(1 for m in pms if m.status == "Overdue")
-        progress  = round(sum(m.progress for m in pms) / total, 1) if total else 0.0
 
-        # ── Total subtask counts — scoped to THIS project's selected
-        # milestones only. Previously `total_subs` counted every Subtask row
-        # in the entire template with no project filter at all, so any
-        # project showed the same template-wide total (e.g. "108") no
-        # matter how many milestones it actually had selected — visibly
-        # wrong on a single-project dashboard and inconsistent with every
-        # other number on this page, which is scoped to `pms`/selected_nums.
-        if selected_nums:
-            total_subs = db.query(func.count(Subtask.id)).join(
-                Task, Subtask.task_id == Task.id
-            ).join(
-                Milestone, Task.milestone_id == Milestone.id
-            ).filter(Milestone.num.in_(selected_nums)).scalar() or 0
+        # Overall progress = average of per-milestone live %s (CustomMilestone based)
+        if total:
+            ms_pcts = [_ms_pct(pm.num) for pm in pms]
+            progress = round(sum(ms_pcts) / total, 1)
         else:
-            total_subs = 0
-        done_subs  = db.query(func.count(SubtaskStatus.id)).filter_by(
-            project_id=project_id, status="Completed"
-        ).scalar() or 0
+            progress = 0.0
+
+        # ── Total task counts — scoped to CustomTask for this project ─────────
+        # Use CustomTask counts (the actual active system) instead of Subtask
+        # template rows which have no project scope.
+        total_tasks = sum(len(task_status_map.get(cm.id, [])) for cm in active_cms)
+        done_tasks  = sum(
+            sum(1 for s in task_status_map.get(cm.id, []) if s == "Completed")
+            for cm in active_cms
+        )
 
         # ── Milestone list ────────────────────────────────────────────────────
         ms_list = [
             {
                 "num": pm.num, "name": pm.name,
-                "status": pm.status, "progress": pm.progress,
+                "status": pm.status, "progress": _ms_pct(pm.num),
                 "assignee": pm.assignee, "planned_end": pm.planned_end,
             }
             for pm in pms
@@ -86,21 +109,22 @@ def get_dashboard(
             project_id=project_id
         ).order_by(Notification.created_at.desc()).limit(20).all()
 
-        notif_user_cache = {}
-        notif_list = []
-        for n in notifs:
-            uname = None
-            if n.user_id:
-                if n.user_id not in notif_user_cache:
-                    u = db.query(User).filter_by(id=n.user_id).first()
-                    notif_user_cache[n.user_id] = u.name if u else None
-                uname = notif_user_cache[n.user_id]
-            notif_list.append({
+        # Bulk-fetch all notification user names in one query (eliminates N+1)
+        notif_user_ids = {n.user_id for n in notifs if n.user_id}
+        notif_user_map = {}
+        if notif_user_ids:
+            notif_users = db.query(User.id, User.name).filter(User.id.in_(notif_user_ids)).all()
+            notif_user_map = {u.id: u.name for u in notif_users}
+        notif_list = [
+            {
                 "id": n.id, "type": n.type, "message": n.message,
                 "email_to": n.email_to, "email_sent": n.email_sent,
                 "read": n.read, "created_at": n.created_at,
-                "user_id": n.user_id, "user_name": uname,
-            })
+                "user_id": n.user_id,
+                "user_name": notif_user_map.get(n.user_id) if n.user_id else None,
+            }
+            for n in notifs
+        ]
 
         # ── Overdue items ─────────────────────────────────────────────────────
         overdue_items = [
@@ -184,20 +208,6 @@ def get_dashboard(
                 "due_date": t.planned_end,
             })
 
-        cs_rows = db.query(CustomSubtask).filter(
-            CustomSubtask.project_id == project_id,
-            CustomSubtask.planned_end != None,
-            CustomSubtask.planned_end > now,
-            CustomSubtask.planned_end <= soon,
-            CustomSubtask.status != "Completed",
-        ).all()
-        for s in cs_rows:
-            deadline_list.append({
-                "id": f"sub-{s.id}", "name": f"📝 {s.name}",
-                "assignee": s.assignee or "Unassigned",
-                "due_date": s.planned_end,
-            })
-
         act_rows = db.query(Activity).filter(
             Activity.project_id == project_id,
             Activity.planned_end != None,
@@ -256,8 +266,8 @@ def get_dashboard(
                 "overdue":     overdue,
                 "not_started": total - completed - in_prog - overdue,
                 "progress":    progress,
-                "done_tasks":  done_subs,
-                "total_tasks": total_subs,
+                "done_tasks":  done_tasks,
+                "total_tasks": total_tasks,
             },
             "milestones":    ms_list,
             "notifications": notif_list,
@@ -289,22 +299,22 @@ def list_notifications(
 
     # Requirement 7(b): resolve the assigned person's name so the frontend can
     # group notifications per user and show a count instead of full message
-    # text by default.
-    user_cache = {}
-    out = []
-    for n in rows:
-        uname = None
-        if n.user_id:
-            if n.user_id not in user_cache:
-                u = db.query(User).filter_by(id=n.user_id).first()
-                user_cache[n.user_id] = u.name if u else None
-            uname = user_cache[n.user_id]
-        out.append({
+    # text by default. Bulk-fetch all user names in one query (eliminates N+1).
+    user_ids = {n.user_id for n in rows if n.user_id}
+    user_map = {}
+    if user_ids:
+        users = db.query(User.id, User.name).filter(User.id.in_(user_ids)).all()
+        user_map = {u.id: u.name for u in users}
+    out = [
+        {
             "id": n.id, "type": n.type, "message": n.message,
             "email_to": n.email_to, "email_sent": n.email_sent,
             "read": n.read, "created_at": n.created_at,
-            "user_id": n.user_id, "user_name": uname,
-        })
+            "user_id": n.user_id,
+            "user_name": user_map.get(n.user_id) if n.user_id else None,
+        }
+        for n in rows
+    ]
     return out
 
 
