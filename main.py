@@ -14,7 +14,7 @@ from app.api.routes import (auth, projects, milestones, responses,
                              billing_statement_report, hours_tracker,
                              report_templates, attachments, billing_reports,
                              da_project_reports, proposal_estimates,
-                             role_permissions)
+                             role_permissions, chat)
 from fastapi.staticfiles import StaticFiles
 from app.services.scheduler import start_scheduler, stop_scheduler
 
@@ -897,7 +897,7 @@ for router in [auth, projects, milestones, responses, dashboard,
                billing_statement_report, hours_tracker,
                report_templates, attachments, billing_reports,
                da_project_reports, proposal_estimates,
-               role_permissions]:
+               role_permissions, chat]:
     app.include_router(router.router, prefix="/api")
 
 # Extra routers from global_team module (custom roles + assignment categories)
