@@ -69,9 +69,11 @@ def _get_gemini_client():
         raise HTTPException(status_code=503, detail="google-generativeai package not installed")
 
 
-# ── Tool definitions (sent to Gemini as function declarations) ─────────────────
+# ── Tool definitions — built at request time using proper genai.protos ─────────
+# Raw dicts are NOT accepted by the Gemini SDK for function_declarations.
+# We build genai.protos.Tool objects from this spec inside _build_gemini_tool().
 
-TOOL_DECLARATIONS = [
+_TOOL_SPEC = [
     {
         "name": "list_my_projects",
         "description": (
@@ -80,39 +82,20 @@ TOOL_DECLARATIONS = [
             "Use this when the user asks about 'my projects', 'what projects am I on', "
             "or wants to explore their project list."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "status_filter": {
-                    "type": "string",
-                    "description": "Optional filter: 'Active', 'Completed', 'On Hold'. Leave empty for all.",
-                    "enum": ["Active", "Completed", "On Hold", ""],
-                }
-            },
-            "required": [],
+        "properties": {
+            "status_filter": ("string", "Optional filter: Active, Completed, or On Hold. Leave empty for all."),
         },
     },
     {
         "name": "get_project_details",
         "description": (
             "Get milestone and task progress details for a specific project. "
-            "Returns milestones with status, planned/actual dates, iteration, "
-            "and the tasks under each milestone. "
-            "Use when the user asks about a specific project's progress, milestones, or timeline."
+            "Returns milestones with status, planned/actual dates, and tasks. "
+            "Use when the user asks about a project's progress, milestones, or timeline."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "project_id": {
-                    "type": "integer",
-                    "description": "The numeric ID of the project to look up.",
-                },
-                "project_name": {
-                    "type": "string",
-                    "description": "Project name to search by if ID is unknown. Partial match supported.",
-                },
-            },
-            "required": [],
+        "properties": {
+            "project_id":   ("integer", "The numeric ID of the project to look up."),
+            "project_name": ("string",  "Project name to search by if ID is unknown. Partial match supported."),
         },
     },
     {
@@ -120,97 +103,86 @@ TOOL_DECLARATIONS = [
         "description": (
             "Get work hours logged by the current user for a date range. "
             "Returns total hours, breakdown by project, and daily log entries. "
-            "Use when the user asks 'how many hours have I logged', 'my timesheet', "
-            "'what did I work on this week', etc."
+            "Use when the user asks about their timesheet, hours logged, or what they worked on."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date_from": {
-                    "type": "string",
-                    "description": "Start date in YYYY-MM-DD format. Defaults to start of current week.",
-                },
-                "date_to": {
-                    "type": "string",
-                    "description": "End date in YYYY-MM-DD format. Defaults to today.",
-                },
-            },
-            "required": [],
+        "properties": {
+            "date_from": ("string", "Start date in YYYY-MM-DD format. Defaults to start of current week."),
+            "date_to":   ("string", "End date in YYYY-MM-DD format. Defaults to today."),
         },
     },
     {
         "name": "get_team_workload",
         "description": (
             "Get work hours logged by ALL team members for a date range. "
-            "Returns per-person totals so you can see who is busy, idle, or overloaded. "
-            "Use for questions about team utilization, who has capacity, workload distribution."
+            "Returns per-person totals so you can see who is busy or has capacity. "
+            "Use for questions about team utilization and workload distribution."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date_from": {
-                    "type": "string",
-                    "description": "Start date in YYYY-MM-DD format. Defaults to start of current week.",
-                },
-                "date_to": {
-                    "type": "string",
-                    "description": "End date in YYYY-MM-DD format. Defaults to today.",
-                },
-                "project_id": {
-                    "type": "integer",
-                    "description": "Optional: filter to a specific project. Leave out for all projects.",
-                },
-            },
-            "required": [],
+        "properties": {
+            "date_from":  ("string",  "Start date in YYYY-MM-DD format. Defaults to start of current week."),
+            "date_to":    ("string",  "End date in YYYY-MM-DD format. Defaults to today."),
+            "project_id": ("integer", "Optional: filter to a specific project ID."),
         },
     },
     {
         "name": "list_my_assignments",
         "description": (
             "List tasks currently assigned to the current user across all projects. "
-            "Returns task name, project, milestone, status, planned dates, and category. "
-            "Use for 'what tasks do I have', 'what am I assigned to', 'my workload', "
-            "'what's due soon', etc."
+            "Returns task name, project, status, and planned dates. "
+            "Use for questions like: what tasks do I have, what am I assigned to, what is due soon."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "status_filter": {
-                    "type": "string",
-                    "description": "Optional filter by task status: 'Not Started', 'In Progress', 'Completed'.",
-                },
-                "project_id": {
-                    "type": "integer",
-                    "description": "Optional: filter to a specific project.",
-                },
-            },
-            "required": [],
+        "properties": {
+            "status_filter": ("string",  "Optional filter by task status: Not Started, In Progress, or Completed."),
+            "project_id":    ("integer", "Optional: filter to a specific project ID."),
         },
     },
     {
         "name": "get_dashboard_summary",
         "description": (
-            "Get a high-level KPI summary for a project: overall progress %, "
-            "total planned vs actual hours, count of overdue milestones, "
-            "and number of open tasks. "
+            "Get a high-level KPI summary for a project: overall progress percentage, "
+            "planned vs actual hours, overdue milestones, and open task count. "
             "Use when the user asks for a project summary, overview, or health check."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "project_id": {
-                    "type": "integer",
-                    "description": "The numeric ID of the project.",
-                },
-                "project_name": {
-                    "type": "string",
-                    "description": "Project name to search by if ID is unknown.",
-                },
-            },
-            "required": [],
+        "properties": {
+            "project_id":   ("integer", "The numeric ID of the project."),
+            "project_name": ("string",  "Project name to search by if ID is unknown."),
         },
     },
 ]
+
+
+def _build_gemini_tool(genai):
+    """
+    Convert _TOOL_SPEC into a genai.protos.Tool object.
+    Must be called after genai.configure() so protos are accessible.
+    """
+    _type_map = {
+        "string":  genai.protos.Type.STRING,
+        "integer": genai.protos.Type.INTEGER,
+        "boolean": genai.protos.Type.BOOLEAN,
+        "number":  genai.protos.Type.NUMBER,
+    }
+
+    declarations = []
+    for spec in _TOOL_SPEC:
+        properties = {}
+        for prop_name, (prop_type, prop_desc) in spec["properties"].items():
+            properties[prop_name] = genai.protos.Schema(
+                type_=_type_map.get(prop_type, genai.protos.Type.STRING),
+                description=prop_desc,
+            )
+
+        declarations.append(
+            genai.protos.FunctionDeclaration(
+                name=spec["name"],
+                description=spec["description"],
+                parameters=genai.protos.Schema(
+                    type_=genai.protos.Type.OBJECT,
+                    properties=properties,
+                ),
+            )
+        )
+
+    return genai.protos.Tool(function_declarations=declarations)
 
 
 # ── Tool executor ──────────────────────────────────────────────────────────────
@@ -541,8 +513,8 @@ async def chat(
 ):
     genai = _get_gemini_client()
 
-    # Build tool config for Gemini
-    tools = [{"function_declarations": TOOL_DECLARATIONS}]
+    # Build proper genai.protos.Tool (raw dicts are NOT accepted by the SDK)
+    gemini_tool = _build_gemini_tool(genai)
 
     # Convert conversation history to Gemini format
     history = [
@@ -553,7 +525,7 @@ async def chat(
     # Start chat session with history
     model = genai.GenerativeModel(
         model_name="gemini-1.5-flash",
-        tools=tools,
+        tools=[gemini_tool],
         system_instruction=_build_system_prompt(current_user),
     )
 
