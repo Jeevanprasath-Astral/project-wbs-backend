@@ -28,7 +28,12 @@ class Settings(BaseSettings):
     CLOUDINARY_API_KEY: str = ""
     CLOUDINARY_API_SECRET: str = ""
 
+    # Groq AI — AXON Chatbot (free: 1,000 req/day, no credit card needed)
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+
     class Config:
         env_file = ".env"
+        extra = "ignore"   # silently ignore unknown env vars (e.g. GEMINI_API_KEY, DA_PASSWORD)
 
 settings = Settings()

@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.deps import get_current_user
 from app.db.database import get_db
 from app.models.models import (
@@ -62,7 +63,7 @@ class ChatResponse(BaseModel):
 # ── Groq client (lazy init) ───────────────────────────────────────────────────
 
 def _get_groq_client():
-    api_key = os.environ.get("GROQ_API_KEY", "")
+    api_key = settings.GROQ_API_KEY
     if not api_key:
         raise HTTPException(
             status_code=503,
@@ -557,7 +558,7 @@ async def chat(
         )
 
     # ── Step 2: Build message history in OpenAI format ─────────────────────────
-    model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model_name = settings.GROQ_MODEL or "llama-3.3-70b-versatile"
 
     messages = [{"role": "system", "content": _build_system_prompt(current_user)}]
 

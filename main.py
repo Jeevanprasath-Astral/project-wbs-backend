@@ -864,7 +864,7 @@ app = FastAPI(title=settings.APP_NAME, description="Project WBS API", version="2
 # GZip all responses >= 1 KB — cuts JSON payload by ~60-80% on slow networks
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ── Demo write-guard middleware ────────────────────────────────────────────────
