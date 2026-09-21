@@ -1,7 +1,20 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
+from pathlib import Path
+
+# Resolve .env path relative to this file so it works regardless of CWD.
+# config.py is at:  backend/app/core/config.py
+# .env is at:       backend/.env  (3 parent levels up)
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 class Settings(BaseSettings):
+    # pydantic-settings v2 style — env_file loaded via model_config
+    model_config = SettingsConfigDict(
+        env_file=str(_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",   # silently ignore unknown env vars (e.g. GEMINI_API_KEY)
+    )
+
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/project_wbs"
     SECRET_KEY: str = "change-me-in-production"
     ALGORITHM: str = "HS256"
@@ -30,10 +43,6 @@ class Settings(BaseSettings):
 
     # Groq AI — AXON Chatbot (free: 1,000 req/day, no credit card needed)
     GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"   # silently ignore unknown env vars (e.g. GEMINI_API_KEY, DA_PASSWORD)
+    GROQ_MODEL: str = "openai/gpt-oss-20b"
 
 settings = Settings()

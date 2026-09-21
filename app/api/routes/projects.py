@@ -12,10 +12,11 @@ from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager, can_create_project
 from app.services.audit_service import log_action
 from app.core.security import hash_password
-from app.services.email_service import send_email, send_welcome_email
+from app.services.email_service import send_email, send_welcome_email, send_mailbox_link_email
 import os
 from pydantic import BaseModel
 from typing import Optional
+from datetime import datetime, timedelta, timezone
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
@@ -30,6 +31,12 @@ class NewUserRequest(BaseModel):
     email: str
     role: str
     password: str = "wbs123"
+
+class StatusReportRequest(BaseModel):
+    to_emails: str          # comma-separated email addresses
+    note: Optional[str] = ""
+    completed_this_week: Optional[str] = ""
+    plan_next_week: Optional[str] = ""
 
 def _init_project_milestones(db: Session, project: Project):
     milestones = db.query(Milestone).order_by(Milestone.num).all()
@@ -393,6 +400,356 @@ def add_new_member(project_id: int, payload: AddMemberRequest, db: Session = Dep
         app_url=app_url,
     )
     return {"status": "ok", "message": f"{user.name} created and added to project"}
+
+@router.get("/{project_id}/weekly-summary")
+def get_weekly_summary(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Auto-detect completed-this-week and upcoming milestones for the status-report modal pre-fill."""
+    now = datetime.now(timezone.utc)
+    week_ago = now - timedelta(days=7)
+    two_weeks_ahead = now + timedelta(days=14)
+
+    milestones = (
+        db.query(CustomMilestone)
+        .filter(CustomMilestone.project_id == project_id, CustomMilestone.is_active == True)
+        .order_by(CustomMilestone.num)
+        .all()
+    )
+
+    completed_lines = []
+    upcoming_lines = []
+
+    for ms in milestones:
+        # ── Completed this week ────────────────────────────────────────────────
+        if ms.status == "Completed" and ms.actual_end:
+            ae = ms.actual_end
+            if ae.tzinfo is None:
+                ae = ae.replace(tzinfo=timezone.utc)
+            if ae >= week_ago:
+                completed_lines.append(f"• M{ms.num:02d} {ms.name} — completed")
+
+        # ── Upcoming / in-progress ─────────────────────────────────────────────
+        if ms.status != "Completed":
+            if ms.status == "In Progress":
+                line = f"• M{ms.num:02d} {ms.name} (in progress"
+                if ms.planned_end:
+                    pe = ms.planned_end
+                    if pe.tzinfo is None:
+                        pe = pe.replace(tzinfo=timezone.utc)
+                    line += f", due {pe.strftime('%d %b %Y')}"
+                line += ")"
+                upcoming_lines.append(line)
+            elif ms.planned_end:
+                pe = ms.planned_end
+                if pe.tzinfo is None:
+                    pe = pe.replace(tzinfo=timezone.utc)
+                if pe <= two_weeks_ahead:
+                    upcoming_lines.append(
+                        f"• M{ms.num:02d} {ms.name} — due {pe.strftime('%d %b %Y')}"
+                    )
+
+    return {
+        "completed_this_week": "\n".join(completed_lines),
+        "plan_next_week": "\n".join(upcoming_lines),
+    }
+
+
+def _build_status_report_html(
+    project: "Project",
+    milestones: list,
+    task_map: dict,
+    sender_name: str,
+    note: str,
+    completed_this_week: str,
+    plan_next_week: str,
+    project_pct: float,
+    report_date: str,
+) -> str:
+    """Build the full HTML for the project status report email."""
+
+    def _ms_pct(ms) -> float:
+        if ms.status == "Completed":
+            return 100.0
+        statuses = task_map.get(ms.id, [])
+        if not statuses:
+            return 0.0
+        done = sum(1 for s in statuses if s == "Completed")
+        return round((done / len(statuses)) * 100, 1)
+
+    STATUS_STYLE = {
+        "Completed":   ("✅", "#166534", "#dcfce7"),
+        "In Progress": ("⚡", "#d97706", "#fef3c7"),
+        "Not Started": ("⏸",  "#64748b", "#f1f5f9"),
+        "On Hold":     ("⏳", "#c2410c", "#fff7ed"),
+    }
+
+    def _status_badge(status: str) -> str:
+        icon, color, bg = STATUS_STYLE.get(status, ("⏸", "#64748b", "#f1f5f9"))
+        return (
+            f'<span style="background:{bg};color:{color};padding:2px 10px;'
+            f'border-radius:99px;font-size:11px;font-weight:700;">'
+            f'{icon} {status}</span>'
+        )
+
+    def _fmt_date(dt) -> str:
+        if not dt:
+            return "—"
+        try:
+            return dt.strftime("%d %b %Y")
+        except Exception:
+            return str(dt)[:10]
+
+    def _bullet_rows(text: str) -> str:
+        if not text or not text.strip():
+            return '<span style="color:#94a3b8;font-size:11px;">—</span>'
+        lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+        return "<br>".join(
+            f'<span style="color:#374151;font-size:11px;line-height:1.7;">{l}</span>'
+            for l in lines
+        )
+
+    # Project summary table rows
+    proj_start = _fmt_date(project.start_date) if hasattr(project, 'start_date') and project.start_date else "—"
+    proj_end   = _fmt_date(project.end_date)   if hasattr(project, 'end_date')   and project.end_date   else "—"
+    proj_client = getattr(project, 'client', '—') or '—'
+
+    # Note section (only if provided)
+    note_html = ""
+    if note and note.strip():
+        note_html = f"""
+        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;
+                    padding:10px 14px;margin-bottom:16px;font-size:13px;color:#92400e;">
+          <strong>Note from {sender_name}:</strong> {note.strip()}
+        </div>"""
+
+    # Weekly update cards (only if content provided)
+    weekly_html = ""
+    has_completed = bool(completed_this_week and completed_this_week.strip())
+    has_plan = bool(plan_next_week and plan_next_week.strip())
+    if has_completed or has_plan:
+        completed_col = f"""
+        <td style="width:50%;vertical-align:top;padding-right:5px;">
+          <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;
+                      padding:10px 12px;height:100%;box-sizing:border-box;">
+            <div style="font-size:12px;font-weight:700;color:#166534;margin-bottom:6px;">
+              ✅ Completed This Week
+            </div>
+            {_bullet_rows(completed_this_week)}
+          </div>
+        </td>""" if has_completed else ""
+
+        plan_col = f"""
+        <td style="width:50%;vertical-align:top;padding-left:5px;">
+          <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;
+                      padding:10px 12px;height:100%;box-sizing:border-box;">
+            <div style="font-size:12px;font-weight:700;color:#1d4ed8;margin-bottom:6px;">
+              📅 Plan for Next Week
+            </div>
+            {_bullet_rows(plan_next_week)}
+          </div>
+        </td>""" if has_plan else ""
+
+        weekly_html = f"""
+        <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+          <tr>{completed_col}{plan_col}</tr>
+        </table>"""
+
+    # Milestone rows
+    ms_rows = ""
+    for ms in milestones:
+        pct = _ms_pct(ms)
+        ms_rows += f"""
+        <tr>
+          <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;white-space:nowrap;">
+            M{ms.num:02d}
+          </td>
+          <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#334155;font-size:11px;">
+            {ms.name or "—"}
+          </td>
+          <td style="padding:4px 8px;border:1px solid #e2e8f0;font-size:11px;">
+            {_status_badge(ms.status or "Not Started")}
+          </td>
+          <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;white-space:nowrap;">
+            {_fmt_date(ms.planned_end)}
+          </td>
+          <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;white-space:nowrap;">
+            {_fmt_date(ms.actual_end)}
+          </td>
+          <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;text-align:center;">
+            {pct:.0f}%
+          </td>
+        </tr>"""
+
+    return f"""
+<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;">
+
+  <!-- Header -->
+  <div style="background:#091525;padding:22px 28px;text-align:center;
+              border-radius:12px 12px 0 0;">
+    <h1 style="color:#fff;font-size:22px;margin:0;letter-spacing:.04em;">AXON WBS</h1>
+    <p style="color:#4a6080;font-size:11px;margin:5px 0 0;letter-spacing:.08em;">
+      PROJECT STATUS REPORT
+    </p>
+  </div>
+
+  <!-- Body -->
+  <div style="padding:22px 28px;background:#f8fafc;border:1px solid #e2e8f0;
+              border-top:0;border-radius:0 0 12px 12px;">
+
+    {note_html}
+
+    <!-- Project summary -->
+    <table style="width:100%;border-collapse:collapse;margin-bottom:16px;font-size:12px;">
+      <tr>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;
+                   background:#f1f5f9;width:32%;color:#334155;">Project</td>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;color:#475569;">
+          {project.name}
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;
+                   background:#f1f5f9;color:#334155;">Client</td>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;color:#475569;">
+          {proj_client}
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;
+                   background:#f1f5f9;color:#334155;">Overall Status</td>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;">
+          {_status_badge(project.status or "Not Started")}
+          &nbsp;<span style="color:#475569;font-size:12px;">{project_pct:.0f}% complete</span>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;
+                   background:#f1f5f9;color:#334155;">Timeline</td>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;color:#475569;">
+          {proj_start} → {proj_end}
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;font-weight:bold;
+                   background:#f1f5f9;color:#334155;">Report Date</td>
+        <td style="padding:5px 8px;border:1px solid #e2e8f0;color:#475569;">
+          {report_date}
+        </td>
+      </tr>
+    </table>
+
+    {weekly_html}
+
+    <!-- Milestone overview -->
+    <h3 style="font-size:13px;color:#334155;margin:14px 0 6px;font-weight:700;">
+      Milestone Overview
+    </h3>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <tr style="background:#f1f5f9;">
+        <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;
+                   color:#475569;font-size:11px;">#</th>
+        <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;
+                   color:#475569;font-size:11px;">Milestone</th>
+        <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;
+                   color:#475569;font-size:11px;">Status</th>
+        <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;
+                   color:#475569;font-size:11px;">Planned End</th>
+        <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:left;
+                   color:#475569;font-size:11px;">Actual End</th>
+        <th style="padding:5px 8px;border:1px solid #e2e8f0;text-align:center;
+                   color:#475569;font-size:11px;">Done</th>
+      </tr>
+      {ms_rows}
+    </table>
+
+    <p style="font-size:11px;color:#94a3b8;margin-top:20px;text-align:center;">
+      Axon WBS &nbsp;·&nbsp; by Connectome
+    </p>
+  </div>
+</div>"""
+
+
+@router.post("/{project_id}/send-status-report")
+def send_status_report(
+    project_id: int,
+    payload: StatusReportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Build and send a project status report email to the client.
+    Pure HTML email — no attachment — works on Brevo Free plan."""
+
+    # ── Fetch project ──────────────────────────────────────────────────────────
+    project = db.query(Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # ── Compute live progress ─────────────────────────────────────────────────
+    active_cms = (
+        db.query(CustomMilestone)
+        .filter(CustomMilestone.project_id == project_id, CustomMilestone.is_active == True)
+        .order_by(CustomMilestone.num)
+        .all()
+    )
+    cm_ids = [ms.id for ms in active_cms]
+    task_map: dict = {}
+    if cm_ids:
+        task_rows = (
+            db.query(CustomTask.milestone_id, CustomTask.status)
+            .filter(CustomTask.milestone_id.in_(cm_ids))
+            .all()
+        )
+        for row in task_rows:
+            task_map.setdefault(row.milestone_id, []).append(row.status or "Not Started")
+
+    def _ms_pct(ms) -> float:
+        if ms.status == "Completed":
+            return 100.0
+        statuses = task_map.get(ms.id, [])
+        if not statuses:
+            return 0.0
+        done = sum(1 for s in statuses if s == "Completed")
+        return round((done / len(statuses)) * 100, 1)
+
+    pcts = [_ms_pct(ms) for ms in active_cms]
+    project_pct = round(sum(pcts) / len(pcts), 1) if pcts else 0.0
+
+    # ── Parse recipient list ──────────────────────────────────────────────────
+    to_list = [e.strip() for e in payload.to_emails.split(",") if e.strip()]
+    if not to_list:
+        raise HTTPException(400, "No valid recipient email addresses provided")
+
+    # ── Build email ───────────────────────────────────────────────────────────
+    report_date = datetime.now(timezone.utc).strftime("%d %b %Y")
+    body = _build_status_report_html(
+        project=project,
+        milestones=active_cms,
+        task_map=task_map,
+        sender_name=current_user.name,
+        note=payload.note or "",
+        completed_this_week=payload.completed_this_week or "",
+        plan_next_week=payload.plan_next_week or "",
+        project_pct=project_pct,
+        report_date=report_date,
+    )
+
+    subject = f"Project Status Report — {project.name} ({report_date})"
+    sent = send_mailbox_link_email(to_list=to_list, subject=subject, body=body)
+    if not sent:
+        raise HTTPException(500, "Failed to send email. Check server logs.")
+
+    log_action(
+        db, actor=current_user.name, action="send_status_report",
+        description=f"Status report sent for '{project.name}' to {payload.to_emails}",
+        project_id=project_id, entity_type="project",
+        entity_id=project_id, user_id=current_user.id,
+    )
+    db.commit()
+    return {"status": "ok", "message": f"Status report sent to {len(to_list)} recipient(s)"}
+
 
 @router.delete("/{project_id}")
 def delete_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

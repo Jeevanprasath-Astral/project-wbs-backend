@@ -14,11 +14,12 @@ from sqlalchemy.exc import IntegrityError
 from app.core.deps import get_current_user
 from app.services.audit_service import log_action
 from app.services.notification_service import create_notification
-from app.services.email_service import send_mailbox_email
+from app.services.email_service import send_mailbox_email, send_mailbox_link_email
 import io as _io
 import base64 as _b64
 import openpyxl as _xl
 from openpyxl.styles import Font as _Font, PatternFill as _Fill, Alignment as _Align
+from app.utils.cloudinary_helper import upload_file as _cl_upload, build_download_url as _cl_download_url
 
 router = APIRouter(prefix="/projects/{project_id}/custom-milestones", tags=["Custom Milestones"])
 
@@ -2252,10 +2253,18 @@ def send_milestone_mailbox(
     project = db.query(Project).filter_by(id=project_id).first()
     project_name = project.name if project else "—"
     try:
-        excel_b64 = _b64.b64encode(_generate_milestone_excel(db, ms)).decode("utf-8")
+        excel_bytes = _generate_milestone_excel(db, ms)
     except Exception as _xl_err:
         raise HTTPException(500, f"Failed to generate Excel report: {_xl_err}")
     file_name = f"Milestone_M{ms.num:02d}_{(ms.name or 'details').replace(' ','_')}.xlsx"
+    # Upload Excel to Cloudinary (free plan — raw resource type, ~20-80 KB per file)
+    # Public-ID uses milestone_id so the same slot is reused on each send.
+    _public_id = f"milestone-reports/M{ms.num:02d}_{ms.id}"
+    try:
+        _cl_result = _cl_upload(excel_bytes, _public_id)
+        download_url = _cl_download_url(_cl_result["public_id"], filename=file_name)
+    except Exception as _cl_err:
+        raise HTTPException(500, f"Failed to upload report to storage: {_cl_err}")
     note_html = f"<p><strong>Note from {current_user.name}:</strong> {payload.note}</p><hr/>" if payload.note else ""
     tasks = db.query(CustomTask).filter_by(milestone_id=ms.id).order_by(CustomTask.num).all()
     task_rows = "".join(
@@ -2294,17 +2303,23 @@ def send_milestone_mailbox(
           </tr>
           {task_rows}
         </table>
-        <p style="font-size:11px;color:#94a3b8;margin-top:16px;">Excel report attached · Axon WBS</p>
+        <div style="text-align:center;margin:20px 0 8px;">
+          <a href="{download_url}"
+             style="display:inline-block;background:linear-gradient(135deg,#1d6ec6,#0d3e7a);
+                    color:#fff;font-size:14px;font-weight:700;padding:12px 28px;
+                    border-radius:10px;text-decoration:none;letter-spacing:0.01em;">
+            &#8203;⬇ Download Excel Report
+          </a>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:8px;text-align:center;">Axon WBS</p>
       </div>
     </div>
     """
     subject = f"Milestone M{ms.num:02d} — {ms.name or ''} | {project_name}"
-    ok = send_mailbox_email(
+    ok = send_mailbox_link_email(
         to_list=clean_to,
         subject=subject,
         body=body,
-        attachment_b64=excel_b64,
-        attachment_name=file_name,
     )
     if not ok:
         raise HTTPException(500, "Email send failed — verify BREVO_API_KEY is set in Render env vars "

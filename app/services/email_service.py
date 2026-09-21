@@ -299,3 +299,52 @@ def send_mailbox_email(
         return False
 
 
+def send_mailbox_link_email(
+    to_list: list,
+    subject: str,
+    body: str,
+) -> bool:
+    """Send milestone email to multiple recipients with NO attachment.
+
+    The Excel report is uploaded to Cloudinary first and a download link
+    is embedded in `body` by the caller. This works on Brevo Free plan
+    (Brevo blocks attachments on Free; link-based emails are fine).
+    """
+    if not settings.MAIL_ENABLED:
+        logger.info(f"[EMAIL DISABLED] Mailbox link email to: {to_list}")
+        return False
+    if not settings.BREVO_API_KEY:
+        logger.error("BREVO_API_KEY is not set — mailbox link email not sent")
+        return False
+    clean_recipients = [e.strip() for e in to_list if e and e.strip()]
+    if not clean_recipients:
+        logger.error("send_mailbox_link_email: no valid recipients after stripping — email not sent")
+        return False
+    try:
+        payload = _json.dumps({
+            "sender": {"name": "Axon WBS", "email": settings.MAIL_FROM},
+            "to": [{"email": e} for e in clean_recipients],
+            "subject": subject,
+            "htmlContent": body,
+        }).encode("utf-8")
+        req = _urllib.Request(
+            "https://api.brevo.com/v3/smtp/email",
+            data=payload,
+            headers={
+                "api-key": settings.BREVO_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+        )
+        with _urllib.urlopen(req, timeout=30) as resp:
+            logger.info(f"Mailbox link email sent to {to_list} (HTTP {resp.status})")
+        return True
+    except _urllib_error.HTTPError as http_err:
+        err_body = http_err.read().decode("utf-8", errors="replace")
+        logger.error(f"Mailbox link email failed: HTTP {http_err.code} — {err_body}")
+        return False
+    except Exception as e:
+        logger.error(f"Mailbox link email failed: {e}")
+        return False
+
+

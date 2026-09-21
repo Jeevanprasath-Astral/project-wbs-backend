@@ -861,10 +861,22 @@ _ensure_demo_user()
 
 app = FastAPI(title=settings.APP_NAME, description="Project WBS API", version="2.0.0")
 
+
+# ── Temporary debug route — remove after confirming chatbot works ──────────────
+@app.get("/api/debug/groq")
+def debug_groq():
+    key = settings.GROQ_API_KEY
+    return {
+        "groq_configured": bool(key),
+        "key_starts_with": key[:8] + "..." if key else "(empty)",
+        "model": settings.GROQ_MODEL,
+    }
+
+
 # GZip all responses >= 1 KB — cuts JSON payload by ~60-80% on slow networks
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
+    allow_origins=[settings.FRONTEND_URL, "http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:3000"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ── Demo write-guard middleware ────────────────────────────────────────────────
@@ -1200,6 +1212,13 @@ def _migrate_form_fields(db):
 
 @app.on_event("startup")
 def startup():
+    # ── Confirm GROQ_API_KEY loaded (shows in server log — key is masked) ──────
+    groq_key = settings.GROQ_API_KEY
+    if groq_key:
+        logging.info(f"✅ GROQ_API_KEY loaded — starts with: {groq_key[:8]}...")
+    else:
+        logging.warning("⚠️  GROQ_API_KEY is EMPTY — chatbot will return 503. "
+                        "Set GROQ_API_KEY env var and restart the server.")
     start_scheduler()
     # Seed role permissions defaults (idempotent — only inserts missing rows)
     try:
