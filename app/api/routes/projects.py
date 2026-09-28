@@ -482,6 +482,7 @@ def _build_status_report_html(
     this_week_due: list = None,
     prev_week_overdue: list = None,
     issues: list = None,
+    frontend_url: str = "",
 ) -> str:
     """Build the full HTML for the project status report email."""
 
@@ -683,11 +684,11 @@ def _build_status_report_html(
         PROJECT STATUS REPORT
       </p>
     </div>
-    <div style="display:table-cell;vertical-align:middle;text-align:right;width:130px;">
-      <div style="display:inline-block;border:1px solid #2a3f5f;border-radius:8px;
-                  padding:6px 10px;text-align:center;">
-        <div style="color:#7c9cbf;font-size:7px;letter-spacing:.12em;margin-bottom:2px;">POWERED BY</div>
-        <div style="color:#fff;font-size:11px;font-weight:700;letter-spacing:.06em;">CONNECTOME</div>
+    <div style="display:table-cell;vertical-align:middle;text-align:right;width:140px;">
+      <div style="display:inline-block;text-align:center;">
+        <div style="color:#7c9cbf;font-size:7px;letter-spacing:.12em;margin-bottom:4px;">POWERED BY</div>
+        <img src="{frontend_url}/connectome-logo.png" alt="Connectome"
+             width="110" style="display:block;border:0;outline:0;max-width:110px;" />
       </div>
     </div>
   </div>
@@ -980,6 +981,7 @@ def send_status_report(
         this_week_due=this_week_due,
         prev_week_overdue=prev_week_overdue,
         issues=issues_list,
+        frontend_url=os.environ.get("FRONTEND_URL", "").rstrip("/"),
     )
 
     subject = f"Project Status Report — {project.name} ({report_date})"
