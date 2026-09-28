@@ -6,7 +6,7 @@ from app.models.models import (Project, ProjectMilestone, Milestone, User, Proje
                                CustomMilestone, CustomTask, CustomSubtask, SubtaskQuestion, SubtaskReport,
                                Activity, TaskFormField, MilestoneReport, ProjectReport, WorkHours,
                                SubtaskStatus, Response, Notification, AuditLog, ProjectCost,
-                               TaskAssignment, FinancialAuditLog)
+                               TaskAssignment, FinancialAuditLog, ProjectIssue)
 from app.schemas.schemas import ProjectCreate, ProjectOut, ProjectUpdate
 from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager, can_create_project
@@ -16,7 +16,7 @@ from app.services.email_service import send_email, send_welcome_email, send_mail
 import os
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date as date_cls
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
@@ -37,6 +37,18 @@ class StatusReportRequest(BaseModel):
     note: Optional[str] = ""
     completed_this_week: Optional[str] = ""
     plan_next_week: Optional[str] = ""
+
+class IssueCreate(BaseModel):
+    issue_name: str
+    issue_date: str          # YYYY-MM-DD string
+    description: Optional[str] = ""
+    responsible_person: Optional[str] = ""
+
+class IssueUpdate(BaseModel):
+    issue_name: Optional[str] = None
+    issue_date: Optional[str] = None
+    description: Optional[str] = None
+    responsible_person: Optional[str] = None
 
 def _init_project_milestones(db: Session, project: Project):
     milestones = db.query(Milestone).order_by(Milestone.num).all()
@@ -467,6 +479,9 @@ def _build_status_report_html(
     plan_next_week: str,
     project_pct: float,
     report_date: str,
+    this_week_due: list = None,
+    prev_week_overdue: list = None,
+    issues: list = None,
 ) -> str:
     """Build the full HTML for the project status report email."""
 
@@ -583,16 +598,98 @@ def _build_status_report_html(
           </td>
         </tr>"""
 
+    # ── 3 new sections ────────────────────────────────────────────────────────
+    this_week_due     = this_week_due or []
+    prev_week_overdue = prev_week_overdue or []
+    issues            = issues or []
+
+    def _week_due_rows(items: list, color_accent: str) -> str:
+        if not items:
+            return f'<tr><td colspan="6" style="padding:8px;text-align:center;color:#9ca3af;font-size:11px;font-style:italic;">No tasks due this week</td></tr>'
+        rows = ""
+        for i, item in enumerate(items):
+            bg = "#faf7ff" if i % 2 == 0 else "#ffffff"
+            status = item.get("status","—")
+            STATUS_STYLE = {
+                "Completed":   ("✅", "#166534", "#dcfce7"),
+                "In Progress": ("⚡", "#d97706", "#fef3c7"),
+                "Not Started": ("⏸",  "#64748b", "#f1f5f9"),
+                "On Hold":     ("⏳", "#c2410c", "#fff7ed"),
+                "Overdue":     ("🔴", "#dc2626", "#fee2e2"),
+            }
+            icon, fg, sbg = STATUS_STYLE.get(status, ("⏸", "#64748b", "#f1f5f9"))
+            due_color = "#dc2626" if status == "Overdue" else "#475569"
+            rows += f"""
+            <tr style="background:{bg};">
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:{color_accent};font-size:11px;">{i+1}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#334155;font-size:11px;">{item.get("title","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;">{item.get("milestone","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;">{item.get("assignee","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:{due_color};font-size:11px;font-weight:{'700' if status=='Overdue' else '400'};">{item.get("due_date","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;font-size:11px;">
+                <span style="background:{sbg};color:{fg};padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700;">{icon} {status}</span>
+              </td>
+            </tr>"""
+        return rows
+
+    def _overdue_rows(items: list) -> str:
+        if not items:
+            return '<tr><td colspan="6" style="padding:8px;text-align:center;color:#9ca3af;font-size:11px;font-style:italic;">No overdue tasks from last week</td></tr>'
+        rows = ""
+        for i, item in enumerate(items):
+            bg = "#fff5f5" if i % 2 == 0 else "#ffffff"
+            rows += f"""
+            <tr style="background:{bg};">
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#dc2626;font-size:11px;">{i+1}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#334155;font-size:11px;">{item.get("title","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;">{item.get("milestone","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;">{item.get("assignee","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#dc2626;font-size:11px;font-weight:700;">{item.get("due_date","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;font-size:11px;">
+                <span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700;">{item.get("days_overdue",0)} days</span>
+              </td>
+            </tr>"""
+        return rows
+
+    def _issue_rows(items: list) -> str:
+        if not items:
+            return '<tr><td colspan="5" style="padding:8px;text-align:center;color:#9ca3af;font-size:11px;font-style:italic;">No issues logged for this project</td></tr>'
+        rows = ""
+        for i, item in enumerate(items):
+            bg = "#fffdf0" if i % 2 == 0 else "#ffffff"
+            rows += f"""
+            <tr style="background:{bg};">
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#b45309;font-size:11px;">{i+1}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#334155;font-size:11px;font-weight:600;">{item.get("issue_name","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;white-space:nowrap;">{item.get("issue_date","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;">{item.get("description","—")}</td>
+              <td style="padding:4px 8px;border:1px solid #e2e8f0;color:#475569;font-size:11px;">{item.get("responsible_person","—")}</td>
+            </tr>"""
+        return rows
+
+    twd_rows  = _week_due_rows(this_week_due, "#6d28d9")
+    pwo_rows  = _overdue_rows(prev_week_overdue)
+    issue_rows = _issue_rows(issues)
+
     return f"""
 <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;">
 
   <!-- Header -->
-  <div style="background:#091525;padding:22px 28px;text-align:center;
-              border-radius:12px 12px 0 0;">
-    <h1 style="color:#fff;font-size:22px;margin:0;letter-spacing:.04em;">AXON WBS</h1>
-    <p style="color:#4a6080;font-size:11px;margin:5px 0 0;letter-spacing:.08em;">
-      PROJECT STATUS REPORT
-    </p>
+  <div style="background:#091525;padding:22px 28px;border-radius:12px 12px 0 0;
+              position:relative;display:table;width:100%;box-sizing:border-box;">
+    <div style="display:table-cell;vertical-align:middle;text-align:center;">
+      <h1 style="color:#fff;font-size:22px;margin:0;letter-spacing:.04em;">AXON</h1>
+      <p style="color:#4a6080;font-size:11px;margin:5px 0 0;letter-spacing:.08em;">
+        PROJECT STATUS REPORT
+      </p>
+    </div>
+    <div style="display:table-cell;vertical-align:middle;text-align:right;width:130px;">
+      <div style="display:inline-block;border:1px solid #2a3f5f;border-radius:8px;
+                  padding:6px 10px;text-align:center;">
+        <div style="color:#7c9cbf;font-size:7px;letter-spacing:.12em;margin-bottom:2px;">POWERED BY</div>
+        <div style="color:#fff;font-size:11px;font-weight:700;letter-spacing:.06em;">CONNECTOME</div>
+      </div>
+    </div>
   </div>
 
   <!-- Body -->
@@ -665,8 +762,67 @@ def _build_status_report_html(
       {ms_rows}
     </table>
 
+    <!-- This Week Due -->
+    <div style="border-top:2px solid #6366f1;margin:8px 0 10px;"></div>
+    <h3 style="font-size:13px;color:#334155;margin:0 0 4px;font-weight:700;">
+      📋 This Week Due
+      <span style="font-size:10px;color:#6b7280;font-weight:400;margin-left:6px;">
+        (all tasks due this week — any status)
+      </span>
+    </h3>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px;">
+      <tr style="background:#ede9fe;">
+        <th style="padding:5px 8px;border:1px solid #ddd6fe;text-align:left;color:#4c1d95;font-size:11px;">#</th>
+        <th style="padding:5px 8px;border:1px solid #ddd6fe;text-align:left;color:#4c1d95;font-size:11px;">Task / Assignment</th>
+        <th style="padding:5px 8px;border:1px solid #ddd6fe;text-align:left;color:#4c1d95;font-size:11px;">Milestone</th>
+        <th style="padding:5px 8px;border:1px solid #ddd6fe;text-align:left;color:#4c1d95;font-size:11px;">Assignee</th>
+        <th style="padding:5px 8px;border:1px solid #ddd6fe;text-align:left;color:#4c1d95;font-size:11px;">Due Date</th>
+        <th style="padding:5px 8px;border:1px solid #ddd6fe;text-align:left;color:#4c1d95;font-size:11px;">Status</th>
+      </tr>
+      {twd_rows}
+    </table>
+
+    <!-- Previous Week Overdue -->
+    <div style="border-top:2px solid #ef4444;margin:8px 0 10px;"></div>
+    <h3 style="font-size:13px;color:#334155;margin:0 0 4px;font-weight:700;">
+      ⚠️ Previous Week Overdue
+      <span style="font-size:10px;color:#6b7280;font-weight:400;margin-left:6px;">
+        (tasks due last week, still not completed)
+      </span>
+    </h3>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px;">
+      <tr style="background:#fee2e2;">
+        <th style="padding:5px 8px;border:1px solid #fecaca;text-align:left;color:#991b1b;font-size:11px;">#</th>
+        <th style="padding:5px 8px;border:1px solid #fecaca;text-align:left;color:#991b1b;font-size:11px;">Task / Assignment</th>
+        <th style="padding:5px 8px;border:1px solid #fecaca;text-align:left;color:#991b1b;font-size:11px;">Milestone</th>
+        <th style="padding:5px 8px;border:1px solid #fecaca;text-align:left;color:#991b1b;font-size:11px;">Assignee</th>
+        <th style="padding:5px 8px;border:1px solid #fecaca;text-align:left;color:#991b1b;font-size:11px;">Due Date</th>
+        <th style="padding:5px 8px;border:1px solid #fecaca;text-align:left;color:#991b1b;font-size:11px;">Days Overdue</th>
+      </tr>
+      {pwo_rows}
+    </table>
+
+    <!-- Issue Details -->
+    <div style="border-top:2px solid #f59e0b;margin:8px 0 10px;"></div>
+    <h3 style="font-size:13px;color:#334155;margin:0 0 4px;font-weight:700;">
+      🚩 Issue Details
+      <span style="font-size:10px;color:#6b7280;font-weight:400;margin-left:6px;">
+        (manually logged project issues)
+      </span>
+    </h3>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:8px;">
+      <tr style="background:#fef3c7;">
+        <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">#</th>
+        <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Issue Name</th>
+        <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Issue Date</th>
+        <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Description / Notes</th>
+        <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Follow-up By</th>
+      </tr>
+      {issue_rows}
+    </table>
+
     <p style="font-size:11px;color:#94a3b8;margin-top:20px;text-align:center;">
-      Axon WBS &nbsp;·&nbsp; by Connectome
+      Axon &nbsp;·&nbsp; by Connectome
     </p>
   </div>
 </div>"""
@@ -722,6 +878,93 @@ def send_status_report(
     if not to_list:
         raise HTTPException(400, "No valid recipient email addresses provided")
 
+    # ── This Week Due & Previous Week Overdue ─────────────────────────────────
+    today = date_cls.today()
+    # Monday of current week
+    this_mon = today - timedelta(days=today.weekday())
+    this_sun = this_mon + timedelta(days=6)
+    # Monday of previous week
+    prev_mon = this_mon - timedelta(days=7)
+    prev_sun = this_mon - timedelta(days=1)
+
+    # milestone_num lookup for assignments
+    cm_by_id = {ms.id: ms for ms in active_cms}
+
+    def _milestone_label(ta: TaskAssignment) -> str:
+        if ta.milestone_num:
+            return f"M{ta.milestone_num:02d}"
+        return "General"
+
+    def _fmt_d(dt) -> str:
+        if not dt:
+            return "—"
+        try:
+            return dt.strftime("%d %b %Y")
+        except Exception:
+            return str(dt)[:10]
+
+    # This week due — planned_end within [this_mon, this_sun], any status
+    twd_rows_data = (
+        db.query(TaskAssignment)
+        .filter(
+            TaskAssignment.project_id == project_id,
+            TaskAssignment.planned_end >= datetime.combine(this_mon, datetime.min.time()),
+            TaskAssignment.planned_end <= datetime.combine(this_sun, datetime.max.time()),
+        )
+        .order_by(TaskAssignment.planned_end)
+        .all()
+    )
+    this_week_due = [
+        {
+            "title":     ta.title,
+            "milestone": _milestone_label(ta),
+            "assignee":  ta.assignee.name if ta.assignee else "—",
+            "due_date":  _fmt_d(ta.planned_end),
+            "status":    ta.status or "Not Started",
+        }
+        for ta in twd_rows_data
+    ]
+
+    # Previous week overdue — planned_end within [prev_mon, prev_sun], not Completed
+    pwo_rows_data = (
+        db.query(TaskAssignment)
+        .filter(
+            TaskAssignment.project_id == project_id,
+            TaskAssignment.planned_end >= datetime.combine(prev_mon, datetime.min.time()),
+            TaskAssignment.planned_end <= datetime.combine(prev_sun, datetime.max.time()),
+            TaskAssignment.status != "Completed",
+        )
+        .order_by(TaskAssignment.planned_end)
+        .all()
+    )
+    prev_week_overdue = [
+        {
+            "title":        ta.title,
+            "milestone":    _milestone_label(ta),
+            "assignee":     ta.assignee.name if ta.assignee else "—",
+            "due_date":     _fmt_d(ta.planned_end),
+            "days_overdue": (today - ta.planned_end.date()).days if ta.planned_end else 0,
+        }
+        for ta in pwo_rows_data
+    ]
+
+    # Issues
+    issue_rows_data = (
+        db.query(ProjectIssue)
+        .filter(ProjectIssue.project_id == project_id)
+        .order_by(ProjectIssue.issue_date.desc())
+        .all()
+    )
+    issues_list = [
+        {
+            "issue_name":         i.issue_name,
+            "issue_date":         str(i.issue_date) if i.issue_date else "—",
+            "description":        i.description or "—",
+            "responsible_person": i.responsible_person or "—",
+        }
+        for i in issue_rows_data
+    ]
+
     # ── Build email ───────────────────────────────────────────────────────────
     report_date = datetime.now(timezone.utc).strftime("%d %b %Y")
     body = _build_status_report_html(
@@ -734,6 +977,9 @@ def send_status_report(
         plan_next_week=payload.plan_next_week or "",
         project_pct=project_pct,
         report_date=report_date,
+        this_week_due=this_week_due,
+        prev_week_overdue=prev_week_overdue,
+        issues=issues_list,
     )
 
     subject = f"Project Status Report — {project.name} ({report_date})"
@@ -749,6 +995,103 @@ def send_status_report(
     )
     db.commit()
     return {"status": "ok", "message": f"Status report sent to {len(to_list)} recipient(s)"}
+
+
+# ── Project Issues CRUD ───────────────────────────────────────────────────────
+
+def _issue_out(issue: ProjectIssue) -> dict:
+    return {
+        "id":                 issue.id,
+        "project_id":         issue.project_id,
+        "issue_name":         issue.issue_name,
+        "issue_date":         str(issue.issue_date) if issue.issue_date else None,
+        "description":        issue.description or "",
+        "responsible_person": issue.responsible_person or "",
+        "created_by":         issue.created_by,
+        "created_at":         issue.created_at.isoformat() if issue.created_at else None,
+    }
+
+@router.get("/{project_id}/issues")
+def list_issues(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    issues = (db.query(ProjectIssue)
+                .filter(ProjectIssue.project_id == project_id)
+                .order_by(ProjectIssue.issue_date.desc())
+                .all())
+    return [_issue_out(i) for i in issues]
+
+
+@router.post("/{project_id}/issues")
+def create_issue(
+    project_id: int,
+    payload: IssueCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = db.query(Project).filter_by(id=project_id).first()
+    if not project:
+        raise HTTPException(404, "Project not found")
+    try:
+        d = date_cls.fromisoformat(payload.issue_date)
+    except ValueError:
+        raise HTTPException(400, "Invalid issue_date — use YYYY-MM-DD")
+    issue = ProjectIssue(
+        project_id=project_id,
+        issue_name=payload.issue_name,
+        issue_date=d,
+        description=payload.description or "",
+        responsible_person=payload.responsible_person or "",
+        created_by=current_user.id,
+    )
+    db.add(issue)
+    db.commit()
+    db.refresh(issue)
+    return _issue_out(issue)
+
+
+@router.put("/{project_id}/issues/{issue_id}")
+def update_issue(
+    project_id: int,
+    issue_id: int,
+    payload: IssueUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    issue = db.query(ProjectIssue).filter_by(id=issue_id, project_id=project_id).first()
+    if not issue:
+        raise HTTPException(404, "Issue not found")
+    if payload.issue_name is not None:
+        issue.issue_name = payload.issue_name
+    if payload.issue_date is not None:
+        try:
+            issue.issue_date = date_cls.fromisoformat(payload.issue_date)
+        except ValueError:
+            raise HTTPException(400, "Invalid issue_date — use YYYY-MM-DD")
+    if payload.description is not None:
+        issue.description = payload.description
+    if payload.responsible_person is not None:
+        issue.responsible_person = payload.responsible_person
+    db.commit()
+    db.refresh(issue)
+    return _issue_out(issue)
+
+
+@router.delete("/{project_id}/issues/{issue_id}")
+def delete_issue(
+    project_id: int,
+    issue_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    issue = db.query(ProjectIssue).filter_by(id=issue_id, project_id=project_id).first()
+    if not issue:
+        raise HTTPException(404, "Issue not found")
+    db.delete(issue)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @router.delete("/{project_id}")

@@ -772,6 +772,25 @@ class ProposalEstimationRow(Base):
     created_at       = Column(DateTime(timezone=True), server_default=func.now())
     proposal         = relationship("ProposalEstimate", back_populates="estimation_rows")
 
+# ── Project Issues ────────────────────────────────────────────────────────────
+class ProjectIssue(Base):
+    """Manually logged project issues — surfaced in the Issues tab and
+    included in the Project Status Report email under 'Issue Details'."""
+    __tablename__ = "project_issues"
+    id                   = Column(Integer, primary_key=True, index=True)
+    project_id           = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"),
+                                  nullable=False)
+    issue_name           = Column(String(300), nullable=False)
+    issue_date           = Column(Date, nullable=False)
+    description          = Column(Text)
+    responsible_person   = Column(String(200))
+    created_by           = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at           = Column(DateTime(timezone=True), onupdate=func.now())
+    project              = relationship("Project", backref="issues")
+    creator              = relationship("User", foreign_keys=[created_by])
+
+
 class ProposalAuditLog(Base):
     """Phase 3 — immutable log of every status change / significant edit."""
     __tablename__ = "proposal_audit_logs"
