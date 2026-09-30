@@ -498,12 +498,13 @@ def _build_status_report_html(
     STATUS_STYLE = {
         "Completed":   ("✅", "#166534", "#dcfce7"),
         "In Progress": ("⚡", "#d97706", "#fef3c7"),
-        "Not Started": ("⏸",  "#64748b", "#f1f5f9"),
+        "Not Started": ("⬜", "#64748b", "#f1f5f9"),
         "On Hold":     ("⏳", "#c2410c", "#fff7ed"),
+        "Overdue":     ("🔴", "#dc2626", "#fee2e2"),
     }
 
     def _status_badge(status: str) -> str:
-        icon, color, bg = STATUS_STYLE.get(status, ("⏸", "#64748b", "#f1f5f9"))
+        icon, color, bg = STATUS_STYLE.get(status, ("⬜", "#64748b", "#f1f5f9"))
         return (
             f'<span style="background:{bg};color:{color};padding:2px 10px;'
             f'border-radius:99px;font-size:11px;font-weight:700;">'
@@ -817,7 +818,7 @@ def _build_status_report_html(
         <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Issue Name</th>
         <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Issue Date</th>
         <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Description / Notes</th>
-        <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Follow-up By</th>
+        <th style="padding:5px 8px;border:1px solid #fde68a;text-align:left;color:#78350f;font-size:11px;">Responsible</th>
       </tr>
       {issue_rows}
     </table>
