@@ -9,8 +9,8 @@ engine = create_engine(
     pool_size=5,          # keep 5 connections warm and reused
     max_overflow=10,      # allow up to 10 extra under burst load
     pool_timeout=30,      # wait up to 30s for a free connection
-    pool_recycle=1800,    # recycle connections every 30 min (avoids stale TCP)
-    pool_pre_ping=True,   # test connection before use (handles Neon idle drops)
+    pool_recycle=3600,    # recycle connections every 60 min (reduces unnecessary Neon wake-ups)
+    pool_pre_ping=False,  # disabled to avoid waking Neon on every request (saves compute)
     connect_args={
         "connect_timeout": 10,
     },
