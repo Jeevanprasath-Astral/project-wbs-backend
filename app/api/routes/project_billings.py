@@ -249,9 +249,17 @@ def list_billings(
         .order_by(ProjectBilling.created_at.desc())
         .all()
     )
+    # Milestone name + planned billing date for every row in one query
+    mids = {b.milestone_id for b in rows if b.milestone_id}
+    ms_info = {
+        mid: (name, planned_end.strftime('%Y-%m-%d') if planned_end else None)
+        for mid, name, planned_end in db.query(
+            CustomMilestone.id, CustomMilestone.name, CustomMilestone.planned_end
+        ).filter(CustomMilestone.id.in_(mids)).all()
+    } if mids else {}
     out = []
     for b in rows:
-        ms_name, pbd = _resolve_milestone(db, b.milestone_id)
+        ms_name, pbd = ms_info.get(b.milestone_id, (None, None)) if b.milestone_id else (None, None)
         out.append(_billing_out(b, ms_name, pbd))
     return out
 
@@ -268,14 +276,15 @@ def list_billing_audit_log(
         .order_by(FinancialAuditLog.changed_at.desc())
         .all()
     )
+    uids = {r.changed_by for r in rows if r.changed_by is not None}
+    names = dict(db.query(User.id, User.name).filter(User.id.in_(uids)).all()) if uids else {}
     out = []
     for r in rows:
-        u = db.query(User.name).filter_by(id=r.changed_by).first()
         out.append({
             "id":         r.id,
             "billing_id": r.billing_id,
             "action":     r.action,
-            "changed_by": u.name if u else "—",
+            "changed_by": names[r.changed_by] if r.changed_by in names else "—",
             "changed_at": str(r.changed_at) if r.changed_at else None,
             "snapshot":   json.loads(r.snapshot) if r.snapshot else None,
         })

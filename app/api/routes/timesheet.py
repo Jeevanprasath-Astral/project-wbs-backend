@@ -28,6 +28,14 @@ def _parse_date(v: str) -> date_cls:
     return datetime.fromisoformat(v).date()
 
 
+def _user_names(db: Session, ids) -> dict:
+    """user_id -> name for many users in one query (avoids a lookup per row)."""
+    ids = {i for i in ids if i is not None}
+    if not ids:
+        return {}
+    return dict(db.query(User.id, User.name).filter(User.id.in_(ids)).all())
+
+
 # ── Holidays ───────────────────────────────────────────────────────────────
 class HolidayCreate(BaseModel):
     date: str
@@ -105,10 +113,10 @@ def list_leaves(user_id: Optional[int] = None, status: Optional[str] = None,
     if user_id: q = q.filter_by(user_id=user_id)
     if status: q = q.filter_by(status=status)
     rows = q.order_by(LeaveRequest.date_from.desc()).all()
+    names = _user_names(db, (l.user_id for l in rows))
     out = []
     for l in rows:
-        u = db.query(User).filter_by(id=l.user_id).first()
-        out.append({"id": l.id, "user_id": l.user_id, "user_name": u.name if u else "—",
+        out.append({"id": l.id, "user_id": l.user_id, "user_name": names.get(l.user_id, "—"),
                     "date_from": l.date_from, "date_to": l.date_to, "leave_type": l.leave_type,
                     "status": l.status, "reason": l.reason})
     return out
@@ -172,10 +180,10 @@ def list_permissions(user_id: Optional[int] = None, db: Session = Depends(get_db
     q = db.query(Permission)
     if user_id: q = q.filter_by(user_id=user_id)
     rows = q.order_by(Permission.date.desc()).all()
+    names = _user_names(db, (p.user_id for p in rows))
     out = []
     for p in rows:
-        u = db.query(User).filter_by(id=p.user_id).first()
-        out.append({"id": p.id, "user_id": p.user_id, "user_name": u.name if u else "—",
+        out.append({"id": p.id, "user_id": p.user_id, "user_name": names.get(p.user_id, "—"),
                     "date": p.date, "hours": p.hours, "reason": p.reason, "status": p.status})
     return out
 

@@ -88,6 +88,31 @@ def _resolve_level_name(w: WorkHours, db: Session):
     return None
 
 
+def _bulk_level_names(db: Session, records) -> dict:
+    """WorkHours.id -> level name for rows saved without task_name, in at
+    most 4 queries. Same precedence as _resolve_level_name: the most
+    specific level that is set wins (activity > subtask > task > milestone)."""
+    need = [w for w in records if not w.task_name]
+    if not need:
+        return {}
+    def _names(model, ids):
+        ids = {i for i in ids if i}
+        return dict(db.query(model.id, model.name).filter(model.id.in_(ids)).all()) if ids else {}
+    act = _names(Activity,        (w.activity_id for w in need))
+    sub = _names(CustomSubtask,   (w.custom_subtask_id for w in need if not w.activity_id))
+    tsk = _names(CustomTask,      (w.custom_task_id for w in need if not w.activity_id and not w.custom_subtask_id))
+    mst = _names(CustomMilestone, (w.custom_milestone_id for w in need
+                                   if not w.activity_id and not w.custom_subtask_id and not w.custom_task_id))
+    out = {}
+    for w in need:
+        if w.activity_id:           out[w.id] = act.get(w.activity_id)
+        elif w.custom_subtask_id:   out[w.id] = sub.get(w.custom_subtask_id)
+        elif w.custom_task_id:      out[w.id] = tsk.get(w.custom_task_id)
+        elif w.custom_milestone_id: out[w.id] = mst.get(w.custom_milestone_id)
+        else:                       out[w.id] = None
+    return out
+
+
 def _build(w: WorkHours, db: Session):
     user = db.query(User).filter_by(id=w.user_id).first()
     project = db.query(Project).filter_by(id=w.project_id).first()
@@ -131,7 +156,8 @@ def _build(w: WorkHours, db: Session):
     }
 
 
-def _build_fast(w: WorkHours, user_map: dict, proj_map: dict, assign_map: dict, db: Session):
+def _build_fast(w: WorkHours, user_map: dict, proj_map: dict, assign_map: dict, db: Session,
+                level_names: dict = None):
     """N+1-free version of _build() for list endpoints.
     Uses pre-fetched dicts instead of firing per-row DB queries.
     Falls back to _resolve_level_name() only when task_name is None —
@@ -155,7 +181,8 @@ def _build_fast(w: WorkHours, user_map: dict, proj_map: dict, assign_map: dict, 
         "custom_task_id": w.custom_task_id,
         "custom_subtask_id": w.custom_subtask_id,
         "activity_id": w.activity_id,
-        "task_name": w.task_name or _resolve_level_name(w, db),
+        "task_name": w.task_name or (level_names.get(w.id) if level_names is not None
+                                     else _resolve_level_name(w, db)),
         "date": str(w.date),
         "start_time": w.start_time.isoformat() if w.start_time else None,
         "end_time": w.end_time.isoformat() if w.end_time else None,
@@ -207,15 +234,13 @@ def list_work_hours(
     q = q.order_by(WorkHours.date.desc())
 
     if milestone_num:
-        # milestone filter requires post-query filtering; fetch all then slice
-        all_records = q.all()
-        assignment_ids = {a.id for a in db.query(TaskAssignment).filter(TaskAssignment.milestone_num == milestone_num).all()}
-        all_records = [w for w in all_records if w.assignment_id in assignment_ids]
-        total = len(all_records)
-        records = all_records[offset: offset + limit]
-    else:
-        total = q.count()
-        records = q.offset(offset).limit(limit).all()
+        # Filter in the database (previously every matching row was loaded
+        # into memory and sliced in Python).
+        ms_assignment_ids = db.query(TaskAssignment.id).filter(
+            TaskAssignment.milestone_num == milestone_num).scalar_subquery()
+        q = q.filter(WorkHours.assignment_id.in_(ms_assignment_ids))
+    total = q.count()
+    records = q.offset(offset).limit(limit).all()
 
     # Perf: bulk-fetch all referenced users (with team joined), projects, and
     # assignments in 3 queries instead of 3 per record (eliminates N+1).
@@ -235,12 +260,14 @@ def list_work_hours(
         {a.id: a for a in db.query(TaskAssignment).filter(TaskAssignment.id.in_(lw_assign_ids)).all()}
         if lw_assign_ids else {}
     )
+    level_names = _bulk_level_names(db, records)
 
     return {
         "total": total,
         "offset": offset,
         "limit": limit,
-        "records": [_build_fast(w, lw_user_map, lw_proj_map, lw_assign_map, db) for w in records],
+        "records": [_build_fast(w, lw_user_map, lw_proj_map, lw_assign_map, db, level_names)
+                    for w in records],
     }
 
 @router.get("/summary")

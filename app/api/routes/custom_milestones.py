@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy import func as sa_func
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -188,8 +188,13 @@ def _make_list_ctx(db: Session, project_id: int) -> dict:
     ):
         rpt_to_ms[rpt_id] = ms_id
 
-    # Query 1b: all work-hour rows for this project
-    all_wh = db.query(WorkHours).filter(WorkHours.project_id == project_id).all()
+    # Query 1b: all work-hour rows for this project (only the columns used
+    # below — avoids building a full ORM object per row)
+    all_wh = db.query(
+        WorkHours.hours_spent, WorkHours.buffer_hours, WorkHours.user_id,
+        WorkHours.activity_id, WorkHours.custom_subtask_id, WorkHours.custom_task_id,
+        WorkHours.custom_milestone_id, WorkHours.milestone_report_id,
+    ).filter(WorkHours.project_id == project_id).all()
 
     # wh[(entity_type_char, entity_id)][user_id_or_None] = cumulative hours
     # None key = any-user total (used when no specific user is identified)
@@ -223,7 +228,9 @@ def _make_list_ctx(db: Session, project_id: int) -> dict:
 
     # Query 2: all task assignments for this project (ordered newest-first so
     # first-seen wins when building the "most recent" map)
-    all_ta = db.query(TaskAssignment).filter(
+    all_ta = db.query(
+        TaskAssignment.custom_task_id, TaskAssignment.milestone_num, TaskAssignment.assigned_to,
+    ).filter(
         TaskAssignment.project_id == project_id
     ).order_by(TaskAssignment.created_at.desc()).all()
 
@@ -368,8 +375,8 @@ def _build_task_ctx(t: "CustomTask", ctx: dict, compact: bool = False):
         "form_field_count": ctx["ff_count"].get(t.id, 0),
         # compact=True omits form_fields array — used by Log modal (only needs names)
         # and by Milestone Config initial load (lazy-loads fields on Form panel open).
-        "form_fields": [] if compact else [_build_form_field(f) for f in sorted(t.form_fields, key=lambda x: x.num or 0)],
-        "subtasks": [_build_subtask_ctx(s, ctx) for s in sorted(t.subtasks, key=lambda x: x.num or 0)],
+        "form_fields": [] if compact else [_build_form_field(f) for f in sorted(t.form_fields, key=lambda x: (x.num or 0, x.id))],
+        "subtasks": [_build_subtask_ctx(s, ctx) for s in sorted(t.subtasks, key=lambda x: (x.num or 0, x.id))],
     }
 
 
@@ -405,7 +412,7 @@ def _build_ctx(ms: "CustomMilestone", ctx: dict, compact: bool = False):
         "total_days": _total_days(ms.planned_start, ms.planned_end) or _total_days(ms.actual_start, ms.actual_end),
         "progress": _compute_ms_progress(ms),
         "reports": [_build_milestone_report(r) for r in sorted(ms.reports, key=lambda x: x.id)],
-        "tasks": [_build_task_ctx(t, ctx, compact=compact) for t in sorted(ms.tasks, key=lambda x: x.num or 0)],
+        "tasks": [_build_task_ctx(t, ctx, compact=compact) for t in sorted(ms.tasks, key=lambda x: (x.num or 0, x.id))],
     }
 
 
@@ -816,6 +823,51 @@ def _build(ms: CustomMilestone, db: Session = None):
     }
 
 
+# ── Fast response builders for write endpoints ───────────────────────────────
+# After a create/update, the response used to be rebuilt with the per-entity
+# helpers above (_build/_build_task/... with db), which ran a user lookup and
+# a WorkHours SUM for every task, subtask and activity plus a lazy load for
+# every child collection — 1,000+ queries to save one large milestone.
+# These reload the entity with its children in a few SELECT-IN queries and
+# compute hours from the same pre-fetched context the list page uses, so the
+# numbers returned after a save match what the page shows on reload.
+_TASK_CHILDREN = [
+    selectinload(CustomTask.form_fields),
+    selectinload(CustomTask.subtasks).selectinload(CustomSubtask.activities),
+    selectinload(CustomTask.subtasks).selectinload(CustomSubtask.questions),
+    selectinload(CustomTask.subtasks).selectinload(CustomSubtask.reports),
+]
+_SUBTASK_CHILDREN = [
+    selectinload(CustomSubtask.activities),
+    selectinload(CustomSubtask.questions),
+    selectinload(CustomSubtask.reports),
+]
+
+
+def _fresh_milestone(db: Session, ms: CustomMilestone):
+    ms = (db.query(CustomMilestone)
+            .options(selectinload(CustomMilestone.reports),
+                     selectinload(CustomMilestone.tasks).options(*_TASK_CHILDREN))
+            .populate_existing().filter(CustomMilestone.id == ms.id).one())
+    return _build_ctx(ms, _make_list_ctx(db, ms.project_id))
+
+
+def _fresh_task(db: Session, t: CustomTask):
+    t = (db.query(CustomTask).options(*_TASK_CHILDREN)
+           .populate_existing().filter(CustomTask.id == t.id).one())
+    return _build_task_ctx(t, _make_list_ctx(db, t.project_id))
+
+
+def _fresh_subtask(db: Session, s: CustomSubtask):
+    s = (db.query(CustomSubtask).options(*_SUBTASK_CHILDREN)
+           .populate_existing().filter(CustomSubtask.id == s.id).one())
+    return _build_subtask_ctx(s, _make_list_ctx(db, s.project_id))
+
+
+def _fresh_activity(db: Session, a: Activity):
+    return _build_activity_ctx(a, _make_list_ctx(db, a.project_id))
+
+
 # ── IMPORTANT: /templates must come before /{milestone_id} ───────────────────
 @router.get("/templates")
 def get_milestone_templates(
@@ -893,14 +945,18 @@ def get_custom_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # selectinload (one small SELECT ... IN per relationship) instead of
+    # chained joinedload: joining several sibling collections in one query
+    # repeats every task row once per form-field × subtask × activity
+    # combination, which is what inflated memory on the 512 MB instance.
     eager_opts = [
-        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.activities),
-        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.questions),
-        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.reports),
-        joinedload(CustomMilestone.reports),
+        selectinload(CustomMilestone.tasks).selectinload(CustomTask.subtasks).selectinload(CustomSubtask.activities),
+        selectinload(CustomMilestone.tasks).selectinload(CustomTask.subtasks).selectinload(CustomSubtask.questions),
+        selectinload(CustomMilestone.tasks).selectinload(CustomTask.subtasks).selectinload(CustomSubtask.reports),
+        selectinload(CustomMilestone.reports),
     ]
     if not compact:
-        eager_opts.insert(0, joinedload(CustomMilestone.tasks).joinedload(CustomTask.form_fields))
+        eager_opts.insert(0, selectinload(CustomMilestone.tasks).selectinload(CustomTask.form_fields))
     ms = (
         db.query(CustomMilestone).options(*eager_opts)
         .filter_by(id=milestone_id, project_id=project_id)
@@ -925,20 +981,20 @@ def list_custom_milestones(
     # fields. Loading 6000+ form fields into RAM for a dropdown is the #1
     # cause of OOM crashes on the free-tier 512 MB instance.
     eager_opts = [
-        joinedload(CustomMilestone.tasks)
-            .joinedload(CustomTask.subtasks)
-            .joinedload(CustomSubtask.activities),
-        joinedload(CustomMilestone.tasks)
-            .joinedload(CustomTask.subtasks)
-            .joinedload(CustomSubtask.questions),
-        joinedload(CustomMilestone.tasks)
-            .joinedload(CustomTask.subtasks)
-            .joinedload(CustomSubtask.reports),
-        joinedload(CustomMilestone.reports),
+        selectinload(CustomMilestone.tasks)
+            .selectinload(CustomTask.subtasks)
+            .selectinload(CustomSubtask.activities),
+        selectinload(CustomMilestone.tasks)
+            .selectinload(CustomTask.subtasks)
+            .selectinload(CustomSubtask.questions),
+        selectinload(CustomMilestone.tasks)
+            .selectinload(CustomTask.subtasks)
+            .selectinload(CustomSubtask.reports),
+        selectinload(CustomMilestone.reports),
     ]
     if not compact:
         eager_opts.insert(0,
-            joinedload(CustomMilestone.tasks).joinedload(CustomTask.form_fields)
+            selectinload(CustomMilestone.tasks).selectinload(CustomTask.form_fields)
         )
     milestones = db.query(CustomMilestone).options(*eager_opts).filter_by(
         project_id=project_id
@@ -1067,7 +1123,7 @@ def add_from_template(
                description=f"Added M{ms_num:02d} to project",
                project_id=project_id, user_id=current_user.id)
     db.commit(); db.refresh(cm)
-    return _build(cm, db)
+    return _fresh_milestone(db, cm)
 
 
 # ── Add one standard task (+ optional subtask selection) into an existing
@@ -1159,7 +1215,7 @@ def add_task_from_template(
                                          section_name=s.name, question_text=q.question_text,
                                          input_type=q.input_type or "text"))
         db.commit(); db.refresh(ct)
-        return _build_task(ct, db)
+        return _fresh_task(db, ct)
 
 
 # ── Add one standard subtask into an existing custom task ────────────────────
@@ -1241,7 +1297,7 @@ def create_custom_milestone(
                description=f"Created custom M{payload.num}: {payload.name}",
                project_id=project_id, user_id=current_user.id)
     db.commit(); db.refresh(cm)
-    return _build(cm, db)
+    return _fresh_milestone(db, cm)
 
 
 # ── Update milestone ──────────────────────────────────────────────────────────
@@ -1289,7 +1345,7 @@ def update_milestone(
                project_id=project_id, entity_type="custom_milestone", entity_id=ms.id,
                old_value=old_status, new_value=ms.status, user_id=current_user.id)
     db.commit(); db.refresh(ms)
-    return _build(ms, db)
+    return _fresh_milestone(db, ms)
 
 
 # ── Delete milestone ──────────────────────────────────────────────────────────
@@ -1426,7 +1482,7 @@ def revisit_milestone(
                project_id=project_id, entity_type="custom_milestone", entity_id=new_ms.id,
                user_id=current_user.id)
     db.commit(); db.refresh(new_ms)
-    return _build(new_ms, db)
+    return _fresh_milestone(db, new_ms)
 
 
 # ── Revision reasons list (for frontend dropdown) ────────────────────────────
@@ -1460,7 +1516,7 @@ def add_task(
     if ct.assignee:
         _notify_task_assignment(db, project_id, ct, ms.name)
         db.commit()
-    return _build_task(ct, db)
+    return _fresh_task(db, ct)
 
 
 # ── Update task ────────────────────────────────────────────────────────────────
@@ -1493,7 +1549,7 @@ def update_task(
                project_id=project_id, entity_type="custom_task", entity_id=t.id,
                old_value=old_status, new_value=t.status, user_id=current_user.id)
     db.commit(); db.refresh(t)
-    return _build_task(t, db)
+    return _fresh_task(db, t)
 
 
 # ── Delete task ───────────────────────────────────────────────────────────────
@@ -1595,7 +1651,7 @@ def add_subtask(
                        start_time=payload.start_time, end_time=payload.end_time,
                        estimated_hours=payload.estimated_hours or 0.0)
     db.add(cs); db.commit(); db.refresh(cs)
-    return _build_subtask(cs, db)
+    return _fresh_subtask(db, cs)
 
 
 # ── Update subtask ────────────────────────────────────────────────────────────
@@ -1624,7 +1680,7 @@ def update_subtask(
                project_id=project_id, entity_type="custom_subtask", entity_id=s.id,
                old_value=old_status, new_value=s.status, user_id=current_user.id)
     db.commit(); db.refresh(s)
-    return _build_subtask(s, db)
+    return _fresh_subtask(db, s)
 
 
 # ── Delete subtask ────────────────────────────────────────────────────────────
@@ -1655,7 +1711,7 @@ def add_activity(
                 start_time=payload.start_time, end_time=payload.end_time,
                 estimated_hours=payload.estimated_hours or 0.0)
     db.add(a); db.commit(); db.refresh(a)
-    return _build_activity(a, db)
+    return _fresh_activity(db, a)
 
 
 @router.patch("/{milestone_id}/tasks/{task_id}/subtasks/{subtask_id}/activities/{activity_id}")
@@ -1685,7 +1741,7 @@ def update_activity(
                project_id=project_id, entity_type="activity", entity_id=a.id,
                old_value=old_status, new_value=a.status, user_id=current_user.id)
     db.commit(); db.refresh(a)
-    return _build_activity(a, db)
+    return _fresh_activity(db, a)
 
 
 @router.delete("/{milestone_id}/tasks/{task_id}/subtasks/{subtask_id}/activities/{activity_id}")
@@ -2061,13 +2117,16 @@ def hours_summary(
     current_user: User = Depends(get_current_user)
 ):
     milestones = db.query(CustomMilestone).options(
-        joinedload(CustomMilestone.tasks).joinedload(CustomTask.subtasks).joinedload(CustomSubtask.activities)
+        selectinload(CustomMilestone.tasks).selectinload(CustomTask.subtasks).selectinload(CustomSubtask.activities)
     ).filter_by(project_id=project_id, is_active=True).all()
 
+    # Same pre-fetched context (and therefore the same numbers) as the
+    # Milestone Configuration list — a fixed handful of queries.
+    ctx = _make_list_ctx(db, project_id)
     by_milestone = []
     total_est = total_act = 0.0
     for ms in milestones:
-        est, act = _milestone_hours(db, ms)
+        est, act = _milestone_hours_ctx(ctx, ms)
         total_est += est
         total_act += act
         by_milestone.append({
@@ -2082,9 +2141,11 @@ def hours_summary(
     by_person: Dict[str, float] = {}
     rows = db.query(WorkHours.user_id, WorkHours.hours_spent, WorkHours.buffer_hours) \
              .filter(WorkHours.project_id == project_id).all()
+    uids = {r[0] for r in rows if r[0] is not None}
+    names = dict(db.query(User.id, User.name).filter(User.id.in_(uids)).all()) if uids else {}
     for user_id, hours_spent, buffer_hours in rows:
-        user = db.query(User).filter_by(id=user_id).first()
-        name = user.name if user else f"User {user_id}"
+        uname = names.get(user_id)
+        name = uname if user_id in names else f"User {user_id}"
         by_person[name] = round(by_person.get(name, 0.0) + max((hours_spent or 0.0) - (buffer_hours or 0.0), 0.0), 2)
 
     return {
