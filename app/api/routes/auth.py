@@ -132,9 +132,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
                     f"Brevo account check: {brevo_check}. "
                     f"BREVO_API_KEY set: {bool(settings.BREVO_API_KEY)}. "
                     f"MAIL_FROM: {settings.MAIL_FROM!r}. "
-                    f"MAIL_ENABLED: {settings.MAIL_ENABLED}. "
-                    f"Diagnostic: GET /api/auth/email-status?confirm_token=axon-fix-2026 "
-                    f"or GET /api/auth/test-email?to={user.email}&confirm_token=axon-fix-2026"
+                    f"MAIL_ENABLED: {settings.MAIL_ENABLED}."
                 )
         else:
             _log.info(f"Forgot-password: email not found in DB: {payload.email}")
@@ -146,35 +144,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             pass
     return {"message": "If this email is registered, a password reset link has been sent."}
 
-@router.get("/debug-login")
-def debug_login(email: str, password: str, confirm_token: str, db: Session = Depends(get_db)):
-    """TEMPORARY debug — remove after fix."""
-    if confirm_token != "axon-fix-2026":
-        raise HTTPException(status_code=403, detail="Invalid confirm_token")
-    users = db.query(User).filter(User.email == email).all()
-    results = []
-    for u in users:
-        results.append({
-            "id": u.id,
-            "role": u.role,
-            "stored_hash": u.password_hash[:20] + "…",
-            "match": verify_password(password, u.password_hash),
-        })
-    return {"results": results}
 
-@router.get("/emergency-reset")
-def emergency_reset(email: str, new_password: str, confirm_token: str, db: Session = Depends(get_db)):
-    """TEMPORARY one-use endpoint — remove after login is fixed."""
-    if confirm_token != "axon-fix-2026":
-        raise HTTPException(status_code=403, detail="Invalid confirm_token")
-    users = db.query(User).filter(User.email == email).all()
-    if not users:
-        raise HTTPException(status_code=404, detail="No user found with that email")
-    new_hash = hash_password(new_password)
-    for u in users:
-        u.password_hash = new_hash
-    db.commit()
-    return {"message": f"Password updated for {len(users)} account(s) with email {email}", "rows": len(users)}
 
 @router.post("/reset-password")
 def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
@@ -194,57 +164,3 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     db.delete(token_row)
     db.commit()
     return {"message": "Password updated successfully. You can now log in with your new password."}
-
-
-# ── Email diagnostics (admin/debug only — gated by confirm_token) ─────────────
-
-@router.get("/email-status")
-def email_status(confirm_token: str):
-    """Check Brevo configuration without sending anything.
-
-    Usage: GET /api/auth/email-status?confirm_token=axon-fix-2026
-    """
-    if confirm_token != "axon-fix-2026":
-        raise HTTPException(status_code=403, detail="Invalid confirm_token")
-    check = _brevo_check()
-    return {
-        "mail_enabled":    settings.MAIL_ENABLED,
-        "brevo_key_set":   bool(settings.BREVO_API_KEY),
-        "brevo_key_prefix": settings.BREVO_API_KEY[:12] + "…" if settings.BREVO_API_KEY else "(not set)",
-        "mail_from":       settings.MAIL_FROM,
-        "frontend_url":    settings.FRONTEND_URL,
-        "brevo_account":   check,
-    }
-
-
-@router.get("/test-email")
-def test_email(to: str, confirm_token: str):
-    """Send a real test email to verify Brevo is working end-to-end.
-
-    Usage: GET /api/auth/test-email?to=you@example.com&confirm_token=axon-fix-2026
-    """
-    if confirm_token != "axon-fix-2026":
-        raise HTTPException(status_code=403, detail="Invalid confirm_token")
-    sent = send_email(
-        to=to,
-        subject="Axon WBS — Email Test",
-        body=f"""
-        <div style="font-family:Arial,sans-serif;padding:24px;max-width:480px;">
-          <h2 style="color:#0f172a;">✅ Email is working!</h2>
-          <p>This is a test email sent from <strong>Axon WBS</strong>.</p>
-          <p>Sender: <code>{settings.MAIL_FROM}</code></p>
-          <p>If you received this, Brevo is configured correctly.</p>
-        </div>
-        """,
-    )
-    if sent:
-        return {"sent": True, "message": f"Test email dispatched to {to}. Check inbox (and spam folder)."}
-    brevo = _brevo_check()
-    return {
-        "sent": False,
-        "message": "Email failed to send. See details below.",
-        "brevo_account": brevo,
-        "mail_enabled":  settings.MAIL_ENABLED,
-        "brevo_key_set": bool(settings.BREVO_API_KEY),
-        "mail_from":     settings.MAIL_FROM,
-    }

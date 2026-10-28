@@ -517,7 +517,9 @@ def export_pdf(project_id: int, milestones: str = None, db: Session = Depends(ge
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
     from datetime import date
 
-    project, pms, milestones, resp_by_q, resp_by_sub, ss_by_sub = _load_project_data(db, project_id)
+    # NB: don't unpack into `milestones` — that would overwrite the query
+    # parameter (a comma-separated string) with the template dict.
+    project, pms, ms_templates, resp_by_q, resp_by_sub, ss_by_sub = _load_project_data(db, project_id)
     if milestones:
         ms_nums = [int(x.strip()) for x in milestones.split(',') if x.strip().isdigit()]
         if ms_nums:
@@ -620,7 +622,7 @@ def export_pdf(project_id: int, milestones: str = None, db: Session = Depends(ge
 
     # ── Milestone pages ───────────────────────────────────────────────────────
     for pm in pms:
-        ms = milestones.get(pm.num)
+        ms = ms_templates.get(pm.num)
         if not ms: continue
 
         # Milestone header — use CustomMilestone.status (actual configured value)
