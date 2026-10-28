@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, List, Any
 from datetime import datetime
 
@@ -76,10 +76,28 @@ class ProjectOut(BaseModel):
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     client: Optional[str] = None
+    business_unit: Optional[str] = None
+    owner: Optional[str] = None
+    location: Optional[str] = None
+    project_type: Optional[str] = None
+    project_category: Optional[str] = None
+    functional_consultant: Optional[str] = None
+    technical_lead: Optional[str] = None
+    description: Optional[str] = None
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
     status: Optional[str] = None
     progress: Optional[float] = None
     billing_amount: Optional[float] = None
-    project_category: Optional[str] = None
+
+    # The Edit Project form sends "" for an empty date input; treat that as
+    # "no date" instead of failing validation.
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _blank_date_to_none(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 # ── Questions & Responses ─────────────────────────────────────────────────────
 class QuestionOut(BaseModel):

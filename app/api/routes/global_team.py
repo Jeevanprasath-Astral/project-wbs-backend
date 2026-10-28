@@ -37,19 +37,24 @@ class UserCreate(BaseModel):
     email: str
     role: str
     password: str = "wbs123"
-    department: Optional[str] = None
-    phone: Optional[str] = None
+    # department / phone removed — the User model has no such columns, so the
+    # values were silently discarded.
     team_id: Optional[int] = None
+    cost_rate: Optional[float] = 0.0
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     role: Optional[str] = None
     password: Optional[str] = None
     is_active: Optional[bool] = None
-    department: Optional[str] = None
-    phone: Optional[str] = None
     team_id: Optional[int] = None
     cost_rate: Optional[float] = None
+
+class CustomRoleCreate(BaseModel):
+    name: Optional[str] = None
+
+class AssignmentCategoryCreate(BaseModel):
+    name: Optional[str] = None
 
 class TeamCreate(BaseModel):
     name: str
@@ -245,7 +250,8 @@ def create_user(
     u = User(
         name=payload.name, email=payload.email,
         password_hash=hash_password(payload.password),
-        role=payload.role, is_active=True, team_id=payload.team_id
+        role=payload.role, is_active=True, team_id=payload.team_id,
+        cost_rate=payload.cost_rate or 0.0,
     )
     db.add(u); db.commit(); db.refresh(u)
     log_action(db, actor=current_user.name, action="create_user",
@@ -476,10 +482,10 @@ def list_custom_roles(db: Session = Depends(get_db), current_user: User = Depend
     return [{"id": r.id, "name": r.name} for r in db.query(CustomRole).order_by(CustomRole.name).all()]
 
 @_roles_router.post("")
-def create_custom_role(payload: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def create_custom_role(payload: CustomRoleCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if not is_team_manager(current_user):
         raise HTTPException(403, "Only Admin or HR can create roles")
-    name = (payload.get("name") or "").strip()
+    name = (payload.name or "").strip()
     if not name:
         raise HTTPException(400, "Role name required")
     if db.query(CustomRole).filter_by(name=name).first():
@@ -496,8 +502,8 @@ def list_assignment_categories(db: Session = Depends(get_db), current_user: User
     return [{"id": c.id, "name": c.name} for c in db.query(AssignmentCategory).order_by(AssignmentCategory.name).all()]
 
 @_cats_router.post("")
-def create_assignment_category(payload: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    name = (payload.get("name") or "").strip()
+def create_assignment_category(payload: AssignmentCategoryCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    name = (payload.name or "").strip()
     if not name:
         raise HTTPException(400, "Category name required")
     if db.query(AssignmentCategory).filter_by(name=name).first():

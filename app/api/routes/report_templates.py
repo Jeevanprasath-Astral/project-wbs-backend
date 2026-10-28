@@ -30,6 +30,10 @@ class TemplateCreate(BaseModel):
 class TemplateUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    # When provided, replaces the template's full item list. Omit to leave
+    # the items untouched. Milestones the template was already applied to
+    # are unaffected (copy-on-apply).
+    items: Optional[List[TemplateItemIn]] = None
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -97,6 +101,41 @@ def create_template(
             report_name=item.report_name,
             department=item.department,
         ))
+    db.commit()
+    db.refresh(t)
+    return _build(t)
+
+
+@router.patch("/{template_id}")
+def update_template(
+    template_id: int,
+    payload: TemplateUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    t = db.query(ReportTemplate).filter_by(id=template_id).first()
+    if not t:
+        raise HTTPException(404, "Template not found")
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(400, "Template name required")
+        clash = db.query(ReportTemplate).filter(
+            ReportTemplate.name == name, ReportTemplate.id != template_id).first()
+        if clash:
+            raise HTTPException(400, f"A template named '{name}' already exists")
+        t.name = name
+    if payload.description is not None:
+        t.description = payload.description
+    if payload.items is not None:
+        t.items.clear()          # delete-orphan cascade removes old rows
+        db.flush()
+        for item in payload.items:
+            t.items.append(ReportTemplateItem(
+                report_number=item.report_number,
+                report_name=item.report_name,
+                department=item.department,
+            ))
     db.commit()
     db.refresh(t)
     return _build(t)

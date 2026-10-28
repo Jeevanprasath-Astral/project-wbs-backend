@@ -555,6 +555,7 @@ class TaskCreate(BaseModel):
     actual_end: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    notes: Optional[str] = None
     estimated_hours: Optional[float] = None
 
 class TaskUpdate(BaseModel):
@@ -1453,6 +1454,7 @@ def add_task(
                     planned_start=_parse_dt(payload.planned_start), planned_end=_parse_dt(payload.planned_end),
                     actual_start=_parse_dt(payload.actual_start), actual_end=_parse_dt(payload.actual_end),
                     start_time=payload.start_time, end_time=payload.end_time,
+                    notes=payload.notes,
                     estimated_hours=payload.estimated_hours or 0.0)
     db.add(ct); db.commit(); db.refresh(ct)
     if ct.assignee:

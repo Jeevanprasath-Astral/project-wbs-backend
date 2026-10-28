@@ -191,6 +191,9 @@ class GlobalAssignmentCreate(BaseModel):
     priority: str = "Medium"
     status: Optional[str] = "Not Started"
     due_date: Optional[datetime] = None
+    # Parity with the per-project AssignmentCreate (assignments.py).
+    planned_start: Optional[datetime] = None
+    planned_end: Optional[datetime] = None
     remarks: Optional[str] = None
     category: Optional[str] = None
 
@@ -229,6 +232,8 @@ def create_global_assignment(
         priority=payload.priority,
         status=payload.status or "Not Started",
         due_date=payload.due_date,
+        planned_start=payload.planned_start,
+        planned_end=payload.planned_end,
         remarks=payload.remarks,
         category=payload.category,
     )
@@ -287,7 +292,13 @@ class GlobalAssignmentUpdate(BaseModel):
     priority: Optional[str] = None
     status: Optional[str] = None
     due_date: Optional[datetime] = None
+    # Parity with the per-project AssignmentUpdate (assignments.py).
+    planned_start: Optional[datetime] = None
+    planned_end: Optional[datetime] = None
+    actual_start: Optional[datetime] = None
+    actual_end: Optional[datetime] = None
     remarks: Optional[str] = None
+    category: Optional[str] = None
 
 
 @router.patch("/assignments/{assignment_id}")

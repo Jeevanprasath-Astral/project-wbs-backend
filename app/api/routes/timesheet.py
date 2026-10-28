@@ -34,6 +34,12 @@ class HolidayCreate(BaseModel):
     name: str
     project_id: Optional[int] = None
 
+class HolidayUpdate(BaseModel):
+    date: Optional[str] = None
+    name: Optional[str] = None
+    # Send project_id: null explicitly to make the holiday apply to all projects.
+    project_id: Optional[int] = None
+
 @router.get("/holidays")
 def list_holidays(project_id: Optional[int] = None, db: Session = Depends(get_db),
                    current_user: User = Depends(get_current_user)):
@@ -50,6 +56,22 @@ def create_holiday(payload: HolidayCreate, db: Session = Depends(get_db),
         raise HTTPException(403, "Only Admin or HR can manage holidays")
     h = Holiday(date=_parse_date(payload.date), name=payload.name, project_id=payload.project_id)
     db.add(h); db.commit(); db.refresh(h)
+    return {"id": h.id, "date": h.date, "name": h.name, "project_id": h.project_id}
+
+@router.patch("/holidays/{holiday_id}")
+def update_holiday(holiday_id: int, payload: HolidayUpdate, db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_user)):
+    if not is_timesheet_manager(current_user):
+        raise HTTPException(403, "Only Admin or HR can manage holidays")
+    h = db.query(Holiday).filter_by(id=holiday_id).first()
+    if not h: raise HTTPException(404, "Holiday not found")
+    if payload.date:
+        h.date = _parse_date(payload.date)
+    if payload.name:
+        h.name = payload.name
+    if "project_id" in payload.model_fields_set:
+        h.project_id = payload.project_id
+    db.commit(); db.refresh(h)
     return {"id": h.id, "date": h.date, "name": h.name, "project_id": h.project_id}
 
 @router.delete("/holidays/{holiday_id}")

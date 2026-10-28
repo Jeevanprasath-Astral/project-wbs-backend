@@ -1093,17 +1093,20 @@ def archive_proposal_v2(
 # ── Admin: force-status override ──────────────────────────────────────────────
 _VALID_STATUSES = {"Draft", "Submitted", "Approved", "Rejected", "Archived"}
 
+class ForceStatusUpdate(BaseModel):
+    status: Optional[str] = None
+
 @router.patch("/proposal-estimates/{proposal_id}/force-status")
 def force_proposal_status(
     proposal_id: int,
-    payload: dict,
+    payload: ForceStatusUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Admin / Project Manager: directly set any proposal status (e.g. Archived → Approved)."""
     if current_user.role not in {"Admin", "Project Manager"}:
         raise HTTPException(403, "Only Admin or Project Manager can override proposal status")
-    new_status = (payload.get("status") or "").strip()
+    new_status = (payload.status or "").strip()
     if new_status not in _VALID_STATUSES:
         raise HTTPException(400, f"status must be one of: {', '.join(sorted(_VALID_STATUSES))}")
     p = db.query(ProposalEstimate).filter_by(id=proposal_id).first()

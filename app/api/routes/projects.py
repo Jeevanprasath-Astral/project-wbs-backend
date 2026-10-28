@@ -38,6 +38,9 @@ class StatusReportRequest(BaseModel):
     completed_this_week: Optional[str] = ""
     plan_next_week: Optional[str] = ""
 
+class AddExistingMemberRequest(BaseModel):
+    user_id: Optional[int] = None
+
 class IssueCreate(BaseModel):
     issue_name: str
     issue_date: str          # YYYY-MM-DD string
@@ -300,8 +303,18 @@ def update_project(project_id: int, payload: ProjectUpdate, db: Session = Depend
     p = db.query(Project).filter_by(id=project_id).first()
     if not p:
         raise HTTPException(404, "Project not found")
-    for k, v in payload.model_dump(exclude_none=True).items():
+    # Only touch fields the client actually sent. Dates may be cleared
+    # (sent as "" -> None); every other field ignores None as before.
+    clearable = {"start_date", "end_date"}
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        if v is None and k not in clearable:
+            continue
         setattr(p, k, v)
+    # Only validate when this request touched a date, so old rows with a bad
+    # range can still have their status etc. updated.
+    if clearable & payload.model_fields_set and p.start_date and p.end_date and \
+            p.end_date.replace(tzinfo=None) < p.start_date.replace(tzinfo=None):
+        raise HTTPException(400, "End date cannot be before start date")
     log_action(db, actor=current_user.name, action="update",
                description="Project updated", project_id=project_id,
                entity_type="project", entity_id=project_id, user_id=current_user.id)
@@ -340,11 +353,11 @@ def get_all_users(project_id: int, db: Session = Depends(get_db), current_user: 
     return [{"id": u.id, "name": u.name, "email": u.email, "role": u.role} for u in users]
 
 @router.post("/{project_id}/team/add-existing")
-def add_existing_member(project_id: int, payload: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def add_existing_member(project_id: int, payload: AddExistingMemberRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Add an existing user to the project."""
     if not is_team_manager(current_user):
         raise HTTPException(403, "Only Admin or HR can add team members")
-    user_id = payload.get("user_id")
+    user_id = payload.user_id
     user = db.query(User).filter_by(id=user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
