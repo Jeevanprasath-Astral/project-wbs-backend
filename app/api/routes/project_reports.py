@@ -159,6 +159,85 @@ def _milestone_budgeted_hours(db: Session, ms_id: int) -> float:
     return round(float(task_hrs or 0), 2)
 
 
+def _bulk_milestone_hours(db: Session, ms_ids):
+    """Budgeted and actual hours for many milestones in a fixed number of
+    queries (instead of 5 queries per milestone).
+
+    Returns (budgeted, actual) dicts keyed by milestone id. Values match
+    _milestone_budgeted_hours / _milestone_actual_hours exactly: each
+    WorkHours row is counted once per milestone whose tree it belongs to.
+    """
+    ms_ids = list({i for i in ms_ids if i is not None})
+    if not ms_ids:
+        return {}, {}
+
+    budgeted = {mid: 0.0 for mid in ms_ids}
+    for mid, total in db.query(
+            CustomTask.milestone_id,
+            func.coalesce(func.sum(CustomTask.estimated_hours), 0.0))\
+            .filter(CustomTask.milestone_id.in_(ms_ids))\
+            .group_by(CustomTask.milestone_id).all():
+        budgeted[mid] = round(float(total or 0), 2)
+
+    # id -> milestone_id maps for each level of the hierarchy
+    task_ms = dict(db.query(CustomTask.id, CustomTask.milestone_id)
+                   .filter(CustomTask.milestone_id.in_(ms_ids)).all())
+    sub_ms = dict(db.query(CustomSubtask.id, CustomTask.milestone_id)
+                  .join(CustomTask, CustomSubtask.task_id == CustomTask.id)
+                  .filter(CustomTask.milestone_id.in_(ms_ids)).all())
+    act_ms = dict(db.query(Activity.id, CustomTask.milestone_id)
+                  .join(CustomSubtask, Activity.subtask_id == CustomSubtask.id)
+                  .join(CustomTask, CustomSubtask.task_id == CustomTask.id)
+                  .filter(CustomTask.milestone_id.in_(ms_ids)).all())
+
+    task_sq = db.query(CustomTask.id).filter(CustomTask.milestone_id.in_(ms_ids))
+    sub_sq = db.query(CustomSubtask.id).join(
+        CustomTask, CustomSubtask.task_id == CustomTask.id).filter(
+        CustomTask.milestone_id.in_(ms_ids))
+    act_sq = db.query(Activity.id).join(
+        CustomSubtask, Activity.subtask_id == CustomSubtask.id).join(
+        CustomTask, CustomSubtask.task_id == CustomTask.id).filter(
+        CustomTask.milestone_id.in_(ms_ids))
+    wh_rows = db.query(WorkHours.custom_milestone_id, WorkHours.custom_task_id,
+                       WorkHours.custom_subtask_id, WorkHours.activity_id,
+                       WorkHours.hours_spent, WorkHours.buffer_hours).filter(or_(
+        WorkHours.custom_milestone_id.in_(ms_ids),
+        WorkHours.custom_task_id.in_(task_sq.scalar_subquery()),
+        WorkHours.custom_subtask_id.in_(sub_sq.scalar_subquery()),
+        WorkHours.activity_id.in_(act_sq.scalar_subquery()),
+    )).all()
+
+    ms_set = set(ms_ids)
+    actual_raw = {mid: 0.0 for mid in ms_ids}
+    for cm_id, t_id, s_id, a_id, h, b in wh_rows:
+        hrs = max((h or 0.0) - (b or 0.0), 0.0)
+        targets = set()
+        if cm_id in ms_set:  targets.add(cm_id)
+        if t_id in task_ms:  targets.add(task_ms[t_id])
+        if s_id in sub_ms:   targets.add(sub_ms[s_id])
+        if a_id in act_ms:   targets.add(act_ms[a_id])
+        for mid in targets:
+            actual_raw[mid] += hrs
+    actual = {mid: round(v, 2) for mid, v in actual_raw.items()}
+    return budgeted, actual
+
+
+def _user_role_map(db: Session) -> dict:
+    """lower(name) -> role for every user, so the Team column needs no
+    per-row query. Mirrors the old case-insensitive ILIKE lookup."""
+    roles = {}
+    for name, role in db.query(User.name, User.role).order_by(User.id).all():
+        if name:
+            roles.setdefault(name.lower(), role or "")
+    return roles
+
+
+def _team_of(role_map: dict, assignee: Optional[str]) -> str:
+    if not assignee:
+        return ""
+    return role_map.get(assignee.strip().lower(), "")
+
+
 def _parse_date(s: Optional[str]):
     if not s:
         return None
@@ -199,20 +278,25 @@ def budgeted_vs_actual_report(
     milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
 
     # Team filter — resolve assignee → user → team name, then compare
+    role_map = _user_role_map(db)
     if team:
         milestones = [
             ms for ms in milestones
-            if _assignee_team(db, ms.assignee) == team
+            if _team_of(role_map, ms.assignee) == team
         ]
+
+    project_ids = list({ms.project_id for ms in milestones})
+    projects_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(project_ids)).all()} if project_ids else {}
+    budgeted_map, actual_map = _bulk_milestone_hours(db, [ms.id for ms in milestones])
 
     headers = ["Individual Name", "Project", "Team", "Start Date", "End Date",
                "Budgeted Hours", "Actual Hours", "Difference", "Status"]
     rows = []
     for ms in milestones:
-        project = db.query(Project).filter_by(id=ms.project_id).first()
-        team_name = _assignee_team(db, ms.assignee)
-        budgeted = _milestone_budgeted_hours(db, ms.id)
-        actual   = _milestone_actual_hours(db, ms.id)
+        project = projects_map.get(ms.project_id)
+        team_name = _team_of(role_map, ms.assignee)
+        budgeted = budgeted_map.get(ms.id, 0.0)
+        actual   = actual_map.get(ms.id, 0.0)
         difference = round(budgeted - actual, 2)
         rows.append([
             ms.assignee or "—",
@@ -276,11 +360,14 @@ def timeline_report(
 
     milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
 
+    project_ids = list({ms.project_id for ms in milestones})
+    projects_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(project_ids)).all()} if project_ids else {}
+
     headers = ["Milestone", "Project", "Planned End Date", "Actual End Date",
                "Schedule Variance Reason", "Status"]
     rows = []
     for ms in milestones:
-        project = db.query(Project).filter_by(id=ms.project_id).first()
+        project = projects_map.get(ms.project_id)
         rows.append([
             ms.name,
             project.name if project else "—",
@@ -334,19 +421,21 @@ def budgeted_vs_actual_data(
 
     milestones = q.order_by(CustomMilestone.project_id, CustomMilestone.num).all()
 
+    role_map = _user_role_map(db)
     if team:
-        milestones = [ms for ms in milestones if _assignee_team(db, ms.assignee) == team]
+        milestones = [ms for ms in milestones if _team_of(role_map, ms.assignee) == team]
 
-    # Pre-fetch all projects in one query to avoid N+1
+    # Pre-fetch projects and all milestone hours in a fixed number of queries
     project_ids = list({ms.project_id for ms in milestones})
     projects_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(project_ids)).all()} if project_ids else {}
+    budgeted_map, actual_map = _bulk_milestone_hours(db, [ms.id for ms in milestones])
 
     rows = []
     for ms in milestones:
         proj = projects_map.get(ms.project_id)
-        team_name = _assignee_team(db, ms.assignee)
-        budgeted  = _milestone_budgeted_hours(db, ms.id)
-        actual    = _milestone_actual_hours(db, ms.id)
+        team_name = _team_of(role_map, ms.assignee)
+        budgeted  = budgeted_map.get(ms.id, 0.0)
+        actual    = actual_map.get(ms.id, 0.0)
         rows.append({
             "individual_name":  ms.assignee or "—",
             "project":          proj.name if proj else "—",

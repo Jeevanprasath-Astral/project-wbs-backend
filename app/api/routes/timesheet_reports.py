@@ -40,6 +40,20 @@ from app.db.database import get_db
 from app.models.models import WorkHours, LeaveRequest, Permission, Holiday, User, Project
 from app.core.deps import get_current_user
 
+
+# ── Bulk lookups (avoid one query per row) ───────────────────────────────────
+def _project_names(db: Session, ids) -> dict:
+    ids = {i for i in ids if i}
+    if not ids:
+        return {}
+    return dict(db.query(Project.id, Project.name).filter(Project.id.in_(ids)).all())
+
+def _user_names(db: Session, ids) -> dict:
+    ids = {i for i in ids if i}
+    if not ids:
+        return {}
+    return dict(db.query(User.id, User.name).filter(User.id.in_(ids)).all())
+
 router = APIRouter(prefix="/timesheet/reports", tags=["Timesheet Reports"])
 
 MIN_DAILY_HOURS = 7.0
@@ -187,12 +201,13 @@ def individual_time_report(start_date: Optional[str] = None, end_date: Optional[
     elif is_billable is not None: q = q.filter(WorkHours.is_billable == is_billable)
     entries = q.order_by(WorkHours.date).all()
 
+    proj_names = _project_names(db, (w.project_id for w in entries))
     rows = []
     for w in entries:
-        project = db.query(Project).filter_by(id=w.project_id).first() if w.project_id else None
+        pname = proj_names.get(w.project_id) if w.project_id else None
         values = {
             "start_date": str(w.date), "end_date": str(w.date),
-            "project": project.name if project else "📋 General",
+            "project": pname if pname is not None else "📋 General",
             "billable": w.work_type if w.work_type else ("Billable" if (w.is_billable if w.is_billable is not None else True) else "Non-Billable"),
             "hours": w.hours_spent or 0,
         }
@@ -217,12 +232,13 @@ def leave_report(start_date: Optional[str] = None, end_date: Optional[str] = Non
     if user_id: q = q.filter(LeaveRequest.user_id == user_id)
     leaves = q.order_by(LeaveRequest.date_from).all()
 
+    names = _user_names(db, (l.user_id for l in leaves))
     rows = []
     for l in leaves:
-        u = db.query(User).filter_by(id=l.user_id).first()
+        uname = names.get(l.user_id)
         days = (l.date_to - l.date_from).days + 1 if l.date_from and l.date_to else 0
         values = {
-            "employee": u.name if u else "—",
+            "employee": uname if uname is not None else "—",
             "leave_reason": l.reason,
             "leave_start_date": str(l.date_from) if l.date_from else "—",
             "leave_end_date": str(l.date_to) if l.date_to else "—",
@@ -242,7 +258,9 @@ def overtime_report(start_date: Optional[str] = None, end_date: Optional[str] = 
     start, end = _resolve_range(start_date, end_date)
     keys, headers = _resolve_columns("overtime", columns)
 
-    q = db.query(WorkHours).filter(WorkHours.date >= start, WorkHours.date <= end)
+    # Only the three columns needed — avoids building full ORM objects.
+    q = db.query(WorkHours.user_id, WorkHours.date, WorkHours.hours_spent)\
+        .filter(WorkHours.date >= start, WorkHours.date <= end)
     if user_id: q = q.filter(WorkHours.user_id == user_id)
     if project_id: q = q.filter(WorkHours.project_id == project_id)
     entries = q.all()
@@ -254,12 +272,13 @@ def overtime_report(start_date: Optional[str] = None, end_date: Optional[str] = 
         key = (w.user_id, w.date)
         totals[key] = totals.get(key, 0) + (w.hours_spent or 0)
 
+    names = _user_names(db, (uid for (uid, d), h in totals.items() if h > MIN_DAILY_HOURS))
     rows = []
     for (uid, d), hours in sorted(totals.items(), key=lambda kv: kv[0][1]):
         if hours > MIN_DAILY_HOURS:
-            u = db.query(User).filter_by(id=uid).first()
+            uname = names.get(uid)
             values = {
-                "employee": u.name if u else "—",
+                "employee": uname if uname is not None else "—",
                 "start_date": str(d), "end_date": str(d),
                 "hours_worked": round(hours, 2),
                 "overtime_hours": round(hours - MIN_DAILY_HOURS, 2),
@@ -305,10 +324,11 @@ def permission_report(start_date: Optional[str] = None, end_date: Optional[str] 
     if user_id: q = q.filter(Permission.user_id == user_id)
     perms = q.order_by(Permission.date).all()
 
+    names = _user_names(db, (p.user_id for p in perms))
     rows = []
     for p in perms:
-        u = db.query(User).filter_by(id=p.user_id).first()
-        values = {"employee": u.name if u else "—", "start_date": str(p.date), "end_date": str(p.date),
+        uname = names.get(p.user_id)
+        values = {"employee": uname if uname is not None else "—", "start_date": str(p.date), "end_date": str(p.date),
                   "hours": p.hours or 0, "permission_reason": p.reason}
         rows.append([values[k] for k in keys])
 

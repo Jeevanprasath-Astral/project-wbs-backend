@@ -47,6 +47,16 @@ def _compute_status(planned_date, actual_date, today):
     return "Delayed", delta
 
 
+def _load_related(db: Session, entries):
+    """Milestones and projects for a list of billing entries — two queries
+    total instead of one per distinct milestone/project."""
+    mids = {e.milestone_id for e in entries if e.milestone_id}
+    pids = {e.project_id for e in entries if e.project_id}
+    ms_cache = {m.id: m for m in db.query(CustomMilestone).filter(CustomMilestone.id.in_(mids)).all()} if mids else {}
+    proj_cache = {p.id: p for p in db.query(Project).filter(Project.id.in_(pids)).all()} if pids else {}
+    return ms_cache, proj_cache
+
+
 @router.get("/monthly-tracker")
 def monthly_billing_tracker(
     project_id:  Optional[int] = None,
@@ -68,15 +78,7 @@ def monthly_billing_tracker(
     entries = q.all()
 
     # Resolve planned_billing_date from milestone.planned_end
-    ms_cache = {}
-    proj_cache = {}
-    for e in entries:
-        if e.milestone_id and e.milestone_id not in ms_cache:
-            m = db.query(CustomMilestone).filter_by(id=e.milestone_id).first()
-            ms_cache[e.milestone_id] = m
-        if e.project_id and e.project_id not in proj_cache:
-            p = db.query(Project).filter_by(id=e.project_id).first()
-            proj_cache[e.project_id] = p
+    ms_cache, proj_cache = _load_related(db, entries)
 
     # Filter by start/end on planned_billing_date.
     # planned_end is a DateTime column — extract .date() so comparisons with date objects work.
@@ -180,15 +182,7 @@ def billing_status_report(
         q = q.filter(ProjectBilling.billing_type == billing_type)
     entries = q.all()
 
-    ms_cache   = {}
-    proj_cache = {}
-    for e in entries:
-        if e.milestone_id and e.milestone_id not in ms_cache:
-            m = db.query(CustomMilestone).filter_by(id=e.milestone_id).first()
-            ms_cache[e.milestone_id] = m
-        if e.project_id and e.project_id not in proj_cache:
-            p = db.query(Project).filter_by(id=e.project_id).first()
-            proj_cache[e.project_id] = p
+    ms_cache, proj_cache = _load_related(db, entries)
 
     rows = []
     for e in entries:

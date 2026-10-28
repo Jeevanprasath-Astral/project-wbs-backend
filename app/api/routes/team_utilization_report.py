@@ -122,8 +122,13 @@ def _aggregate(wh_rows, db):
     """
     user_summary = {}
     user_proj    = {}
-    rate_cache   = {}   # uid -> (user_obj, cost_rate)
-    proj_cache   = {}   # pid -> project_obj
+    # Preload every user / project referenced by these rows (2 queries total
+    # instead of one per distinct user and project).
+    uids = {wh.user_id for wh in wh_rows if wh.user_id is not None}
+    pids = {wh.project_id for wh in wh_rows if wh.project_id}
+    users = {u.id: u for u in db.query(User).filter(User.id.in_(uids)).all()} if uids else {}
+    proj_cache = {p.id: p for p in db.query(Project).filter(Project.id.in_(pids)).all()} if pids else {}
+    rate_cache = {}   # uid -> (user_obj, cost_rate)
 
     for wh in wh_rows:
         uid = wh.user_id
@@ -132,7 +137,7 @@ def _aggregate(wh_rows, db):
             continue
 
         if uid not in rate_cache:
-            u = db.query(User).filter_by(id=uid).first()
+            u = users.get(uid)
             rate_cache[uid] = (u, float(u.cost_rate or 0) if u else 0.0)
 
         u_obj, rate = rate_cache[uid]
@@ -154,12 +159,10 @@ def _aggregate(wh_rows, db):
 
         # ── per-user-project detail ───────────────────────────────────────────
         if pid:
-            if pid not in proj_cache:
-                proj_cache[pid] = db.query(Project).filter_by(id=pid).first()
             key = (uid, pid)
             if key not in user_proj:
                 user_proj[key] = {
-                    "user": u_obj, "project": proj_cache[pid],
+                    "user": u_obj, "project": proj_cache.get(pid),
                     "total": 0.0, "billable": 0.0, "manpower_cost": 0.0,
                 }
             user_proj[key]["total"]        += hrs

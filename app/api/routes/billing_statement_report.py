@@ -133,11 +133,12 @@ def billing_statement_export(
     proj_ids = list({e.project_id for e in entries})
     proj_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(proj_ids)).all()}
 
-    milestone_cache = {}  # mid -> name
-    for e in entries:
-        if e.milestone_id and e.milestone_id not in milestone_cache:
-            m = db.query(CustomMilestone.name).filter_by(id=e.milestone_id).first()
-            milestone_cache[e.milestone_id] = m.name if m else None
+    # mid -> name, loaded in one query
+    mids = {e.milestone_id for e in entries if e.milestone_id}
+    milestone_cache = dict(
+        db.query(CustomMilestone.id, CustomMilestone.name)
+          .filter(CustomMilestone.id.in_(mids)).all()
+    ) if mids else {}
 
     # ── Group entries by project ──────────────────────────────────────────────
     proj_entries = {}   # {pid: [entry, ...]}
@@ -371,22 +372,16 @@ def billing_statement_data(
     proj_ids = list({e.project_id for e in entries})
     proj_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(proj_ids)).all()}
 
+    # Milestone name + planned_end (planned_date fallback) in one query
+    mids = {e.milestone_id for e in entries if e.milestone_id}
     milestone_cache = {}
-    for e in entries:
-        if e.milestone_id and e.milestone_id not in milestone_cache:
-            m = db.query(CustomMilestone.name).filter_by(id=e.milestone_id).first()
-            milestone_cache[e.milestone_id] = m.name if m else None
-
-    # Build milestone planned_end cache for planned_date fallback
     milestone_planned_end_cache = {}
-    for e in entries:
-        if e.milestone_id and e.milestone_id not in milestone_planned_end_cache:
-            m = db.query(CustomMilestone).filter_by(id=e.milestone_id).first()
-            if m and m not in milestone_cache:
-                milestone_cache[e.milestone_id] = m.name if m else None
-            milestone_planned_end_cache[e.milestone_id] = (
-                str(m.planned_end.date()) if m and m.planned_end else None
-            )
+    if mids:
+        for mid, name, planned_end in db.query(
+                CustomMilestone.id, CustomMilestone.name, CustomMilestone.planned_end
+        ).filter(CustomMilestone.id.in_(mids)).all():
+            milestone_cache[mid] = name
+            milestone_planned_end_cache[mid] = str(planned_end.date()) if planned_end else None
 
     proj_entries = {}
     for e in entries:

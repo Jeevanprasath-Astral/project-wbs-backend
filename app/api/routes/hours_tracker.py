@@ -88,12 +88,19 @@ def _aggregate(db, start, end, user_id=None, project_id=None):
     if user_id: perm_q = perm_q.filter(Permission.user_id == user_id)
     perm_rows = perm_q.all()
 
+    # ── Preload users / projects referenced above (2 queries in total) ──────
+    _uids = ({wh.user_id for wh in wh_rows} | {lv.user_id for lv in leave_rows}
+             | {pr.user_id for pr in perm_rows}) - {None}
+    _pids = {wh.project_id for wh in wh_rows} - {None}
+    user_map = {u.id: u for u in db.query(User).filter(User.id.in_(_uids)).all()} if _uids else {}
+    project_map = {p.id: p for p in db.query(Project).filter(Project.id.in_(_pids)).all()} if _pids else {}
+
     # ── Build individual map ──────────────────────────────────────────────────
     ind = {}  # uid -> {user, metrics}
 
     def _ensure_user(uid):
         if uid not in ind:
-            u = db.query(User).filter_by(id=uid).first()
+            u = user_map.get(uid)
             ind[uid] = {
                 'user': u,
                 'billable': 0.0, 'non_billable': 0.0,
@@ -129,7 +136,7 @@ def _aggregate(db, start, end, user_id=None, project_id=None):
 
     def _ensure_proj(pid):
         if pid not in proj:
-            p = db.query(Project).filter_by(id=pid).first()
+            p = project_map.get(pid)
             proj[pid] = {
                 'project': p,
                 'billable': 0.0, 'non_billable': 0.0,

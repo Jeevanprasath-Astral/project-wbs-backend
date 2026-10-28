@@ -235,7 +235,9 @@ def _run_lightweight_migrations():
         "CREATE INDEX IF NOT EXISTS ix_activities_project_id         ON activities(project_id)",
         # Notifications: the bell-icon unread count hits this on every page load.
         "CREATE INDEX IF NOT EXISTS ix_notifications_user_id         ON notifications(user_id)",
-        "CREATE INDEX IF NOT EXISTS ix_notifications_is_read         ON notifications(is_read)",
+        # Column is named "read" (not is_read) — the old statement failed on
+        # every startup, so this index never existed.
+        'CREATE INDEX IF NOT EXISTS ix_notifications_user_read      ON notifications(user_id, "read")',
         # ── Milestone Config Redesign (Task Form Fields) ──────────────────────
         # TaskFormField replaces the Subtask → Question hierarchy. Each Task now
         # has a flat list of form fields (section_name = former subtask name).
@@ -518,6 +520,18 @@ def _run_lightweight_migrations():
         # Write-guard middleware blocks all non-GET requests for demo JWTs.
         "ALTER TABLE users    ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT FALSE",
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT FALSE",
+        # ── Performance: indexes for the Reports module ───────────────────────
+        # Every timesheet / hours / utilization / profitability report filters
+        # work_hours by date range; billing and cost reports filter by project.
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_date               ON work_hours(date)",
+        "CREATE INDEX IF NOT EXISTS ix_work_hours_user_date          ON work_hours(user_id, date)",
+        "CREATE INDEX IF NOT EXISTS ix_project_billings_project_id   ON project_billings(project_id)",
+        "CREATE INDEX IF NOT EXISTS ix_project_billings_milestone_id ON project_billings(milestone_id)",
+        "CREATE INDEX IF NOT EXISTS ix_project_costs_project_date    ON project_costs(project_id, date)",
+        "CREATE INDEX IF NOT EXISTS ix_leave_requests_user_id        ON leave_requests(user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_permissions_user_date         ON permissions(user_id, date)",
+        "CREATE INDEX IF NOT EXISTS ix_holidays_date                 ON holidays(date)",
+        "CREATE INDEX IF NOT EXISTS ix_project_members_project_id    ON project_members(project_id)",
     ]
     for stmt in statements:
         try:

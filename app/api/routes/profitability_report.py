@@ -14,11 +14,20 @@ Formulas:
   Net Margin %       = Net Profit / Billing Amount × 100   (blank if Billing = 0)
   Labor Yield %      = (Billing − Direct Expenses) / Manpower Cost × 100  (blank if Manpower Cost = 0)
   Utilization %      = Billable Hours / Total Hours × 100  (blank if Total Hours = 0)
+
+Date filter (start_date / end_date, both optional, inclusive):
+  Hours & Manpower Cost → work_hours.date
+  Direct / Indirect     → project_costs.date
+  Billing               → actual_billing_date, else the linked milestone's
+                          planned_end (the Planned Billing Date). Entries with
+                          neither date are excluded when a date filter is set.
+  No dates → all-time figures (previous behaviour).
 """
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, case
+from datetime import date as date_cls
 from typing import Optional
 from io import BytesIO
 import openpyxl
@@ -27,7 +36,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from sqlalchemy import or_, and_
 
 from app.db.database import get_db
-from app.models.models import Project, WorkHours, ProjectCost, User, ProjectBilling
+from app.models.models import Project, WorkHours, ProjectCost, User, ProjectBilling, CustomMilestone
 from app.core.deps import get_current_user
 
 router = APIRouter(prefix="/profitability-report", tags=["Profitability Report"])
@@ -129,70 +138,113 @@ def _pct(numerator, denominator, decimals=1):
 
 
 # ── Core calculation helper ───────────────────────────────────────────────────
-def _project_metrics(db: Session, project: Project):
-    """Compute all profitability metrics for one project."""
-    pid = project.id
+def _parse_date(v: Optional[str]):
+    if not v:
+        return None
+    try:
+        return date_cls.fromisoformat(v)
+    except ValueError:
+        raise HTTPException(400, f"Invalid date format '{v}' — use YYYY-MM-DD")
 
-    # ── Hours ────────────────────────────────────────────────────────────────
-    total_hours = db.query(func.coalesce(func.sum(WorkHours.hours_spent), 0.0))\
-        .filter(WorkHours.project_id == pid).scalar() or 0.0
 
-    # Count as billable: explicit work_type='Billable' OR legacy records where
-    # work_type is NULL but is_billable=True (stored before work_type field existed).
-    billable_hours = db.query(func.coalesce(func.sum(WorkHours.hours_spent), 0.0))\
-        .filter(
-            WorkHours.project_id == pid,
-            or_(
-                WorkHours.work_type == 'Billable',
-                and_(WorkHours.work_type.is_(None), WorkHours.is_billable == True)
-            )
-        ).scalar() or 0.0
+def _empty_totals():
+    return {"total_hours": 0.0, "billable_hours": 0.0, "manpower_cost": 0.0,
+            "direct_expenses": 0.0, "indirect_cost": 0.0, "billing": 0.0}
 
-    # ── Manpower Cost = SUM(hours × user.cost_rate) ──────────────────────────
-    # Join WorkHours → User to get each entry's rate, then aggregate.
-    manpower_cost = 0.0
-    wh_rows = db.query(WorkHours.hours_spent, WorkHours.user_id)\
-        .filter(WorkHours.project_id == pid).all()
-    user_rate_cache = {}
-    for hours, uid in wh_rows:
-        if uid not in user_rate_cache:
-            u = db.query(User.cost_rate).filter_by(id=uid).first()
-            user_rate_cache[uid] = float(u.cost_rate or 0) if u else 0.0
-        manpower_cost += float(hours or 0) * user_rate_cache[uid]
 
-    # ── Cost entries ─────────────────────────────────────────────────────────
-    all_costs = db.query(ProjectCost).filter_by(project_id=pid).all()
-    direct_expenses  = sum(c.cost for c in all_costs if c.category != INDIRECT_CATEGORY)
-    indirect_cost    = sum(c.cost for c in all_costs if c.category == INDIRECT_CATEGORY)
+def _bulk_metrics(db: Session, project_ids, start=None, end=None) -> dict:
+    """Profitability metrics for many projects in 3 queries total
+    (previously 5+ queries per project). Returns {project_id: metrics}."""
+    pids = list({p for p in project_ids if p is not None})
+    raw = {pid: _empty_totals() for pid in pids}
+    if not pids:
+        return {}
 
-    # ── Derived KPIs ─────────────────────────────────────────────────────────
-    total_cost   = manpower_cost + direct_expenses + indirect_cost
-    # Billing = SUM of all ProjectBilling entries for this project.
-    # Falls back to 0 if no entries recorded yet.
-    billing = float(
-        db.query(func.coalesce(
-            func.sum(func.coalesce(ProjectBilling.actual_billing_amount,
-                                   ProjectBilling.planned_billing_amount)), 0.0))
-          .filter(ProjectBilling.project_id == pid).scalar() or 0.0
+    # ── Hours + Manpower Cost (one grouped query) ────────────────────────────
+    # Billable: explicit work_type='Billable' OR legacy rows where work_type is
+    # NULL but is_billable=True (stored before work_type existed).
+    billable_cond = or_(
+        WorkHours.work_type == 'Billable',
+        and_(WorkHours.work_type.is_(None), WorkHours.is_billable == True),
     )
-    net_profit   = billing - total_cost
-    margin_pct   = _pct(net_profit, billing)
-    recovery_pct = _pct(billing - direct_expenses, manpower_cost)
-    util_pct     = _pct(billable_hours, total_hours)
+    hq = (db.query(
+            WorkHours.project_id,
+            func.coalesce(func.sum(WorkHours.hours_spent), 0.0),
+            func.coalesce(func.sum(case((billable_cond, WorkHours.hours_spent), else_=0.0)), 0.0),
+            func.coalesce(func.sum(WorkHours.hours_spent * func.coalesce(User.cost_rate, 0.0)), 0.0),
+          )
+          .outerjoin(User, User.id == WorkHours.user_id)
+          .filter(WorkHours.project_id.in_(pids)))
+    if start: hq = hq.filter(WorkHours.date >= start)
+    if end:   hq = hq.filter(WorkHours.date <= end)
+    for pid, total, billable, manpower in hq.group_by(WorkHours.project_id).all():
+        raw[pid]["total_hours"]    = float(total or 0)
+        raw[pid]["billable_hours"] = float(billable or 0)
+        raw[pid]["manpower_cost"]  = float(manpower or 0)
 
+    # ── Cost entries (one grouped query) ─────────────────────────────────────
+    is_indirect = ProjectCost.category == INDIRECT_CATEGORY
+    cq = (db.query(
+            ProjectCost.project_id,
+            func.coalesce(func.sum(case((is_indirect, 0.0), else_=ProjectCost.cost)), 0.0),
+            func.coalesce(func.sum(case((is_indirect, ProjectCost.cost), else_=0.0)), 0.0),
+          )
+          .filter(ProjectCost.project_id.in_(pids)))
+    if start: cq = cq.filter(ProjectCost.date >= start)
+    if end:   cq = cq.filter(ProjectCost.date <= end)
+    for pid, direct, indirect in cq.group_by(ProjectCost.project_id).all():
+        raw[pid]["direct_expenses"] = float(direct or 0)
+        raw[pid]["indirect_cost"]   = float(indirect or 0)
+
+    # ── Billing (one query; date resolved in Python so it works the same on
+    # every database) — actual amount if billed, else the planned amount ──────
+    bq = (db.query(ProjectBilling.project_id,
+                   ProjectBilling.actual_billing_amount,
+                   ProjectBilling.planned_billing_amount,
+                   ProjectBilling.actual_billing_date,
+                   CustomMilestone.planned_end)
+          .outerjoin(CustomMilestone, CustomMilestone.id == ProjectBilling.milestone_id)
+          .filter(ProjectBilling.project_id.in_(pids)))
+    for pid, actual_amt, planned_amt, actual_dt, planned_end in bq.all():
+        if start or end:
+            bill_date = actual_dt or (planned_end.date() if planned_end else None)
+            if bill_date is None:
+                continue
+            if start and bill_date < start:
+                continue
+            if end and bill_date > end:
+                continue
+        amt = actual_amt if actual_amt is not None else planned_amt
+        if amt is not None:
+            raw[pid]["billing"] += float(amt)
+
+    return {pid: _derive(r) for pid, r in raw.items()}
+
+
+def _derive(r: dict) -> dict:
+    """Derived KPIs — same formulas as before."""
+    billing, manpower = r["billing"], r["manpower_cost"]
+    direct, indirect = r["direct_expenses"], r["indirect_cost"]
+    total_cost = manpower + direct + indirect
+    net_profit = billing - total_cost
     return {
         "billing":         _fmt(billing),
-        "total_hours":     _fmt(total_hours),
-        "billable_hours":  _fmt(billable_hours),
-        "util_pct":        util_pct,
-        "manpower_cost":   _fmt(manpower_cost),
-        "direct_expenses": _fmt(direct_expenses),
-        "indirect_cost":   _fmt(indirect_cost),
+        "total_hours":     _fmt(r["total_hours"]),
+        "billable_hours":  _fmt(r["billable_hours"]),
+        "util_pct":        _pct(r["billable_hours"], r["total_hours"]),
+        "manpower_cost":   _fmt(manpower),
+        "direct_expenses": _fmt(direct),
+        "indirect_cost":   _fmt(indirect),
         "total_cost":      _fmt(total_cost),
         "net_profit":      _fmt(net_profit),
-        "margin_pct":      margin_pct,
-        "recovery_pct":    recovery_pct,
+        "margin_pct":      _pct(net_profit, billing),
+        "recovery_pct":    _pct(billing - direct, manpower),
     }
+
+
+def _project_metrics(db: Session, project: Project, start=None, end=None):
+    """Single-project wrapper kept for compatibility."""
+    return _bulk_metrics(db, [project.id], start, end).get(project.id) or _derive(_empty_totals())
 
 
 # ── Report endpoint ───────────────────────────────────────────────────────────
@@ -219,9 +271,12 @@ def profitability_report_export(
         "Net Margin %", "Labor Yield %",
     ]
 
+    start, end = _parse_date(start_date), _parse_date(end_date)
+    metrics = _bulk_metrics(db, [p.id for p in projects], start, end)
+
     rows = []
     for p in projects:
-        m = _project_metrics(db, p)
+        m = metrics[p.id]
         rows.append([
             p.name,
             m["billing"],
@@ -267,9 +322,12 @@ def profitability_report_data(
         q = q.filter(Project.status == status)
     projects = q.order_by(Project.name).all()
 
+    start, end = _parse_date(start_date), _parse_date(end_date)
+    metrics = _bulk_metrics(db, [p.id for p in projects], start, end)
+
     rows = []
     for p in projects:
-        m = _project_metrics(db, p)
+        m = metrics[p.id]
         rows.append({
             "project":         p.name,
             "status":          p.status or "—",
