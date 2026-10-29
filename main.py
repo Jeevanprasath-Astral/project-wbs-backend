@@ -14,6 +14,7 @@ from app.api.routes import (auth, projects, milestones, responses,
                              billing_statement_report, hours_tracker,
                              report_templates, attachments, billing_reports,
                              da_project_reports, proposal_estimates,
+                             org_structure, billing_dashboard,
                              role_permissions, chat)
 from fastapi.staticfiles import StaticFiles
 from app.services.scheduler import start_scheduler, stop_scheduler
@@ -532,6 +533,11 @@ def _run_lightweight_migrations():
         "CREATE INDEX IF NOT EXISTS ix_permissions_user_date         ON permissions(user_id, date)",
         "CREATE INDEX IF NOT EXISTS ix_holidays_date                 ON holidays(date)",
         "CREATE INDEX IF NOT EXISTS ix_project_members_project_id    ON project_members(project_id)",
+        # ── Organisation structure (Group → Company → Division) ───────────────
+        # org_groups / companies / divisions are created by create_all();
+        # projects already exists, so its new FK column is added here.
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS division_id INTEGER REFERENCES divisions(id)",
+        "CREATE INDEX IF NOT EXISTS ix_projects_division_id          ON projects(division_id)",
     ]
     for stmt in statements:
         try:
@@ -912,7 +918,7 @@ for router in [auth, projects, milestones, responses, dashboard,
                billing_statement_report, hours_tracker,
                report_templates, attachments, billing_reports,
                da_project_reports, proposal_estimates,
-               role_permissions, chat]:
+               role_permissions, chat, org_structure, billing_dashboard]:
     app.include_router(router.router, prefix="/api")
 
 # Extra routers from global_team module (custom roles + assignment categories)

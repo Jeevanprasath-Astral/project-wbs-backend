@@ -51,6 +51,7 @@ class ProjectCreate(BaseModel):
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     billing_amount: Optional[float] = 0.0
+    division_id: Optional[int] = None
 
 class ProjectOut(BaseModel):
     id: int
@@ -70,6 +71,7 @@ class ProjectOut(BaseModel):
     progress: float
     budget: Optional[float] = 0.0
     billing_amount: Optional[float] = 0.0
+    division_id: Optional[int] = None
     created_at: Optional[datetime]
     model_config = {"from_attributes": True}
 
@@ -89,10 +91,12 @@ class ProjectUpdate(BaseModel):
     status: Optional[str] = None
     progress: Optional[float] = None
     billing_amount: Optional[float] = None
+    # Send null to unassign the project from its division.
+    division_id: Optional[int] = None
 
     # The Edit Project form sends "" for an empty date input; treat that as
     # "no date" instead of failing validation.
-    @field_validator("start_date", "end_date", mode="before")
+    @field_validator("start_date", "end_date", "division_id", mode="before")
     @classmethod
     def _blank_date_to_none(cls, v):
         if isinstance(v, str) and not v.strip():

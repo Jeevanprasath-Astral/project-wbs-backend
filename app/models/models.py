@@ -40,6 +40,36 @@ class Team(Base):
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
     members     = relationship("User", back_populates="team")
 
+# ── Organisation structure: Group → Company → Division → Project ───────────
+# Used by the Group Billing Dashboard to roll planned vs actual billing up
+# from milestones to the whole group. A project belongs to one Division
+# (Project.division_id); its Company and Group follow from that division.
+class OrgGroup(Base):
+    __tablename__ = "org_groups"
+    id         = Column(Integer, primary_key=True, index=True)
+    name       = Column(String(150), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    companies  = relationship("Company", back_populates="group", order_by="Company.name")
+
+class Company(Base):
+    __tablename__ = "companies"
+    __table_args__ = (UniqueConstraint("group_id", "name", name="uq_company_group_name"),)
+    id         = Column(Integer, primary_key=True, index=True)
+    group_id   = Column(Integer, ForeignKey("org_groups.id"), nullable=False, index=True)
+    name       = Column(String(150), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    group      = relationship("OrgGroup", back_populates="companies")
+    divisions  = relationship("Division", back_populates="company", order_by="Division.name")
+
+class Division(Base):
+    __tablename__ = "divisions"
+    __table_args__ = (UniqueConstraint("company_id", "name", name="uq_division_company_name"),)
+    id         = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    name       = Column(String(150), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    company    = relationship("Company", back_populates="divisions")
+
 # ── Password Reset Tokens ────────────────────────────────────────────────────
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
@@ -100,6 +130,9 @@ class Project(Base):
     # Demo flag — True for the dedicated demo project shown at /demo.
     # Demo users (is_demo=True) can only list/access projects with this flag set.
     is_demo                = Column(Boolean, default=False)
+    # Organisation structure — the Division this project belongs to (nullable
+    # until someone assigns it; unassigned projects are grouped separately).
+    division_id            = Column(Integer, ForeignKey("divisions.id"), nullable=True)
     created_by             = Column(Integer, ForeignKey("users.id"))
     created_at             = Column(DateTime(timezone=True), server_default=func.now())
     updated_at             = Column(DateTime(timezone=True), onupdate=func.now())
@@ -108,6 +141,7 @@ class Project(Base):
     notifications          = relationship("Notification",     back_populates="project", cascade="all, delete-orphan")
     audit_logs             = relationship("AuditLog",         back_populates="project", cascade="all, delete-orphan")
     costs                  = relationship("ProjectCost",      back_populates="project", cascade="all, delete-orphan")
+    division               = relationship("Division")
 
 class ProjectMember(Base):
     __tablename__ = "project_members"

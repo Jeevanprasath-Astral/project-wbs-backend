@@ -6,7 +6,7 @@ from app.models.models import (Project, ProjectMilestone, Milestone, User, Proje
                                CustomMilestone, CustomTask, CustomSubtask, SubtaskQuestion, SubtaskReport,
                                Activity, TaskFormField, MilestoneReport, ProjectReport, WorkHours,
                                SubtaskStatus, Response, Notification, AuditLog, ProjectCost,
-                               TaskAssignment, FinancialAuditLog, ProjectIssue)
+                               TaskAssignment, FinancialAuditLog, ProjectIssue, Division)
 from app.schemas.schemas import ProjectCreate, ProjectOut, ProjectUpdate
 from app.core.deps import get_current_user
 from app.core.permissions import is_team_manager, can_create_project
@@ -135,6 +135,8 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if not can_create_project(current_user):
         raise HTTPException(403, "Only Admin and Project Manager can create projects")
+    if payload.division_id is not None and not db.get(Division, payload.division_id):
+        raise HTTPException(400, "Division not found")
     project = Project(**payload.model_dump(), created_by=current_user.id, status="Not Started", progress=0.0)
     db.add(project)
     db.flush()
@@ -305,14 +307,16 @@ def update_project(project_id: int, payload: ProjectUpdate, db: Session = Depend
         raise HTTPException(404, "Project not found")
     # Only touch fields the client actually sent. Dates may be cleared
     # (sent as "" -> None); every other field ignores None as before.
-    clearable = {"start_date", "end_date"}
+    clearable = {"start_date", "end_date", "division_id"}
+    if payload.division_id is not None and not db.get(Division, payload.division_id):
+        raise HTTPException(400, "Division not found")
     for k, v in payload.model_dump(exclude_unset=True).items():
         if v is None and k not in clearable:
             continue
         setattr(p, k, v)
     # Only validate when this request touched a date, so old rows with a bad
     # range can still have their status etc. updated.
-    if clearable & payload.model_fields_set and p.start_date and p.end_date and \
+    if {"start_date", "end_date"} & payload.model_fields_set and p.start_date and p.end_date and \
             p.end_date.replace(tzinfo=None) < p.start_date.replace(tzinfo=None):
         raise HTTPException(400, "End date cannot be before start date")
     log_action(db, actor=current_user.name, action="update",
