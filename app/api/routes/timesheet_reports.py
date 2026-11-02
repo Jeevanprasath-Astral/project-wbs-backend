@@ -37,7 +37,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from app.db.database import get_db
-from app.models.models import WorkHours, LeaveRequest, Permission, Holiday, User, Project
+from app.models.models import WorkHours, LeaveRequest, Permission, Holiday, User, Project, CustomMilestone, CustomTask, MilestoneReport
 from app.core.deps import get_current_user
 
 
@@ -85,7 +85,9 @@ def _resolve_range(start_date: Optional[str] = None, end_date: Optional[str] = N
 # actual output order/selection is driven by the `columns` query param.
 REPORT_FIELDS = {
     "individual_time": [("start_date", "Start Date"), ("end_date", "End Date"), ("project", "Project"),
-                         ("billable", "Billable / Non-Billable"), ("hours", "Number of Hours")],
+                         ("milestone", "Milestone"), ("task", "Task"), ("description", "Description"),
+                         ("billable", "Billable / Non-Billable"), ("hours", "Number of Hours"),
+                         ("notes", "Notes")],
     "leave": [("employee", "Employee Name"), ("leave_reason", "Leave Reason"),
               ("leave_start_date", "Leave Start Date"), ("leave_end_date", "Leave End Date"),
               ("leave_days", "Leave Days")],
@@ -205,11 +207,38 @@ def individual_time_report(start_date: Optional[str] = None, end_date: Optional[
     rows = []
     for w in entries:
         pname = proj_names.get(w.project_id) if w.project_id else None
+
+        # Milestone: prefer CustomMilestone name; fallback to MilestoneReport name for DA/report-only projects
+        milestone_name = None
+        milestone_desc = None
+        if w.custom_milestone_id:
+            cm = db.query(CustomMilestone).filter_by(id=w.custom_milestone_id).first()
+            if cm:
+                milestone_name = cm.name
+                milestone_desc = cm.description
+        if not milestone_name and w.milestone_report_id:
+            mr = db.query(MilestoneReport).filter_by(id=w.milestone_report_id).first()
+            if mr:
+                milestone_name = mr.report_name  # report-only project: put report name in Milestone column
+
+        # Task: from CustomTask; leave empty for report-only projects (no task structure)
+        task_name = None
+        if w.custom_task_id:
+            ct = db.query(CustomTask).filter_by(id=w.custom_task_id).first()
+            if ct:
+                task_name = ct.name
+        if not task_name and w.task_name:
+            task_name = w.task_name  # fallback to free-text task_name if set
+
         values = {
             "start_date": str(w.date), "end_date": str(w.date),
             "project": pname if pname is not None else "📋 General",
+            "milestone": milestone_name or "—",
+            "task": task_name or "",  # intentionally empty (not "—") for report-only projects
+            "description": milestone_desc or "—",
             "billable": w.work_type if w.work_type else ("Billable" if (w.is_billable if w.is_billable is not None else True) else "Non-Billable"),
             "hours": w.hours_spent or 0,
+            "notes": w.notes or "",
         }
         rows.append([values[k] for k in keys])
 
