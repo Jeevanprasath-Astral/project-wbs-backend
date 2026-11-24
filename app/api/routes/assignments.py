@@ -215,9 +215,9 @@ def create_assignment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    _assign_roles = {"Associate", "Functional Consultant", "Technical Team"}
+    _assign_roles = {"Associate", "Functional Consultant", "Technical Team", "BD"}
     if not is_elevated(current_user) and current_user.role not in _assign_roles:
-        raise HTTPException(403, "Only Admin, Project Manager, FC Lead, TC Lead, or Associate can assign tasks")
+        raise HTTPException(403, "Only Admin, Project Manager, FC Lead, TC Lead, BD, or Associate can assign tasks")
 
     assignee = db.query(User).filter_by(id=payload.assigned_to).first()
     if not assignee:
@@ -379,8 +379,8 @@ def delete_assignment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not is_elevated(current_user):
-        raise HTTPException(403, "Only Admin, FC Lead or TC Lead can delete assignments")
+    if not is_elevated(current_user) and current_user.role != "BD":
+        raise HTTPException(403, "Only Admin, Project Manager, FC Lead, TC Lead, or BD can delete assignments")
     a = db.query(TaskAssignment).filter_by(id=assignment_id, project_id=project_id).first()
     if not a:
         raise HTTPException(404, "Assignment not found")

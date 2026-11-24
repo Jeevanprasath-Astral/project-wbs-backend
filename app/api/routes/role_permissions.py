@@ -91,7 +91,7 @@ DEFAULTS = [
 
     ("BD",                    "proposals",           True,  True,  True,  True),
     ("BD",                    "financial_settings",  False, False, False, False),
-    ("BD",                    "global_assignments",  True,  True,  True,  False),
+    ("BD",                    "global_assignments",  True,  True,  True,  True),
     ("BD",                    "milestones",          True,  True,  True,  False),
     ("BD",                    "timesheet",           True,  True,  True,  True),
     ("BD",                    "reports",             True,  False, False, False),

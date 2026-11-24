@@ -206,9 +206,9 @@ def create_global_assignment(
 ):
     """Create a task assignment from the Global Task Assignments hub.
     Supports General Tasks (no project_id) in addition to project-linked tasks."""
-    _assign_roles = {"Associate", "Functional Consultant", "Technical Team"}
+    _assign_roles = {"Associate", "Functional Consultant", "Technical Team", "BD"}
     if not is_elevated(current_user) and current_user.role not in _assign_roles:
-        raise HTTPException(403, "Only elevated roles, Associates, Functional Consultants, or Technical Team can assign tasks")
+        raise HTTPException(403, "Only elevated roles, BD, Associates, Functional Consultants, or Technical Team can assign tasks")
 
     assignee = db.query(User).filter_by(id=payload.assigned_to).first()
     if not assignee:
@@ -345,8 +345,8 @@ def delete_global_assignment(
     a = db.query(TaskAssignment).filter_by(id=assignment_id).first()
     if not a:
         raise HTTPException(404, "Assignment not found")
-    if not is_admin(current_user) and a.assigned_by != current_user.id:
-        raise HTTPException(403, "Only the assigner or an Admin can delete this task")
+    if not is_admin(current_user) and not is_elevated(current_user) and current_user.role != "BD" and a.assigned_by != current_user.id:
+        raise HTTPException(403, "Only the assigner, an elevated role, BD, or Admin can delete this task")
 
     # Capture data needed for email before deleting
     task_title = a.title
